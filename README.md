@@ -2,7 +2,7 @@
 
 **Mangle Extension for Badger**
 
-A Pure Go High-Performance Neuro-Symbolic Engine for Massive Scale Knowledge Graphs.
+A Pure Go engine for massive-scale Knowledge Graphs with integrated Vector Similarity Search.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
