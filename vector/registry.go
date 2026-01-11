@@ -3,6 +3,7 @@ package vector
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"math"
 	"runtime"
 	"sync"
@@ -63,6 +64,11 @@ func NewRegistry(db *badger.DB) *VectorRegistry {
 // and the full vector is asynchronously persisted to disk.
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 	if len(fullVec) != FullDim {
+		slog.Error("invalid vector dimension",
+			"id", id,
+			"expected", FullDim,
+			"got", len(fullVec),
+		)
 		return fmt.Errorf("invalid vector dimension: expected %d, got %d", FullDim, len(fullVec))
 	}
 
@@ -79,6 +85,10 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 		// Overwrite existing vector in place
 		copy(r.data[idx*MRLDim:(idx+1)*MRLDim], quantized)
 		r.mu.Unlock()
+		slog.Debug("vector updated",
+			"id", id,
+			"index", idx,
+		)
 	} else {
 		// Append new vector
 		idx := uint32(len(r.revMap))
@@ -86,6 +96,11 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 		r.revMap = append(r.revMap, id)
 		r.data = append(r.data, quantized...)
 		r.mu.Unlock()
+		slog.Debug("vector added",
+			"id", id,
+			"index", idx,
+			"totalVectors", len(r.revMap),
+		)
 	}
 
 	// Async disk write for full vector
@@ -148,6 +163,12 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) ([]SearchResult, erro
 	if k <= 0 {
 		return nil, nil
 	}
+
+	slog.Debug("vector search started",
+		"vectorCount", r.Count(),
+		"k", k,
+		"numCPUs", runtime.NumCPU(),
+	)
 
 	// Process query to get 64-d MRL vector
 	mrlQuery := ProcessMRL(queryVec)
@@ -408,6 +429,12 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	numVectors := len(r.revMap)
+	slog.Info("saving vector snapshot",
+		"vectorCount", numVectors,
+		"dataSizeBytes", len(r.data),
+	)
+
 	// Serialize int8 vectors (direct byte copy - very fast)
 	vectorsBytes := make([]byte, len(r.data))
 	for i, v := range r.data {
@@ -425,21 +452,36 @@ func (r *VectorRegistry) SaveSnapshot() error {
 
 	// Save vectors snapshot
 	if err := batch.Set([]byte("sys:mrl:vectors"), vectorsBytes); err != nil {
+		slog.Error("failed to save vectors snapshot", "error", err)
 		return fmt.Errorf("failed to save vectors snapshot: %w", err)
 	}
 
 	// Save IDs snapshot
 	if err := batch.Set([]byte("sys:mrl:ids"), idsBytes); err != nil {
+		slog.Error("failed to save IDs snapshot", "error", err)
 		return fmt.Errorf("failed to save IDs snapshot: %w", err)
 	}
 
-	return batch.Flush()
+	if err := batch.Flush(); err != nil {
+		slog.Error("failed to flush snapshot batch", "error", err)
+		return err
+	}
+
+	slog.Info("vector snapshot saved successfully",
+		"vectorCount", numVectors,
+		"vectorsSizeBytes", len(vectorsBytes),
+		"idsSizeBytes", len(idsBytes),
+	)
+
+	return nil
 }
 
 // LoadSnapshot restores the RAM state from BadgerDB.
 func (r *VectorRegistry) LoadSnapshot() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	slog.Info("loading vector snapshot")
 
 	var vectorsBytes, idsBytes []byte
 
@@ -449,8 +491,10 @@ func (r *VectorRegistry) LoadSnapshot() error {
 		if err != nil {
 			if err == badger.ErrKeyNotFound {
 				// No snapshot exists
+				slog.Info("no existing vector snapshot found")
 				return nil
 			}
+			slog.Error("failed to load vectors snapshot", "error", err)
 			return fmt.Errorf("failed to load vectors snapshot: %w", err)
 		}
 
@@ -468,6 +512,7 @@ func (r *VectorRegistry) LoadSnapshot() error {
 			if err == badger.ErrKeyNotFound {
 				return nil
 			}
+			slog.Error("failed to load IDs snapshot", "error", err)
 			return fmt.Errorf("failed to load IDs snapshot: %w", err)
 		}
 
@@ -505,6 +550,12 @@ func (r *VectorRegistry) LoadSnapshot() error {
 	for idx, id := range r.revMap {
 		r.idMap[id] = uint32(idx)
 	}
+
+	slog.Info("vector snapshot loaded successfully",
+		"vectorCount", numVectors,
+		"vectorsSizeBytes", len(vectorsBytes),
+		"idsSizeBytes", len(idsBytes),
+	)
 
 	return nil
 }

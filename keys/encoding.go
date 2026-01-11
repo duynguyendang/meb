@@ -20,6 +20,22 @@ const (
 	SystemPrefix byte = 0xFF // System metadata prefix (avoids collision with data keys)
 )
 
+// Key size constants
+const (
+	// Component sizes
+	PrefixSize = 1 // Size of key prefix byte
+	IDSize      = 8 // Size of each uint64 ID component
+
+	// Triple key sizes: prefix(1) + 3*ID(8) = 25 bytes
+	TripleKeySize = PrefixSize + 3*IDSize // 25 bytes
+
+	// Quad key sizes: prefix(1) + 4*ID(8) = 33 bytes
+	QuadKeySize = PrefixSize + 4*IDSize // 33 bytes
+
+	// Chunk key sizes: prefix(1) + ID(8) = 9 bytes
+	ChunkKeySize = PrefixSize + IDSize // 9 bytes
+)
+
 // System metadata keys
 var KeyFactCount = []byte{SystemPrefix, 0x01} // Stores the total fact count
 
@@ -30,7 +46,7 @@ var KeyFactCount = []byte{SystemPrefix, 0x01} // Stores the total fact count
 // EncodeSPOKey encodes a triple into an SPO (Subject-Predicate-Object) key.
 // Uses BigEndian encoding to ensure lexicographic ordering matches numeric ordering.
 func EncodeSPOKey(subject, predicate, object uint64) []byte {
-	key := make([]byte, 25)
+	key := make([]byte, TripleKeySize)
 	key[0] = SPOPrefix
 	binary.BigEndian.PutUint64(key[1:9], subject)
 	binary.BigEndian.PutUint64(key[9:17], predicate)
@@ -41,7 +57,7 @@ func EncodeSPOKey(subject, predicate, object uint64) []byte {
 // EncodeOPSKey encodes a triple into an OPS (Object-Predicate-Subject) key.
 // Uses BigEndian encoding to ensure lexicographic ordering matches numeric ordering.
 func EncodeOPSKey(subject, predicate, object uint64) []byte {
-	key := make([]byte, 25)
+	key := make([]byte, TripleKeySize)
 	key[0] = OPSPrefix
 	binary.BigEndian.PutUint64(key[1:9], object)
 	binary.BigEndian.PutUint64(key[9:17], predicate)
@@ -51,7 +67,7 @@ func EncodeOPSKey(subject, predicate, object uint64) []byte {
 
 // DecodeSPOKey decodes an SPO key back into subject, predicate, object IDs.
 func DecodeSPOKey(key []byte) (subject, predicate, object uint64) {
-	if len(key) < 25 || key[0] != SPOPrefix {
+	if len(key) < TripleKeySize || key[0] != SPOPrefix {
 		return 0, 0, 0
 	}
 	subject = binary.BigEndian.Uint64(key[1:9])
@@ -62,7 +78,7 @@ func DecodeSPOKey(key []byte) (subject, predicate, object uint64) {
 
 // DecodeOPSKey decodes an OPS key back into subject, predicate, object IDs.
 func DecodeOPSKey(key []byte) (subject, predicate, object uint64) {
-	if len(key) < 25 || key[0] != OPSPrefix {
+	if len(key) < TripleKeySize || key[0] != OPSPrefix {
 		return 0, 0, 0
 	}
 	object = binary.BigEndian.Uint64(key[1:9])
@@ -79,13 +95,13 @@ func EncodeSPOPrefix(subject, predicate uint64) []byte {
 		return []byte{SPOPrefix}
 	}
 	if predicate == 0 {
-		prefix := make([]byte, 9)
+		prefix := make([]byte, PrefixSize+IDSize) // 9 bytes
 		prefix[0] = SPOPrefix
 		binary.BigEndian.PutUint64(prefix[1:9], subject)
 		return prefix
 	}
 	// Full prefix: subject + predicate
-	prefix := make([]byte, 17)
+	prefix := make([]byte, PrefixSize+2*IDSize) // 17 bytes
 	prefix[0] = SPOPrefix
 	binary.BigEndian.PutUint64(prefix[1:9], subject)
 	binary.BigEndian.PutUint64(prefix[9:17], predicate)
@@ -100,13 +116,13 @@ func EncodeOPSPrefix(object, predicate uint64) []byte {
 		return []byte{OPSPrefix}
 	}
 	if predicate == 0 {
-		prefix := make([]byte, 9)
+		prefix := make([]byte, PrefixSize+IDSize) // 9 bytes
 		prefix[0] = OPSPrefix
 		binary.BigEndian.PutUint64(prefix[1:9], object)
 		return prefix
 	}
 	// Full prefix: object + predicate
-	prefix := make([]byte, 17)
+	prefix := make([]byte, PrefixSize+2*IDSize) // 17 bytes
 	prefix[0] = OPSPrefix
 	binary.BigEndian.PutUint64(prefix[1:9], object)
 	binary.BigEndian.PutUint64(prefix[9:17], predicate)
@@ -116,7 +132,7 @@ func EncodeOPSPrefix(object, predicate uint64) []byte {
 // EncodeChunkKey creates the key for storing raw content blobs.
 // Format: [Prefix(1) | ID(8)] = 9 bytes
 func EncodeChunkKey(id uint64) []byte {
-	k := make([]byte, 9)
+	k := make([]byte, ChunkKeySize)
 	k[0] = ChunkPrefix
 	binary.BigEndian.PutUint64(k[1:], id)
 	return k
@@ -131,7 +147,7 @@ func EncodeChunkKey(id uint64) []byte {
 // The layout depends on the prefix, allowing flexible index ordering.
 // Uses BigEndian encoding to ensure lexicographic ordering matches numeric ordering.
 func EncodeQuadKey(prefix byte, s, p, o, g uint64) []byte {
-	key := make([]byte, 33)
+	key := make([]byte, QuadKeySize)
 	key[0] = prefix
 
 	// Order depends on prefix
@@ -165,7 +181,7 @@ func EncodeQuadKey(prefix byte, s, p, o, g uint64) []byte {
 // DecodeQuadKey decodes a quad key back into subject, predicate, object, graph IDs.
 // Automatically detects the prefix and decodes accordingly.
 func DecodeQuadKey(key []byte) (s, p, o, g uint64) {
-	if len(key) < 33 {
+	if len(key) < QuadKeySize {
 		return 0, 0, 0, 0
 	}
 
@@ -200,22 +216,22 @@ func EncodeQuadSPOGPrefix(s, p, o, g uint64) []byte {
 
 	// Add bound components in order: S, P, O, G
 	if s != 0 {
-		buf := make([]byte, 8)
+		buf := make([]byte, IDSize)
 		binary.BigEndian.PutUint64(buf, s)
 		prefix = append(prefix, buf...)
 
 		if p != 0 {
-			buf = make([]byte, 8)
+			buf = make([]byte, IDSize)
 			binary.BigEndian.PutUint64(buf, p)
 			prefix = append(prefix, buf...)
 
 			if o != 0 {
-				buf = make([]byte, 8)
+				buf = make([]byte, IDSize)
 				binary.BigEndian.PutUint64(buf, o)
 				prefix = append(prefix, buf...)
 
 				if g != 0 {
-					buf = make([]byte, 8)
+					buf = make([]byte, IDSize)
 					binary.BigEndian.PutUint64(buf, g)
 					prefix = append(prefix, buf...)
 				}
@@ -233,7 +249,7 @@ func EncodeQuadGSPOPrefix(g uint64) []byte {
 		return []byte{QuadGSPOPrefix}
 	}
 
-	prefix := make([]byte, 9)
+	prefix := make([]byte, PrefixSize+IDSize) // 9 bytes
 	prefix[0] = QuadGSPOPrefix
 	binary.BigEndian.PutUint64(prefix[1:9], g)
 	return prefix
@@ -247,22 +263,22 @@ func EncodeQuadPOSGPrefix(p, o, s, g uint64) []byte {
 
 	// Add bound components in order: P, O, S, G
 	if p != 0 {
-		buf := make([]byte, 8)
+		buf := make([]byte, IDSize)
 		binary.BigEndian.PutUint64(buf, p)
 		prefix = append(prefix, buf...)
 
 		if o != 0 {
-			buf = make([]byte, 8)
+			buf = make([]byte, IDSize)
 			binary.BigEndian.PutUint64(buf, o)
 			prefix = append(prefix, buf...)
 
 			if s != 0 {
-				buf = make([]byte, 8)
+				buf = make([]byte, IDSize)
 				binary.BigEndian.PutUint64(buf, s)
 				prefix = append(prefix, buf...)
 
 				if g != 0 {
-					buf = make([]byte, 8)
+					buf = make([]byte, IDSize)
 					binary.BigEndian.PutUint64(buf, g)
 					prefix = append(prefix, buf...)
 				}

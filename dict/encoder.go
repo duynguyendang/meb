@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 
@@ -76,11 +77,12 @@ func NewEncoder(db *badger.DB, cacheSize int) (*Encoder, error) {
 
 // loadNextID loads the next ID counter from BadgerDB.
 func (e *Encoder) loadNextID() error {
-	return e.db.View(func(txn *badger.Txn) error {
+	err := e.db.View(func(txn *badger.Txn) error {
 		// The next ID is stored under a special key
 		item, err := txn.Get([]byte("__dict_next_id"))
 		if err == badger.ErrKeyNotFound {
 			// First time using this dictionary
+			slog.Info("dictionary initialized with new ID counter")
 			return nil
 		}
 		if err != nil {
@@ -92,6 +94,12 @@ func (e *Encoder) loadNextID() error {
 			return nil
 		})
 	})
+
+	if err == nil {
+		slog.Info("dictionary ID counter loaded", "nextID", e.nextID)
+	}
+
+	return err
 }
 
 // saveNextID saves the next ID counter to BadgerDB.
@@ -202,6 +210,12 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		}
 	}
 
+	slog.Debug("dictionary batch GetIDs cache check",
+		"totalKeys", len(keys),
+		"cacheHits", len(keys)-len(misses),
+		"cacheMisses", len(misses),
+	)
+
 	if len(misses) == 0 {
 		return results, nil
 	}
@@ -238,6 +252,13 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		if results[m.index] == 0 {
 			toCreate = append(toCreate, m)
 		}
+	}
+
+	if len(toCreate) > 0 {
+		slog.Debug("dictionary allocating new IDs",
+			"count", len(toCreate),
+			"nextID", atomic.LoadUint64(&e.nextID),
+		)
 	}
 
 	if len(toCreate) > 0 {
@@ -384,9 +405,19 @@ func makeDictReverseKey(id uint64) []byte {
 // Close flushes any pending state and releases resources.
 func (e *Encoder) Close() error {
 	// Save the next ID counter on close
-	if err := e.saveNextID(atomic.LoadUint64(&e.nextID)); err != nil {
+	nextID := atomic.LoadUint64(&e.nextID)
+	if err := e.saveNextID(nextID); err != nil {
+		slog.Error("failed to save next ID on close", "error", err)
 		return fmt.Errorf("failed to save next ID: %w", err)
 	}
+
+	stats := e.Stats()
+	slog.Info("dictionary closed",
+		"nextID", nextID,
+		"forwardCacheLen", stats["forward_cache_len"],
+		"reverseCacheLen", stats["reverse_cache_len"],
+	)
+
 	return nil
 }
 

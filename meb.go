@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"iter"
@@ -89,21 +90,39 @@ func (m *MEBStore) saveStats() error {
 
 // NewMEBStore creates a new MEBStore with the given configuration.
 func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
+	slog.Info("initializing MEB store",
+		"dataDir", cfg.DataDir,
+		"inMemory", cfg.InMemory,
+		"blockCacheSize", cfg.BlockCacheSize,
+		"indexCacheSize", cfg.IndexCacheSize,
+		"numDictShards", cfg.NumDictShards,
+	)
+
+	// Validate configuration before proceeding
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+
 	// Open BadgerDB
 	db, err := store.OpenBadgerDB(cfg)
 	if err != nil {
+		slog.Error("failed to open BadgerDB", "error", err)
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
+
+	slog.Info("BadgerDB opened successfully")
 
 	// Create dictionary encoder (sharded if configured)
 	var dictEncoder dict.Dictionary
 	if cfg.NumDictShards > 0 {
+		slog.Info("creating sharded dictionary encoder", "shards", cfg.NumDictShards, "lruCacheSize", cfg.LRUCacheSize)
 		dictEncoder, err = dict.NewShardedEncoder(db, cfg.LRUCacheSize, cfg.NumDictShards)
 		if err != nil {
 			db.Close()
 			return nil, fmt.Errorf("failed to create sharded dictionary encoder: %w", err)
 		}
 	} else {
+		slog.Info("creating single-threaded dictionary encoder", "lruCacheSize", cfg.LRUCacheSize)
 		dictEncoder, err = dict.NewEncoder(db, cfg.LRUCacheSize)
 		if err != nil {
 			db.Close()
@@ -139,6 +158,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	// Register default predicates (triples)
 	m.registerDefaultPredicates()
 
+	slog.Info("MEB store initialized successfully", "factCount", m.numFacts.Load())
 	return m, nil
 }
 
@@ -414,45 +434,15 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 
 		// Handle Object (could be string or other type)
 		var oID uint64
-		var objStr string
 
 		if len(factStringRefs[i]) > 3 && factStringRefs[i][3].isObj {
 			// Object is a string, use the ID from refs
-			objStr = fact.Object.(string)
 			oID = ids[factStringRefs[i][3].index]
 		} else {
 			// Object is not a string, need to encode it
-			switch v := fact.Object.(type) {
-			case int:
-				objStr = fmt.Sprintf("%d", v)
-				oID, err = m.dict.GetOrCreateID(objStr)
-				if err != nil {
-					return err
-				}
-			case int64:
-				objStr = fmt.Sprintf("%d", v)
-				oID, err = m.dict.GetOrCreateID(objStr)
-				if err != nil {
-					return err
-				}
-			case float64:
-				objStr = fmt.Sprintf("%f", v)
-				oID, err = m.dict.GetOrCreateID(objStr)
-				if err != nil {
-					return err
-				}
-			case bool:
-				objStr = fmt.Sprintf("%t", v)
-				oID, err = m.dict.GetOrCreateID(objStr)
-				if err != nil {
-					return err
-				}
-			default:
-				objStr = fmt.Sprintf("%v", v)
-				oID, err = m.dict.GetOrCreateID(objStr)
-				if err != nil {
-					return err
-				}
+			_, oID, err = m.encodeObject(fact.Object)
+			if err != nil {
+				return err
 			}
 		}
 
@@ -490,10 +480,13 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 		graph = "default"
 	}
 
+	slog.Info("deleting graph", "graph", graph)
+
 	// Get graph ID
 	gID, err := m.dict.GetID(graph)
 	if err != nil {
 		// Graph doesn't exist, nothing to delete
+		slog.Debug("graph not found, nothing to delete", "graph", graph)
 		return nil
 	}
 
@@ -538,19 +531,24 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 	it.Close()
 	txn.Discard()
 
+	slog.Debug("collected keys for deletion", "count", len(keysToDelete))
+
 	// Second pass: delete all keys in a write transaction
 	deleteTxn := m.db.NewTransaction(true)
 
 	for _, keys := range keysToDelete {
 		if err := deleteTxn.Delete(keys.spog); err != nil {
+			slog.Error("failed to delete SPOG key", "error", err)
 			deleteTxn.Discard()
 			return err
 		}
 		if err := deleteTxn.Delete(keys.posg); err != nil {
+			slog.Error("failed to delete POSG key", "error", err)
 			deleteTxn.Discard()
 			return err
 		}
 		if err := deleteTxn.Delete(keys.gspo); err != nil {
+			slog.Error("failed to delete GSPO key", "error", err)
 			deleteTxn.Discard()
 			return err
 		}
@@ -560,9 +558,11 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 
 	// Commit the transaction
 	if err := deleteTxn.Commit(); err != nil {
+		slog.Error("failed to commit delete transaction", "error", err)
 		return err
 	}
 
+	slog.Info("graph deleted successfully", "graph", graph, "factsDeleted", len(keysToDelete))
 	return nil
 }
 
@@ -577,6 +577,12 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 //   - If Graph is bound (only) -> Use GSPO (Prefix: G|S...)
 //   - Else -> Return empty iterator (requires at least one bound arg)
 func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
+	return m.ScanContext(context.Background(), s, p, o, g)
+}
+
+// ScanContext is like Scan but accepts a context for cancellation.
+// Use this for long-running scans that need to respect context cancellation.
+func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
 	return func(yield func(Fact, error) bool) {
 		// Helper to append uint64 to byte slice
 		appendUint64 := func(b []byte, v uint64) []byte {
@@ -629,9 +635,21 @@ func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 			gBound = true
 		}
 
-		// Debug logging (remove in production)
-		// fmt.Printf("DEBUG Scan: s=%s sID=%d sbound=%v, p=%s pID=%d pbound=%v, g=%s gID=%d gbound=%v\n",
-		// 	s, sID, sBound, p, pID, pBound, g, gID, gBound)
+		// Log scan parameters for debugging (enabled via LOG_LEVEL=debug)
+		slog.Debug("scan parameters",
+			"subject", s,
+			"subjectID", sID,
+			"subjectBound", sBound,
+			"predicate", p,
+			"predicateID", pID,
+			"predicateBound", pBound,
+			"object", o,
+			"objectID", oID,
+			"objectBound", oBound,
+			"graph", g,
+			"graphID", gID,
+			"graphBound", gBound,
+		)
 
 		// Reject full table scans (no arguments bound)
 		if !sBound && !pBound && !oBound && !gBound {
@@ -691,6 +709,15 @@ func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 
 		// Scan using the selected index
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				yield(Fact{}, ctx.Err())
+				return
+			default:
+				// Continue scanning
+			}
+
 			item := it.Item()
 			key := item.Key()
 
@@ -807,42 +834,58 @@ func (m *MEBStore) Reset() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	slog.Info("resetting store", "factCount", m.numFacts.Load())
+
 	// Clear all data
 	err := m.db.DropAll()
 	if err != nil {
+		slog.Error("failed to drop all data", "error", err)
 		return err
 	}
 
 	// Reset fact count (atomic operation)
 	m.numFacts.Store(0)
 
+	slog.Info("store reset complete")
 	return nil
 }
 
 // Close closes the store and releases resources.
 func (m *MEBStore) Close() error {
+	slog.Info("closing store", "factCount", m.numFacts.Load())
+
 	// Save vector snapshot before closing
 	if err := m.vectors.SaveSnapshot(); err != nil {
+		slog.Error("failed to save vector snapshot", "error", err)
 		return fmt.Errorf("failed to save vector snapshot: %w", err)
 	}
 
 	// Save fact count stats to disk
 	if err := m.saveStats(); err != nil {
+		slog.Error("failed to save stats", "error", err)
 		return fmt.Errorf("failed to save stats: %w", err)
 	}
 
 	// Wait for vector operations to complete
 	if err := m.vectors.Close(); err != nil {
+		slog.Error("failed to close vectors", "error", err)
 		return err
 	}
 
 	// Close dictionary
 	if err := m.dict.Close(); err != nil {
+		slog.Error("failed to close dictionary", "error", err)
 		return err
 	}
 
 	// Close BadgerDB
-	return m.db.Close()
+	if err := m.db.Close(); err != nil {
+		slog.Error("failed to close database", "error", err)
+		return err
+	}
+
+	slog.Info("store closed successfully")
+	return nil
 }
 
 // Count returns the total number of facts in the store.
@@ -856,6 +899,8 @@ func (m *MEBStore) Count() uint64 {
 // is suspected to be out of sync (e.g., after an unclean shutdown).
 // It scans the SPOG index and updates both the in-memory counter and disk.
 func (m *MEBStore) RecalculateStats() (uint64, error) {
+	slog.Info("recalculating stats (expensive operation)", "currentCount", m.numFacts.Load())
+
 	var count uint64
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -873,6 +918,7 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 	})
 
 	if err != nil {
+		slog.Error("failed to recalculate stats", "error", err)
 		return 0, fmt.Errorf("failed to recalculate stats: %w", err)
 	}
 
@@ -881,9 +927,11 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 
 	// Save to disk
 	if err := m.saveStats(); err != nil {
+		slog.Error("failed to save recalculated stats", "error", err)
 		return 0, fmt.Errorf("failed to save recalculated stats: %w", err)
 	}
 
+	slog.Info("stats recalculated successfully", "newCount", count)
 	return count, nil
 }
 
@@ -960,19 +1008,29 @@ func (m *MEBStore) GetContent(id uint64) ([]byte, error) {
 // AddDocument adds a complete document with vector, content, and metadata.
 // This is a high-level helper that handles the full RAG pipeline.
 func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, metadata map[string]any) error {
+	slog.Debug("adding document",
+		"key", docKey,
+		"contentSize", len(content),
+		"vectorDim", len(vec),
+		"metadataCount", len(metadata),
+	)
+
 	// 1. Get or create ID for the document
 	id, err := m.dict.GetOrCreateID(docKey)
 	if err != nil {
+		slog.Error("failed to get document ID", "key", docKey, "error", err)
 		return fmt.Errorf("failed to get document ID: %w", err)
 	}
 
 	// 2. Store vector
 	if err := m.vectors.Add(id, vec); err != nil {
+		slog.Error("failed to add vector", "key", docKey, "error", err)
 		return fmt.Errorf("failed to add vector: %w", err)
 	}
 
 	// 3. Store content (compressed)
 	if err := m.SetContent(id, content); err != nil {
+		slog.Error("failed to store content", "key", docKey, "error", err)
 		return fmt.Errorf("failed to store content: %w", err)
 	}
 
@@ -987,15 +1045,46 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 				Graph:     "metadata",
 			}
 			if err := m.AddFact(fact); err != nil {
+				slog.Error("failed to add metadata fact", "key", docKey, "predicate", key, "error", err)
 				return fmt.Errorf("failed to add metadata fact for %s: %w", key, err)
 			}
 		}
 	}
 
+	slog.Debug("document added successfully", "key", docKey, "id", id)
 	return nil
 }
 
 // === Helper methods ===
+
+// encodeObject converts an object value to its dictionary ID and string representation.
+// Handles various types including int, int64, float64, bool, and string.
+func (m *MEBStore) encodeObject(obj any) (string, uint64, error) {
+	switch v := obj.(type) {
+	case string:
+		return v, 0, nil // ID will be obtained from batch
+	case int:
+		objStr := fmt.Sprintf("%d", v)
+		oID, err := m.dict.GetOrCreateID(objStr)
+		return objStr, oID, err
+	case int64:
+		objStr := fmt.Sprintf("%d", v)
+		oID, err := m.dict.GetOrCreateID(objStr)
+		return objStr, oID, err
+	case float64:
+		objStr := fmt.Sprintf("%f", v)
+		oID, err := m.dict.GetOrCreateID(objStr)
+		return objStr, oID, err
+	case bool:
+		objStr := fmt.Sprintf("%t", v)
+		oID, err := m.dict.GetOrCreateID(objStr)
+		return objStr, oID, err
+	default:
+		objStr := fmt.Sprintf("%v", v)
+		oID, err := m.dict.GetOrCreateID(objStr)
+		return objStr, oID, err
+	}
+}
 
 // factToAtom converts a Fact to a Mangle Atom.
 func (m *MEBStore) factToAtom(fact Fact) (ast.Atom, error) {

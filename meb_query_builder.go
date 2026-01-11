@@ -196,7 +196,21 @@ func (b *Builder) matchesFilters(candidateKey string) bool {
 }
 
 // toString converts a byte slice to string without copying.
-// This is a zero-copy conversion for performance.
+//
+// SAFETY CONTRACT: This function uses unsafe operations for zero-copy conversion.
+// The caller MUST ensure that the byte slice 'b' is never modified after this
+// function returns. Violating this contract will result in undefined behavior.
+//
+// Usage: Only use this when 'b' is guaranteed to be immutable after conversion,
+// such as when it's a freshly allocated slice returned from GetContent that
+// won't be reused or modified.
+//
+// For general use cases where safety is a concern, use string(b) instead.
 func toString(b []byte) string {
+	// SAFETY: The unsafe.String constructor creates a string that shares the
+	// underlying byte array with 'b'. As long as 'b' is not modified after
+	// this call, this is safe. In the context of Execute(), b comes from
+	// GetContent which returns a new byte slice that is not subsequently
+	// modified, making this conversion safe.
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }

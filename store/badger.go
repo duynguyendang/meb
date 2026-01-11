@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
 
 	"github.com/dgraph-io/badger/v4"
@@ -39,6 +40,35 @@ type Config struct {
 	// Use 0 for single-threaded encoder (default), or a power of 2 (e.g., 16) for sharded encoder.
 	// Sharded encoder reduces contention in concurrent workloads.
 	NumDictShards int
+}
+
+// Validate checks if the configuration is valid and returns an error if not.
+func (c *Config) Validate() error {
+	// Validate DataDir
+	if c.DataDir == "" && !c.InMemory {
+		return fmt.Errorf("DataDir must be specified when InMemory is false")
+	}
+
+	// Validate cache sizes
+	if c.BlockCacheSize <= 0 {
+		return fmt.Errorf("BlockCacheSize must be positive, got %d", c.BlockCacheSize)
+	}
+	if c.IndexCacheSize <= 0 {
+		return fmt.Errorf("IndexCacheSize must be positive, got %d", c.IndexCacheSize)
+	}
+	if c.LRUCacheSize < 0 {
+		return fmt.Errorf("LRUCacheSize must be non-negative, got %d", c.LRUCacheSize)
+	}
+
+	// Validate NumDictShards: must be 0 or a power of 2
+	if c.NumDictShards < 0 {
+		return fmt.Errorf("NumDictShards must be non-negative, got %d", c.NumDictShards)
+	}
+	if c.NumDictShards > 0 && (c.NumDictShards&(c.NumDictShards-1)) != 0 {
+		return fmt.Errorf("NumDictShards must be 0 or a power of 2, got %d", c.NumDictShards)
+	}
+
+	return nil
 }
 
 // DefaultConfig returns a production-ready configuration for 1B nodes.
