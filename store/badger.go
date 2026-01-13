@@ -13,6 +13,9 @@ type Config struct {
 	// DataDir is the directory where BadgerDB will store its data.
 	DataDir string
 
+	// DictDir is the directory where the Dictionary BadgerDB will store its data.
+	DictDir string
+
 	// InMemory enables in-memory mode (useful for testing).
 	InMemory bool
 
@@ -40,6 +43,14 @@ type Config struct {
 	// Use 0 for single-threaded encoder (default), or a power of 2 (e.g., 16) for sharded encoder.
 	// Sharded encoder reduces contention in concurrent workloads.
 	NumDictShards int
+
+	// MemTableSize is the size of the memtable in bytes.
+	// Default: 64MB. Lower this to reduce memory usage.
+	MemTableSize int64
+
+	// NumMemtables is the maximum number of tables to keep in memory which are waiting to be written to disk.
+	// Default: 5. Lower this to reduce memory usage.
+	NumMemtables int
 }
 
 // Validate checks if the configuration is valid and returns an error if not.
@@ -75,6 +86,7 @@ func (c *Config) Validate() error {
 func DefaultConfig(dataDir string) *Config {
 	return &Config{
 		DataDir:        dataDir,
+		DictDir:        filepath.Join(dataDir, "dict"), // Separate dictionary directory
 		InMemory:       false,
 		BlockCacheSize: 8 << 30, // 8GB
 		IndexCacheSize: 1 << 30, // 1GB
@@ -90,8 +102,8 @@ func TestConfig(dataDir string) *Config {
 	return &Config{
 		DataDir:        dataDir,
 		InMemory:       false,
-		BlockCacheSize: 100 << 20,   // 100MB
-		IndexCacheSize: 10 << 20,    // 10MB
+		BlockCacheSize: 100 << 20, // 100MB
+		IndexCacheSize: 10 << 20,  // 10MB
 		LRUCacheSize:   1000,
 		Compression:    true,
 		SyncWrites:     true, // Enable sync writes to ensure persistence in tests
@@ -144,6 +156,14 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 
 	// === Write Configuration ===
 	opts.SyncWrites = cfg.SyncWrites
+
+	// === Memory Tuning ===
+	if cfg.MemTableSize > 0 {
+		opts.MemTableSize = cfg.MemTableSize
+	}
+	if cfg.NumMemtables > 0 {
+		opts.NumMemtables = cfg.NumMemtables
+	}
 
 	return opts
 }

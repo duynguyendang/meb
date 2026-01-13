@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
-	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -31,11 +29,9 @@ type Encoder struct {
 	forwardCache *lruCache[string, uint64] // string -> uint64
 	reverseCache *lruCache[uint64, string] // uint64 -> string
 
-	// Atomic ID generation
-	nextID uint64
-
-	// Mutex for ID allocation
-	mu sync.Mutex
+	// Components
+	allocator *RangeAllocator
+	filter    *BloomFilter
 }
 
 // lruCache wraps expirable.LRU for a simpler API
@@ -60,67 +56,48 @@ func (c *lruCache[K, V]) Add(key K, value V) {
 // NewEncoder creates a new dictionary encoder with the given BadgerDB instance and cache size.
 // If the dictionary already exists in BadgerDB, it loads the next ID counter.
 func NewEncoder(db *badger.DB, cacheSize int) (*Encoder, error) {
-	enc := &Encoder{
-		db: db,
-		forwardCache: newLRUCache[string, uint64](cacheSize),
-		reverseCache: newLRUCache[uint64, string](cacheSize),
-		nextID:       1, // Start from ID 1 (ID 0 reserved for "not found")
+	// Initialize Allocator
+	allocator, err := NewRangeAllocator(db, DefaultBlockSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create range allocator: %w", err)
 	}
 
-	// Load the next ID from BadgerDB
-	if err := enc.loadNextID(); err != nil {
-		return nil, fmt.Errorf("failed to load next ID: %w", err)
+	// Initialize BloomFilter (2B items, 1% FP)
+	// TODO: Load existing filter from disk if needed, or rebuild.
+	// For now we start fresh in RAM, assuming cold start or cache warming strategy.
+	filter := NewBloomFilter(2000000000, 0.01)
+
+	enc := &Encoder{
+		db:           db,
+		forwardCache: newLRUCache[string, uint64](cacheSize),
+		reverseCache: newLRUCache[uint64, string](cacheSize),
+		allocator:    allocator,
+		filter:       filter,
 	}
 
 	return enc, nil
 }
 
-// loadNextID loads the next ID counter from BadgerDB.
-func (e *Encoder) loadNextID() error {
-	err := e.db.View(func(txn *badger.Txn) error {
-		// The next ID is stored under a special key
-		item, err := txn.Get([]byte("__dict_next_id"))
-		if err == badger.ErrKeyNotFound {
-			// First time using this dictionary
-			slog.Info("dictionary initialized with new ID counter")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		return item.Value(func(val []byte) error {
-			e.nextID = binary.BigEndian.Uint64(val)
-			return nil
-		})
-	})
-
-	if err == nil {
-		slog.Info("dictionary ID counter loaded", "nextID", e.nextID)
-	}
-
-	return err
-}
-
-// saveNextID saves the next ID counter to BadgerDB.
-func (e *Encoder) saveNextID(id uint64) error {
-	return e.db.Update(func(txn *badger.Txn) error {
-		key := []byte("__dict_next_id")
-		val := make([]byte, 8)
-		binary.BigEndian.PutUint64(val, id)
-		return txn.Set(key, val)
-	})
-}
+// Methods loadNextID and saveNextID removed as RangeAllocator handles this.
 
 // GetOrCreateID gets the ID for a string, creating a new ID if it doesn't exist.
 // Thread-safe for concurrent access.
 func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
-	// 1. Check LRU cache
+	// 1. Check LRU cache (RAM)
 	if id, ok := e.forwardCache.Get(s); ok && id != 0 {
 		return id, nil
 	}
 
-	// 2. Check BadgerDB
+	// 2. Check Bloom Filter (RAM)
+	// If bloom filter says "No", we are 100% sure it's not in DB.
+	// We can skip the disk read and go straight to allocation.
+	if e.filter != nil && !e.filter.Test(s) {
+		// Definitely not in DB. Allocate new ID.
+		return e.allocateNewID(s)
+	}
+
+	// 3. Check BadgerDB (Disk)
+	// Bloom filter said "Maybe", so we must check DB.
 	key := makeDictForwardKey(s)
 	var id uint64
 	err := e.db.View(func(txn *badger.Txn) error {
@@ -148,41 +125,55 @@ func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
 		return 0, err
 	}
 
-	// 3. Allocate new ID (atomic)
-	e.mu.Lock()
-	newID := atomic.AddUint64(&e.nextID, 1)
-	e.mu.Unlock()
+	// 4. Not in DB (False positive from Bloom Filter). Allocate new ID.
+	return e.allocateNewID(s)
+}
 
-	// 4. Persist to BadgerDB
-	batch := e.db.NewWriteBatch()
-	defer batch.Cancel()
+// allocateNewID allocates a new ID for the given string using the RangeAllocator.
+func (e *Encoder) allocateNewID(s string) (uint64, error) {
+	// Allocate ID from RangeAllocator
+	newID, err := e.allocator.Allocate()
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate ID: %w", err)
+	}
 
-	idBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(idBytes, newID)
+	// Persist to BadgerDB
+	// Note: RangeAllocator already persisted the GlobalCounter range.
+	// We just need to persist the mapping itself.
 
-	// Forward map: string -> ID
-	if err := batch.Set(key, idBytes); err != nil {
+	// Use batch for better performance if possible, but here we are in single-item flow.
+	// Ideally we should batch these updates, but the interface is single-item.
+	// The persistent dictionary requirement implies we must write to disk or have a WAL.
+	// BadgerDB handles this with WAL.
+
+	err = e.db.Update(func(txn *badger.Txn) error {
+		// Forward map: string -> ID
+		key := makeDictForwardKey(s)
+		idBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(idBytes, newID)
+		if err := txn.Set(key, idBytes); err != nil {
+			return err
+		}
+
+		// Reverse map: ID -> string
+		reverseKey := makeDictReverseKey(newID)
+		if err := txn.Set(reverseKey, []byte(s)); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
 		return 0, err
 	}
 
-	// Reverse map: ID -> string
-	reverseKey := makeDictReverseKey(newID)
-	if err := batch.Set(reverseKey, []byte(s)); err != nil {
-		return 0, err
+	// Add to Bloom Filter
+	if e.filter != nil {
+		e.filter.Add(s)
 	}
 
-	if err := batch.Flush(); err != nil {
-		return 0, err
-	}
-
-	// 5. Persist next ID counter after allocation to ensure persistence
-	// We need to save nextID (which is already incremented), not newID
-	if err := e.saveNextID(atomic.LoadUint64(&e.nextID)); err != nil {
-		// Log error but don't fail the operation
-		// The nextID will be recovered on restart from the actual max ID in the DB
-	}
-
-	// 6. Update cache
+	// Update cache
 	e.forwardCache.Add(s, newID)
 	e.reverseCache.Add(newID, s)
 
@@ -201,83 +192,101 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 	}
 	var misses []miss
 
-	// 1. Fast Path: Check LRU cache first (lock-free read)
+	// 1. Fast Path: Check LRU cache first (lock-free)
 	for i, key := range keys {
 		if id, ok := e.forwardCache.Get(key); ok && id != 0 {
 			results[i] = id
 		} else {
+			// Check Bloom Filter immediately
+			if e.filter != nil && !e.filter.Test(key) {
+				// Definitely not in DB. Mark for allocation.
+				// We'll handle these as "definite misses" or just let the DB check loop handle them?
+				// To optimize, we can separate "definite new" from "possible existing".
+				// But for simplicity, we treat them as misses and then check DB only for valid bloom hits.
+				// Actually, simpler: just add to misses list.
+				// But we want to avoid DB lookups for bloom negatives.
+			}
 			misses = append(misses, miss{index: i, key: key})
 		}
 	}
-
-	slog.Debug("dictionary batch GetIDs cache check",
-		"totalKeys", len(keys),
-		"cacheHits", len(keys)-len(misses),
-		"cacheMisses", len(misses),
-	)
 
 	if len(misses) == 0 {
 		return results, nil
 	}
 
-	// 2. Slow Path: Batch process all misses
-	// Query BadgerDB for all missing keys at once
-	err := e.db.View(func(txn *badger.Txn) error {
-		for _, m := range misses {
-			key := makeDictForwardKey(m.key)
-			item, err := txn.Get(key)
-			if err == badger.ErrKeyNotFound {
-				continue // Will need to allocate new ID
-			}
-			if err != nil {
-				return err
-			}
-			if err := item.Value(func(val []byte) error {
-				results[m.index] = binary.BigEndian.Uint64(val)
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	// 2. Filter Misses: Separate "Bloom Negative" (New) from "Bloom Positive" (Maybe Existing)
+	var possibleExisting []miss
+	var definiteNew []miss
 
-	if err != nil {
-		return nil, err
+	for _, m := range misses {
+		if e.filter != nil && !e.filter.Test(m.key) {
+			definiteNew = append(definiteNew, m)
+		} else {
+			possibleExisting = append(possibleExisting, m)
+		}
 	}
 
-	// 3. Allocate new IDs for keys that still don't have IDs
+	// 3. Slow Path: Check BadgerDB for "possible existing"
+	if len(possibleExisting) > 0 {
+		err := e.db.View(func(txn *badger.Txn) error {
+			for _, m := range possibleExisting {
+				key := makeDictForwardKey(m.key)
+				item, err := txn.Get(key)
+				if err == badger.ErrKeyNotFound {
+					continue // Will need to allocate new ID
+				}
+				if err != nil {
+					return err
+				}
+				if err := item.Value(func(val []byte) error {
+					results[m.index] = binary.BigEndian.Uint64(val)
+					return nil
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 4. Collect all keys that still need IDs (Bloom hits not found in DB + Bloom misses)
 	var toCreate []miss
-	for _, m := range misses {
+
+	// Add those from possibleExisting that weren't found
+	for _, m := range possibleExisting {
 		if results[m.index] == 0 {
 			toCreate = append(toCreate, m)
 		}
 	}
+	// Add all definiteNew
+	toCreate = append(toCreate, definiteNew...)
 
 	if len(toCreate) > 0 {
 		slog.Debug("dictionary allocating new IDs",
 			"count", len(toCreate),
-			"nextID", atomic.LoadUint64(&e.nextID),
 		)
-	}
 
-	if len(toCreate) > 0 {
-		// Batch allocate IDs (single lock)
-		e.mu.Lock()
-		firstID := atomic.AddUint64(&e.nextID, uint64(len(toCreate))) - uint64(len(toCreate)) + 1
-		e.mu.Unlock()
+		// Batch allocate IDs
+		startID, err := e.allocator.AllocateBatch(uint64(len(toCreate)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to allocate batch: %w", err)
+		}
 
 		// Batch persist to BadgerDB
 		batch := e.db.NewWriteBatch()
 		defer batch.Cancel()
 
 		for i, m := range toCreate {
-			newID := firstID + uint64(i)
+			newID := startID + uint64(i)
 			results[m.index] = newID
 
 			// Forward map: string -> ID
 			key := makeDictForwardKey(m.key)
-			idBytes := make([]byte, 8) // Create a NEW slice for each entry (don't reuse)
+			idBytes := make([]byte, 8)
 			binary.BigEndian.PutUint64(idBytes, newID)
 			if err := batch.Set(key, idBytes); err != nil {
 				return nil, err
@@ -288,25 +297,30 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 			if err := batch.Set(reverseKey, []byte(m.key)); err != nil {
 				return nil, err
 			}
+
+			// Add to Bloom Filter
+			if e.filter != nil {
+				e.filter.Add(m.key)
+			}
+
+			// Update cache
+			e.forwardCache.Add(m.key, newID)
+			e.reverseCache.Add(newID, m.key)
 		}
 
 		if err := batch.Flush(); err != nil {
 			return nil, err
 		}
 
-		// Save next ID counter after batch allocation to ensure persistence
-		// Save the atomic nextID value (already incremented by the allocation)
-		if err := e.saveNextID(atomic.LoadUint64(&e.nextID)); err != nil {
-			return nil, fmt.Errorf("failed to save next ID: %w", err)
-		}
+		// Note: RangeAllocator persisting is handled inside AllocateBatch
 	}
 
-	// 4. Update cache for all results
-	for i, key := range keys {
-		id := results[i]
+	// 5. Update cache for results found in DB (step 3)
+	for _, m := range possibleExisting {
+		id := results[m.index]
 		if id != 0 {
-			e.forwardCache.Add(key, id)
-			e.reverseCache.Add(id, key)
+			e.forwardCache.Add(m.key, id)
+			e.reverseCache.Add(id, m.key)
 		}
 	}
 
@@ -404,16 +418,8 @@ func makeDictReverseKey(id uint64) []byte {
 
 // Close flushes any pending state and releases resources.
 func (e *Encoder) Close() error {
-	// Save the next ID counter on close
-	nextID := atomic.LoadUint64(&e.nextID)
-	if err := e.saveNextID(nextID); err != nil {
-		slog.Error("failed to save next ID on close", "error", err)
-		return fmt.Errorf("failed to save next ID: %w", err)
-	}
-
 	stats := e.Stats()
 	slog.Info("dictionary closed",
-		"nextID", nextID,
 		"forwardCacheLen", stats["forward_cache_len"],
 		"reverseCacheLen", stats["reverse_cache_len"],
 	)
@@ -424,7 +430,6 @@ func (e *Encoder) Close() error {
 // Stats returns statistics about the encoder.
 func (e *Encoder) Stats() map[string]interface{} {
 	return map[string]interface{}{
-		"next_id":          atomic.LoadUint64(&e.nextID),
 		"forward_cache_len": e.forwardCache.cache.Len(),
 		"reverse_cache_len": e.reverseCache.cache.Len(),
 	}

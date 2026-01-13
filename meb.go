@@ -4,18 +4,18 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"log/slog"
 	"strings"
 	"sync"
-	"iter"
 	"sync/atomic"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 	"github.com/duynguyendang/meb/predicates"
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
-	"github.com/dgraph-io/badger/v4"
 	"github.com/google/mangle/ast"
 	"github.com/google/mangle/factstore"
 	"github.com/klauspost/compress/s2"
@@ -33,8 +33,9 @@ type Fact struct {
 // MEBStore implements both factstore.FactStore and store.KnowledgeStore interfaces.
 // It uses BadgerDB for persistent storage and dictionary encoding for efficient operations.
 type MEBStore struct {
-	db   *badger.DB
-	dict dict.Dictionary
+	db     *badger.DB
+	dictDB *badger.DB // Separate DB for dictionary
+	dict   dict.Dictionary
 
 	// Predicate tables
 	predicates map[ast.PredicateSym]*predicates.PredicateTable
@@ -103,38 +104,58 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
-	// Open BadgerDB
+	// Open BadgerDB for Facts
 	db, err := store.OpenBadgerDB(cfg)
 	if err != nil {
 		slog.Error("failed to open BadgerDB", "error", err)
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
-	slog.Info("BadgerDB opened successfully")
+	slog.Info("BadgerDB (Facts) opened successfully")
+
+	// Open BadgerDB for Dictionary
+	// Create a modified config for Dictionary DB
+	dictCfg := *cfg // Copy config
+	dictCfg.DataDir = cfg.DictDir
+	dictCfg.SyncWrites = true // Enforce strict persistence for Dictionary
+	// We might want different cache sizes for dict DB, but sharing config is a good start.
+	// Maybe reduce block cache for dict as it's mostly key lookups?
+	// For now, use same config but different dir.
+
+	dictDB, err := store.OpenBadgerDB(&dictCfg)
+	if err != nil {
+		db.Close()
+		slog.Error("failed to open Dictionary BadgerDB", "error", err)
+		return nil, fmt.Errorf("failed to open Dictionary BadgerDB: %w", err)
+	}
+	slog.Info("BadgerDB (Dictionary) opened successfully")
 
 	// Create dictionary encoder (sharded if configured)
 	var dictEncoder dict.Dictionary
 	if cfg.NumDictShards > 0 {
 		slog.Info("creating sharded dictionary encoder", "shards", cfg.NumDictShards, "lruCacheSize", cfg.LRUCacheSize)
-		dictEncoder, err = dict.NewShardedEncoder(db, cfg.LRUCacheSize, cfg.NumDictShards)
+		dictEncoder, err = dict.NewShardedEncoder(dictDB, cfg.LRUCacheSize, cfg.NumDictShards)
 		if err != nil {
+			dictDB.Close()
 			db.Close()
 			return nil, fmt.Errorf("failed to create sharded dictionary encoder: %w", err)
 		}
 	} else {
 		slog.Info("creating single-threaded dictionary encoder", "lruCacheSize", cfg.LRUCacheSize)
-		dictEncoder, err = dict.NewEncoder(db, cfg.LRUCacheSize)
+		dictEncoder, err = dict.NewEncoder(dictDB, cfg.LRUCacheSize)
 		if err != nil {
+			dictDB.Close()
 			db.Close()
 			return nil, fmt.Errorf("failed to create dictionary encoder: %w", err)
 		}
 	}
 
 	m := &MEBStore{
-		db:        db,
-		dict:      dictEncoder,
+		db:         db,
+		dictDB:     dictDB,
+		dict:       dictEncoder,
 		predicates: make(map[ast.PredicateSym]*predicates.PredicateTable),
-		config:    cfg,
+		config:     cfg,
 		txPool: &sync.Pool{
 			New: func() interface{} {
 				return db.NewTransaction(false)
@@ -365,8 +386,8 @@ func (m *MEBStore) AddFact(fact Fact) error {
 func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	// 1. Collect all UNIQUE strings that need encoding
 	type stringRef struct {
-		index int   // Index in uniqueStrings
-		isObj bool  // True if this is an object string
+		index int  // Index in uniqueStrings
+		isObj bool // True if this is an object string
 	}
 	factStringRefs := make([][]stringRef, len(facts))
 	uniqueStringsMap := make(map[string]int) // string -> index in uniqueStrings
@@ -430,7 +451,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		// Get IDs for Subject, Predicate, Graph from refs
 		sID := ids[factStringRefs[i][0].index]
 		pID := ids[factStringRefs[i][1].index]
-		gID := ids[factStringRefs[i][2].index]
+		// gID := ids[factStringRefs[i][2].index] // Graph ID unused in 24-byte key mode
 
 		// Handle Object (could be string or other type)
 		var oID uint64
@@ -446,22 +467,13 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			}
 		}
 
-		// Add to all 3 quad indices
-		// SPOG: Subject -> Predicate -> Object -> Graph (forward lookups)
-		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, sID, pID, oID, gID)
+		// Add to main index: S|P|O (24 bytes)
+		// We drop explicit Graph support in the key for density, or assume Graph is handled outside/implicitly?
+		// Requirement strictly asked for 24-byte key: S+P+O.
+		spogKey := keys.BuildKey(sID, pID, oID)
+
+		// Use idempotent overwrite (Set)
 		if err := batch.Set(spogKey, nil); err != nil {
-			return err
-		}
-
-		// POSG: Predicate -> Object -> Subject -> Graph (reverse lookups)
-		posgKey := keys.EncodeQuadKey(keys.QuadPOSGPrefix, sID, pID, oID, gID)
-		if err := batch.Set(posgKey, nil); err != nil {
-			return err
-		}
-
-		// GSPO: Graph -> Subject -> Predicate -> Object (graph lifecycle)
-		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, sID, pID, oID, gID)
-		if err := batch.Set(gspoKey, nil); err != nil {
 			return err
 		}
 
@@ -581,29 +593,20 @@ func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 }
 
 // ScanContext is like Scan but accepts a context for cancellation.
-// Use this for long-running scans that need to respect context cancellation.
+// optimized for 24-byte S|P|O keys.
 func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
 	return func(yield func(Fact, error) bool) {
-		// Helper to append uint64 to byte slice
-		appendUint64 := func(b []byte, v uint64) []byte {
-			buf := make([]byte, 8)
-			binary.BigEndian.PutUint64(buf, v)
-			return append(b, buf...)
-		}
-
 		// Collect bound arguments
-		var sID, pID, oID, gID uint64
+		var sID, pID, oID uint64
+		// var gID uint64 // Graph not supported in 24-byte key
 		var sBound, pBound, oBound, gBound bool
 		var err error
 
 		// Convert bound arguments to IDs
-		// If a bound argument is not found in the dictionary, it means no facts match
-		// Return empty iterator rather than an error
 		if s != "" {
 			sID, err = m.dict.GetID(s)
 			if err != nil {
-				// Subject not in dictionary means no facts with this subject exist
-				return
+				return // Subject not found -> no facts
 			}
 			sBound = true
 		}
@@ -611,160 +614,169 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2
 		if p != "" {
 			pID, err = m.dict.GetID(p)
 			if err != nil {
-				// Predicate not in dictionary means no facts with this predicate exist
-				return
+				return // Predicate not found -> no facts
 			}
 			pBound = true
 		}
 
-		if o != "" {
-			oID, err = m.dict.GetID(o)
-			if err != nil {
-				// Object not in dictionary means no facts with this object exist
-				return
-			}
-			oBound = true
-		}
-
 		if g != "" {
-			gID, err = m.dict.GetID(g)
-			if err != nil {
-				// Graph not in dictionary means no facts in this graph exist
-				return
-			}
+			// gID, err = m.dict.GetID(g) // Optim: don't look up ID if we just check string equality later
+			// if err != nil {
+			// return // Graph not found
+			// }
 			gBound = true
-		}
 
-		// Log scan parameters for debugging (enabled via LOG_LEVEL=debug)
-		slog.Debug("scan parameters",
-			"subject", s,
-			"subjectID", sID,
-			"subjectBound", sBound,
-			"predicate", p,
-			"predicateID", pID,
-			"predicateBound", pBound,
-			"object", o,
-			"objectID", oID,
-			"objectBound", oBound,
-			"graph", g,
-			"graphID", gID,
-			"graphBound", gBound,
-		)
-
-		// Reject full table scans (no arguments bound)
-		if !sBound && !pBound && !oBound && !gBound {
-			return
-		}
-
-		// Select the best index and prefix
-		var prefix []byte
-
-		// Strategy: Choose index based on bound arguments
-		// Priority:
-		// 1. If graph bound + subject/predicate bound -> Use GSPO (G|S|P...) for efficient graph filtering
-		// 2. If object bound + predicate bound (and not with graph) -> Use POSG (P|O...) for reverse traversal
-		// 3. If subject bound (no graph) -> Use SPOG (S|P...) for forward traversal
-		// 4. If graph + predicate bound (no subject) -> Use POSG with graph wildcard
-		// 5. If only predicate or object bound -> Not efficiently supported (full scan required)
-		if gBound && sBound {
-			// Use GSPO index when graph is bound with subject
-			// GSPO order: G, S, P, O
-			prefix = []byte{keys.QuadGSPOPrefix}
-			prefix = appendUint64(prefix, gID)
-			prefix = appendUint64(prefix, sID)
-			if pBound {
-				prefix = appendUint64(prefix, pID)
-			}
-			// Note: We can't filter by object without full index
-		} else if oBound && pBound && !gBound {
-			// POSG prefix order: P, O, S, G (requires predicate bound)
-			// We can't efficiently use POSG when graph is also bound
-			prefix = keys.EncodeQuadPOSGPrefix(pID, oID, sID, gID)
-		} else if sBound && !gBound {
-			// SPOG prefix (no graph bound)
-			prefix = keys.EncodeQuadSPOGPrefix(sID, pID, oID, gID)
-		} else if gBound && pBound {
-			// Graph + predicate bound: Use POSG with graph=0 (wildcard)
-			// POSG order: P, O, S, G
-			// We set gID=0 to match all graphs, then filter in the loop
-			prefix = keys.EncodeQuadPOSGPrefix(pID, oID, sID, 0)
-		} else if gBound {
-			// Use GSPO for graph-only queries
-			prefix = keys.EncodeQuadGSPOPrefix(gID)
-		} else {
-			// Only predicate or object-only bound - not efficiently supported
-			return
-		}
-
-		// Create read-only transaction
-		txn := m.db.NewTransaction(false)
-		defer txn.Discard()
-
-		// Create iterator
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false // We only need keys
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		// Scan using the selected index
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			// Check for context cancellation
-			select {
-			case <-ctx.Done():
-				yield(Fact{}, ctx.Err())
-				return
-			default:
-				// Continue scanning
+			if o != "" {
+				oID, err = m.dict.GetID(o)
+				if err != nil {
+					return // Object not found -> no facts
+				}
+				oBound = true
 			}
 
-			item := it.Item()
-			key := item.Key()
-
-			// Decode the quad key
-			decodedS, decodedP, decodedO, decodedG := keys.DecodeQuadKey(key)
-
-			// Convert IDs back to strings
-			subject, err := m.dict.GetString(decodedS)
-			if err != nil {
-				yield(Fact{}, err)
+			// Reject full table scans (no arguments bound)
+			if !sBound && !pBound && !oBound {
+				// If only G is bound, we can't scan efficiently with SPO keys
 				return
 			}
 
-			predicate, err := m.dict.GetString(decodedP)
-			if err != nil {
-				yield(Fact{}, err)
+			// Determine Prefix
+			var prefix []byte
+
+			if sBound {
+				// Efficient S-scan: [S] or [S|P] or [S|P|O]
+				prefix = make([]byte, 8)
+				binary.BigEndian.PutUint64(prefix, sID)
+
+				if pBound {
+					pBytes := make([]byte, 8)
+					binary.BigEndian.PutUint64(pBytes, pID)
+					prefix = append(prefix, pBytes...)
+
+					if oBound {
+						oBytes := make([]byte, 8)
+						binary.BigEndian.PutUint64(oBytes, oID)
+						prefix = append(prefix, oBytes...)
+					}
+				}
+			} else {
+				// No Subject bound.
+				// Since we ONLY use S|P|O keys (24 bytes), we CANNOT efficiently scan P or O without S.
+				// We must fallback to full scan or return error/empty?
+				// For "2 Billion Nodes" scale, full scan is prohibitive.
+				// We return empty for now, assuming query planner handles this or user provides S.
+				// "Task 4: Optimized Prefix Scanner... Scanner that takes SubjectID..."
+				// This implies the contract is S-based.
 				return
 			}
 
-			objectStr, err := m.dict.GetString(decodedO)
-			if err != nil {
-				yield(Fact{}, err)
-				return
-			}
+			// Create read-only transaction
+			txn := m.db.NewTransaction(false)
+			defer txn.Discard()
 
-			graph, err := m.dict.GetString(decodedG)
-			if err != nil {
-				yield(Fact{}, err)
-				return
-			}
+			// Create iterator
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false // We only need keys
+			// opts.Prefix = prefix // Badger option optim?
 
-			// Filter by graph if graph is bound and we're using a wildcard prefix
-			if gBound && graph != g {
-				continue
-			}
+			it := txn.NewIterator(opts)
+			defer it.Close()
 
-			// Build the Fact
-			fact := Fact{
-				Subject:   subject,
-				Predicate: predicate,
-				Object:    objectStr, // Object is stored as string in dictionary
-				Graph:     graph,
-			}
+			// Scan using the prefix
+			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+				// Check for context cancellation
+				select {
+				case <-ctx.Done():
+					yield(Fact{}, ctx.Err())
+					return
+				default:
+				}
 
-			// Yield the fact
-			if !yield(fact, nil) {
-				return
+				item := it.Item()
+				key := item.Key()
+
+				if len(key) != 24 {
+					continue // Skip non-fact keys (system keys etc)
+				}
+
+				// Decode the key manually (S|P|O)
+				// S is bytes 0-8, P is 8-16, O is 16-24
+
+				// If we are strictly scanning by S, sID is known.
+				// But let's decode from key to be safe/correct.
+				foundSID := binary.BigEndian.Uint64(key[0:8])
+				foundPID := binary.BigEndian.Uint64(key[8:16])
+				foundOID := binary.BigEndian.Uint64(key[16:24])
+
+				// Lazy Resolution: We have IDs. We effectively "yield" potentially just IDs?
+				// The interface requires returning `Fact` (strings).
+				// Requirement: "Lazy Resolution: The scanner should return uint64 IDs. Only resolve these back to Strings using the Dictionary at the final output stage."
+				// BUT `Scan` signature returns `iter.Seq2[Fact, error]`. `Fact` has strings.
+				// To strictly follow requirement, we should probably change `Scan` signature or have a low-level Scan.
+				// Changing `Scan` signature breaks `FactStore` interface.
+				// So we resolve here. "Final output stage" effectively means "before leaving the Store boundary"
+				// OR we change the API.
+				// Given "Task 4... Lazy Resolution", I will try to resolve here but maybe batch it?
+				// BadgerDB iterator loop is sequential.
+				// Resolving string for S is fast (known/cached since we bound it).
+				// P and O might need lookup.
+
+				// Resolve Strings
+				var subject, predicate, objectStr string
+
+				// Subject
+				if sBound && foundSID == sID {
+					subject = s // Use bound string
+				} else {
+					var err error
+					subject, err = m.dict.GetString(foundSID)
+					if err != nil {
+						yield(Fact{}, err)
+						return
+					}
+				}
+
+				// Predicate
+				if pBound && foundPID == pID {
+					predicate = p
+				} else {
+					var err error
+					predicate, err = m.dict.GetString(foundPID)
+					if err != nil {
+						yield(Fact{}, err)
+						return
+					}
+				}
+
+				// Object
+				if oBound && foundOID == oID {
+					objectStr = o
+				} else {
+					var err error
+					objectStr, err = m.dict.GetString(foundOID)
+					if err != nil {
+						yield(Fact{}, err)
+						return
+					}
+				}
+
+				// Graph is lost in 24-byte key. Defaulting.
+				graph := "default"
+				if gBound && g != "default" {
+					continue // Key doesn't enforce Graph, so we filter it out if user asked for specific non-default
+				}
+
+				// Build the Fact
+				fact := Fact{
+					Subject:   subject,
+					Predicate: predicate,
+					Object:    objectStr,
+					Graph:     graph,
+				}
+
+				if !yield(fact, nil) {
+					return
+				}
 			}
 		}
 	}
@@ -876,6 +888,12 @@ func (m *MEBStore) Close() error {
 	if err := m.dict.Close(); err != nil {
 		slog.Error("failed to close dictionary", "error", err)
 		return err
+	}
+
+	// Close Dictionary BadgerDB
+	if err := m.dictDB.Close(); err != nil {
+		slog.Error("failed to close dictionary database", "error", err)
+		// We still try to close the main DB even if this fails
 	}
 
 	// Close BadgerDB
