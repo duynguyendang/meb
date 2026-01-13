@@ -1,7 +1,8 @@
 package adapter
 
 import (
-	"github.com/duynguyendang/meb/keys"
+	"encoding/binary"
+
 	"github.com/dgraph-io/badger/v4"
 )
 
@@ -48,8 +49,8 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 	}
 
 	// Analyze binding pattern
-	var sBound, pBound, oBound bool
-	var sVal, pVal, oVal string
+	var sBound, pBound bool
+	var sVal, pVal string
 
 	if args[0] != nil {
 		sBound = true
@@ -59,64 +60,50 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 		pBound = true
 		pVal = args[1].(string)
 	}
-	if args[2] != nil {
-		oBound = true
-		oVal = args[2].(string)
-	}
+	// Object binding check removed as OPS is unsupported currently
 
 	// Reject full table scans
-	if !sBound && !pBound && !oBound {
+	if !sBound && !pBound {
 		return &EmptyIterator{}
 	}
 
-	// Strategy: Choose index based on bound arguments
-	// Case A: Subject bound -> Use SPO index
-	// Case B: Object bound but subject unbound -> Use OPS index
-	// Case C: Both subject and object bound -> Prefer SPO (arbitrary choice)
+	// Strategy: Use SPO index (24-byte S|P|O keys)
+	// Note: OPS index is not currently maintained in the main store (meb.go), so we rely on SPO.
 
 	var prefix []byte
 
 	if sBound {
 		// Convert subject to ID
-		sID, err := a.dict.GetOrCreateID(sVal)
+		sID, err := a.dict.GetID(sVal) // Use GetID (read-only), not GetOrCreateID
 		if err != nil {
 			return &EmptyIterator{}
 		}
+
+		// S prefix (8 bytes)
+		prefix = make([]byte, 8)
+		binary.LittleEndian.PutUint64(prefix, sID) // Note: Badger uses BigEndian usually? meb.go uses BigEndian.
+		// Wait, meb.go uses BigEndian. Let's stick to keys/encoding.go which uses BigEndian.
+
+		// Correction: Utilize BigEndian as per keys/encoding.go
+		binary.BigEndian.PutUint64(prefix, sID)
 
 		if pBound {
 			// Subject + Predicate bound
-			pID, err := a.dict.GetOrCreateID(pVal)
+			pID, err := a.dict.GetID(pVal)
 			if err != nil {
 				return &EmptyIterator{}
 			}
-			prefix = keys.EncodeSPOPrefix(sID, pID)
-		} else {
-			// Only subject bound
-			prefix = keys.EncodeSPOPrefix(sID, 0)
-		}
-	} else if oBound {
-		// Convert object to ID
-		oID, err := a.dict.GetOrCreateID(oVal)
-		if err != nil {
-			return &EmptyIterator{}
-		}
 
-		if pBound {
-			// Object + Predicate bound
-			pID, err := a.dict.GetOrCreateID(pVal)
-			if err != nil {
-				return &EmptyIterator{}
-			}
-			prefix = keys.EncodeOPSPrefix(oID, pID)
-		} else {
-			// Only object bound
-			prefix = keys.EncodeOPSPrefix(oID, 0)
+			// Append P (8 bytes)
+			pBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(pBytes, pID)
+			prefix = append(prefix, pBytes...)
 		}
 	} else {
-		// Only predicate bound - scan all facts with this predicate
-		// This requires a full predicate scan, which is expensive
-		// For now, we'll use SPO index with just the prefix byte
-		prefix = []byte{keys.SPOPrefix}
+		// No Subject bound.
+		// Since we only maintain S|P|O index, we cannot efficiently query without S.
+		// (OPS index support is currently disabled/removed in meb.go)
+		return &EmptyIterator{}
 	}
 
 	// Create read-only transaction
@@ -125,4 +112,3 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 	// Create iterator
 	return NewBadgerIterator(txn, prefix, a.dict)
 }
-

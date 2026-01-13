@@ -363,17 +363,7 @@ cfg := &store.Config{
 }
 ```
 
-### Development
 
-```go
-cfg := store.TestConfig("./testdata")
-```
-
-### In-Memory (for tests)
-
-```go
-cfg := store.InMemoryConfig()
-```
 
 ---
 

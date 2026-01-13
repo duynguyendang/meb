@@ -165,3 +165,8 @@ func (r *RangeAllocator) saveGlobalCounter() error {
 		return txn.Set([]byte(globalCounterKey), buf)
 	})
 }
+
+// CurrentID returns the highest ID allocated so far (approximate).
+func (r *RangeAllocator) CurrentID() uint64 {
+	return r.current.Load()
+}
