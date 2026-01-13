@@ -51,6 +51,13 @@ type Config struct {
 	// NumMemtables is the maximum number of tables to keep in memory which are waiting to be written to disk.
 	// Default: 5. Lower this to reduce memory usage.
 	NumMemtables int
+
+	// Profile specifies the resource profile ("Ingest-Heavy", "Safe-Serving").
+	// Defaults to "Ingest-Heavy" if empty.
+	Profile string
+
+	// ReadOnly enables read-only mode.
+	ReadOnly bool
 }
 
 // Validate checks if the configuration is valid and returns an error if not.
@@ -89,40 +96,16 @@ func DefaultConfig(dataDir string) *Config {
 		DictDir:        filepath.Join(dataDir, "dict"), // Separate dictionary directory
 		InMemory:       false,
 		BlockCacheSize: 8 << 30, // 8GB
-		IndexCacheSize: 1 << 30, // 1GB
+		IndexCacheSize: 2 << 30, // 2GB (Default for Ingest-Heavy)
 		LRUCacheSize:   100000,
 		Compression:    true,
 		SyncWrites:     false,
-		NumDictShards:  0, // Use single-threaded encoder by default
+		NumDictShards:  0,              // Use single-threaded encoder by default
+		Profile:        "Ingest-Heavy", // Default profile
 	}
 }
 
-// TestConfig returns a configuration suitable for testing.
-func TestConfig(dataDir string) *Config {
-	return &Config{
-		DataDir:        dataDir,
-		InMemory:       false,
-		BlockCacheSize: 100 << 20, // 100MB
-		IndexCacheSize: 10 << 20,  // 10MB
-		LRUCacheSize:   1000,
-		Compression:    true,
-		SyncWrites:     true, // Enable sync writes to ensure persistence in tests
-	}
-}
-
-// InMemoryConfig returns a configuration for in-memory mode.
-func InMemoryConfig() *Config {
-	return &Config{
-		InMemory:       true,
-		BlockCacheSize: 10 << 20, // 10MB
-		IndexCacheSize: 1 << 20,  // 1MB
-		LRUCacheSize:   1000,
-		Compression:    false,
-		SyncWrites:     false,
-	}
-}
-
-// buildBadgerOptions converts Config to badger.Options.
+// buildBadgerOptions converts Config to badger.Options based on Profile.
 func buildBadgerOptions(cfg *Config) badger.Options {
 	opts := badger.DefaultOptions(filepath.Join(cfg.DataDir, "badger"))
 
@@ -132,27 +115,58 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		return opts
 	}
 
+	// === Common Settings ===
+	// Disable conflict detection as we handle logic at app layer (SPO/OPS)
+	opts.DetectConflicts = false
+
+	// 1% false positive rate balances memory vs performance
+	opts.BloomFalsePositive = 0.01
+
 	// === Compression ===
 	if cfg.Compression {
-		// ZSTD provides better compression than Snappy
 		opts.Compression = options.ZSTD
 	} else {
 		opts.Compression = options.None
 	}
 
+	// === Profile Specific Settings ===
+	switch cfg.Profile {
+	case "Safe-Serving":
+		// Optimized for Low RAM / WSL / Cloud Run (1GB - 2GB Env)
+
+		// Note: TableLoadingMode/ValueLogLoadingMode APIs are not available in this Badger v4 version.
+		// We rely on default behavior (mmap).
+		// Use small ValueLogSize to minimize mmap overhead/locking.
+
+		// Strict small ValueLog to keep IO stable
+		opts.ValueLogFileSize = 64 << 20 // 64MB
+
+		// Limit compactors to prevent IO saturation on shared/emulated drives
+		// Badger v4 requires at least 2 compactors.
+		opts.NumCompactors = 2
+
+		// Force ReadOnly if configured (prevents compactions completely)
+		if cfg.ReadOnly {
+			opts.ReadOnly = true
+		}
+
+	case "Ingest-Heavy":
+		fallthrough
+	default:
+		// Optimized for High Performance / High RAM (Ingestion)
+
+		// Large ValueLog
+		opts.ValueLogFileSize = 1 << 30 // 1GB
+
+		// Standard Compactors
+		opts.NumCompactors = 4
+	}
+
 	// === Cache Sizes ===
+	// We use the values from parameters, which should have been set according to profile preferences
+	// by the caller or defaults.
 	opts.BlockCacheSize = cfg.BlockCacheSize
 	opts.IndexCacheSize = cfg.IndexCacheSize
-
-	// Number of compactors (parallel compaction)
-	opts.NumCompactors = 4
-
-	// === Bloom Filters ===
-	// 1% false positive rate balances memory vs performance
-	opts.BloomFalsePositive = 0.01
-
-	// === Value Log ===
-	opts.ValueLogFileSize = 256 << 20 // 256MB vlog files
 
 	// === Write Configuration ===
 	opts.SyncWrites = cfg.SyncWrites

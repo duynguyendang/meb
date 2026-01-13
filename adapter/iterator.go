@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"encoding/binary"
+
 	"github.com/dgraph-io/badger/v4"
 	"github.com/google/mangle/ast"
 )
@@ -124,29 +126,31 @@ func (bit *BadgerIterator) Close() error {
 }
 
 // decodeKey decodes a BadgerDB key back into subject, predicate, object strings.
-// Handles both SPO (0x01) and OPS (0x02) key formats.
+// Handles both SPO (0x01) and optimized 24-byte S|P|O keys.
 func (bit *BadgerIterator) decodeKey(key []byte) (subject, predicate, object string, err error) {
-	if len(key) < 25 {
-		return "", "", "", nil
-	}
-
-	// Import key decoding functions from keys package
-	// We need to re-implement here since we want to avoid circular dependencies
-	// and this is in the adapter package
-
 	var sID, pID, oID uint64
 
-	prefix := key[0]
-	switch prefix {
-	case 0x01: // SPO
-		sID = decodeUint64(key[1:9])
-		pID = decodeUint64(key[9:17])
-		oID = decodeUint64(key[17:25])
-	case 0x02: // OPS
-		oID = decodeUint64(key[1:9])
-		pID = decodeUint64(key[9:17])
-		sID = decodeUint64(key[17:25])
-	default:
+	if len(key) == 24 {
+		// Optimized 24-byte key (S|P|O)
+		sID = binary.BigEndian.Uint64(key[0:8])
+		pID = binary.BigEndian.Uint64(key[8:16])
+		oID = binary.BigEndian.Uint64(key[16:24])
+	} else if len(key) >= 25 {
+		// Legacy prefixed key
+		prefix := key[0]
+		switch prefix {
+		case 0x01: // SPO
+			sID = decodeUint64(key[1:9])
+			pID = decodeUint64(key[9:17])
+			oID = decodeUint64(key[17:25])
+		case 0x02: // OPS
+			oID = decodeUint64(key[1:9])
+			pID = decodeUint64(key[9:17])
+			sID = decodeUint64(key[17:25])
+		default:
+			return "", "", "", nil
+		}
+	} else {
 		return "", "", "", nil
 	}
 

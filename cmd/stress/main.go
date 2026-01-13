@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/duynguyendang/meb"
@@ -21,6 +22,7 @@ var (
 	flagReport       = flag.String("report", "test_report.md", "Output report file")
 	flagBlockCache   = flag.Int("block-cache", 2048, "Block cache size in MB")
 	flagIndexCache   = flag.Int("index-cache", 512, "Index cache size in MB")
+	flagProfile      = flag.String("profile", "", "Profile: Ingest-Heavy or Safe-Serving (default: auto)")
 )
 
 // Stats holds all metrics collected during the stress test
@@ -69,6 +71,27 @@ func main() {
 	log.Printf("Data Dir: %s", *flagDataDir)
 	log.Printf("Report: %s", *flagReport)
 
+	// Environment Detection & Guardrails
+	profile := *flagProfile
+	if profile == "" {
+		if os.Getenv("WSL_DISTRO_NAME") != "" || os.Getenv("K_SERVICE") != "" { // K_SERVICE is set in Cloud Run
+			profile = "Safe-Serving"
+		} else {
+			profile = "Ingest-Heavy" // Default for dev/vm
+		}
+	}
+	log.Printf("Using Profile: %s", profile)
+
+	// Set Memory Limit based on Profile
+	if profile == "Safe-Serving" {
+		limit := int64(900 * 1024 * 1024) // 900MB (Safety margin for 1GB env)
+		debug.SetMemoryLimit(limit)
+		log.Printf("Memory Limit set to: %d bytes (900MB)", limit)
+	} else {
+		// Optional: Release memory more aggressively in heavy ingest
+		debug.SetMemoryLimit(4 * 1024 * 1024 * 1024) // 4GB Limit for stability
+	}
+
 	// Initialize stats collector
 	stats := &Stats{}
 	statsCollector := NewStatsCollector()
@@ -76,7 +99,7 @@ func main() {
 
 	// Step 1: Setup database
 	log.Printf("\n=== Step 1: Setting up database ===")
-	store, err := setupDatabase()
+	store, err := setupDatabase(profile)
 	if err != nil {
 		log.Fatalf("Failed to setup database: %v", err)
 	}
@@ -123,7 +146,7 @@ func main() {
 }
 
 // setupDatabase creates and initializes the MEB store
-func setupDatabase() (*meb.MEBStore, error) {
+func setupDatabase(profile string) (*meb.MEBStore, error) {
 	// Clean up any existing data
 	os.RemoveAll(*flagDataDir)
 
@@ -131,14 +154,15 @@ func setupDatabase() (*meb.MEBStore, error) {
 	cfg := &store.Config{
 		DataDir:        *flagDataDir,
 		InMemory:       false,
-		BlockCacheSize: 128 << 20, // 128MB
-		IndexCacheSize: 64 << 20,  // 64MB
-		LRUCacheSize:   1000000,   // 1M entries
+		BlockCacheSize: int64(*flagBlockCache) << 20,
+		IndexCacheSize: int64(*flagIndexCache) << 20,
+		LRUCacheSize:   1000000, // 1M entries
 		Compression:    true,
 		SyncWrites:     false,
 		NumDictShards:  16,       // Sharded for concurrent workload
 		MemTableSize:   16 << 20, // 16MB
 		NumMemtables:   2,        // 2 Memtables
+		Profile:        profile,
 	}
 
 	return meb.NewMEBStore(cfg)

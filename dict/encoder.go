@@ -31,7 +31,6 @@ type Encoder struct {
 
 	// Components
 	allocator *RangeAllocator
-	filter    *BloomFilter
 }
 
 // lruCache wraps expirable.LRU for a simpler API
@@ -62,17 +61,11 @@ func NewEncoder(db *badger.DB, cacheSize int) (*Encoder, error) {
 		return nil, fmt.Errorf("failed to create range allocator: %w", err)
 	}
 
-	// Initialize BloomFilter (2B items, 1% FP)
-	// TODO: Load existing filter from disk if needed, or rebuild.
-	// For now we start fresh in RAM, assuming cold start or cache warming strategy.
-	filter := NewBloomFilter(2000000000, 0.01)
-
 	enc := &Encoder{
 		db:           db,
 		forwardCache: newLRUCache[string, uint64](cacheSize),
 		reverseCache: newLRUCache[uint64, string](cacheSize),
 		allocator:    allocator,
-		filter:       filter,
 	}
 
 	return enc, nil
@@ -88,16 +81,9 @@ func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
 		return id, nil
 	}
 
-	// 2. Check Bloom Filter (RAM)
-	// If bloom filter says "No", we are 100% sure it's not in DB.
-	// We can skip the disk read and go straight to allocation.
-	if e.filter != nil && !e.filter.Test(s) {
-		// Definitely not in DB. Allocate new ID.
-		return e.allocateNewID(s)
-	}
-
-	// 3. Check BadgerDB (Disk)
-	// Bloom filter said "Maybe", so we must check DB.
+	// 2. Check BadgerDB (Disk)
+	// Badger's native Bloom Filter (if loaded) will optimize this check.
+	// If native bloom says "No", txn.Get returns ErrKeyNotFound very quickly (no disk IO).
 	key := makeDictForwardKey(s)
 	var id uint64
 	err := e.db.View(func(txn *badger.Txn) error {
@@ -125,7 +111,7 @@ func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
 		return 0, err
 	}
 
-	// 4. Not in DB (False positive from Bloom Filter). Allocate new ID.
+	// 3. Not in DB. Allocate new ID.
 	return e.allocateNewID(s)
 }
 
@@ -168,11 +154,6 @@ func (e *Encoder) allocateNewID(s string) (uint64, error) {
 		return 0, err
 	}
 
-	// Add to Bloom Filter
-	if e.filter != nil {
-		e.filter.Add(s)
-	}
-
 	// Update cache
 	e.forwardCache.Add(s, newID)
 	e.reverseCache.Add(newID, s)
@@ -197,15 +178,6 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		if id, ok := e.forwardCache.Get(key); ok && id != 0 {
 			results[i] = id
 		} else {
-			// Check Bloom Filter immediately
-			if e.filter != nil && !e.filter.Test(key) {
-				// Definitely not in DB. Mark for allocation.
-				// We'll handle these as "definite misses" or just let the DB check loop handle them?
-				// To optimize, we can separate "definite new" from "possible existing".
-				// But for simplicity, we treat them as misses and then check DB only for valid bloom hits.
-				// Actually, simpler: just add to misses list.
-				// But we want to avoid DB lookups for bloom negatives.
-			}
 			misses = append(misses, miss{index: i, key: key})
 		}
 	}
@@ -214,56 +186,35 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		return results, nil
 	}
 
-	// 2. Filter Misses: Separate "Bloom Negative" (New) from "Bloom Positive" (Maybe Existing)
-	var possibleExisting []miss
-	var definiteNew []miss
-
-	for _, m := range misses {
-		if e.filter != nil && !e.filter.Test(m.key) {
-			definiteNew = append(definiteNew, m)
-		} else {
-			possibleExisting = append(possibleExisting, m)
-		}
-	}
-
-	// 3. Slow Path: Check BadgerDB for "possible existing"
-	if len(possibleExisting) > 0 {
-		err := e.db.View(func(txn *badger.Txn) error {
-			for _, m := range possibleExisting {
-				key := makeDictForwardKey(m.key)
-				item, err := txn.Get(key)
-				if err == badger.ErrKeyNotFound {
-					continue // Will need to allocate new ID
-				}
-				if err != nil {
-					return err
-				}
-				if err := item.Value(func(val []byte) error {
-					results[m.index] = binary.BigEndian.Uint64(val)
-					return nil
-				}); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// 4. Collect all keys that still need IDs (Bloom hits not found in DB + Bloom misses)
+	// 2. Check BadgerDB for misses
+	// We treat all cache misses as potential DB hits.
+	// Badger's native bloom filter handles the negative lookups efficiently.
 	var toCreate []miss
 
-	// Add those from possibleExisting that weren't found
-	for _, m := range possibleExisting {
-		if results[m.index] == 0 {
-			toCreate = append(toCreate, m)
+	err := e.db.View(func(txn *badger.Txn) error {
+		for _, m := range misses {
+			key := makeDictForwardKey(m.key)
+			item, err := txn.Get(key)
+			if err == badger.ErrKeyNotFound {
+				toCreate = append(toCreate, m)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := item.Value(func(val []byte) error {
+				results[m.index] = binary.BigEndian.Uint64(val)
+				return nil
+			}); err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
-	// Add all definiteNew
-	toCreate = append(toCreate, definiteNew...)
 
 	if len(toCreate) > 0 {
 		slog.Debug("dictionary allocating new IDs",
@@ -298,11 +249,6 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 				return nil, err
 			}
 
-			// Add to Bloom Filter
-			if e.filter != nil {
-				e.filter.Add(m.key)
-			}
-
 			// Update cache
 			e.forwardCache.Add(m.key, newID)
 			e.reverseCache.Add(newID, m.key)
@@ -311,14 +257,18 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		if err := batch.Flush(); err != nil {
 			return nil, err
 		}
-
-		// Note: RangeAllocator persisting is handled inside AllocateBatch
 	}
 
-	// 5. Update cache for results found in DB (step 3)
-	for _, m := range possibleExisting {
+	// 3. Update cache for results found in DB
+	for _, m := range misses {
+		// If it was found (not added to toCreate, or added and now has result), update cache
+		// Actually simpler: just iterate all original misses and check if they have result now
+		// but we already updated cache for 'toCreate' items.
+		// We just need to update cache for items found in DB (not in toCreate)
+
 		id := results[m.index]
 		if id != 0 {
+			// Redundant add for toCreate items but safe/cheap
 			e.forwardCache.Add(m.key, id)
 			e.reverseCache.Add(id, m.key)
 		}
@@ -432,5 +382,6 @@ func (e *Encoder) Stats() map[string]interface{} {
 	return map[string]interface{}{
 		"forward_cache_len": e.forwardCache.cache.Len(),
 		"reverse_cache_len": e.reverseCache.cache.Len(),
+		"next_id":           e.allocator.CurrentID() + 1,
 	}
 }
