@@ -7,8 +7,8 @@ import (
 // Prefix constants for different index types
 const (
 	// Triple indices (legacy, kept for backward compatibility)
-	SPOPrefix byte = 0x01 // Subject-Predicate-Object index
-	OPSPrefix byte = 0x02 // Object-Predicate-Subject index
+	SPOPrefix   byte = 0x01 // Subject-Predicate-Object index
+	OPSPrefix   byte = 0x02 // Object-Predicate-Subject index
 	ChunkPrefix byte = 0x10 // Content blob storage
 
 	// Quad indices (new for multi-tenancy/RAG contexts)
@@ -24,7 +24,7 @@ const (
 const (
 	// Component sizes
 	PrefixSize = 1 // Size of key prefix byte
-	IDSize      = 8 // Size of each uint64 ID component
+	IDSize     = 8 // Size of each uint64 ID component
 
 	// Triple key sizes: prefix(1) + 3*ID(8) = 25 bytes
 	TripleKeySize = PrefixSize + 3*IDSize // 25 bytes
@@ -34,10 +34,24 @@ const (
 
 	// Chunk key sizes: prefix(1) + ID(8) = 9 bytes
 	ChunkKeySize = PrefixSize + IDSize // 9 bytes
+
+	// Optimized 24-byte key size (S+P+O)
+	TotalKeySize = 3 * IDSize
 )
 
 // System metadata keys
 var KeyFactCount = []byte{SystemPrefix, 0x01} // Stores the total fact count
+
+// BuildKey creates a 24-byte composite key (S|P|O).
+// Structure: [Subject(8) | Predicate(8) | Object(8)]
+// Used for high-performance sequential scanning.
+func BuildKey(s, p, o uint64) []byte {
+	k := make([]byte, TotalKeySize)
+	binary.BigEndian.PutUint64(k[0:8], s)
+	binary.BigEndian.PutUint64(k[8:16], p)
+	binary.BigEndian.PutUint64(k[16:24], o)
+	return k
+}
 
 // Triple encoding format:
 // SPO: [prefix(1) | subject(8) | predicate(8) | object(8)] = 25 bytes

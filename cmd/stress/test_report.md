@@ -1,33 +1,35 @@
 # MEB Engine Stress Test Report
 
-**Date:** 2026-01-09 12:30:13
+**Date:** 2026-01-13 09:39:30
 **Hardware:** linux / amd64 / 16 Cores
 
 ## 1. Database Statistics
-* **Total Documents:** 1000
-* **Total Facts:** 3518
-* **Database Size on Disk:** 0.63 GB
-* **Peak RAM Usage:** 0.00 MB
+* **Total Documents:** 50000
+* **Total Facts:** 175595
+* **Database Size on Disk:** 0.85 GB
+* **Peak RAM Usage:** 985.14 MB
 
 ## 2. Ingestion Performance
-* **Total Time:** 283ms
-* **Throughput:** 3535 docs/s
-* **Fact Throughput:** 12434 facts/s
+* **Total Time:** 48.586s
+* **Throughput:** 1029 docs/s
+* **Fact Throughput:** 3614 facts/s
 
 ## 3. Query Performance (100 samples)
 
 | Query Type | P50 (ms) | P95 (ms) | P99 (ms) | Ops/sec |
 | :--- | :--- | :--- | :--- | :--- |
-| **Vector Search (SQ8)** | 0.05 | 0.09 | 0.13 | 20408 |
-| **Graph Scan (Quad)** | 0.02 | 0.04 | 0.07 | 55556 |
-| **Metadata Lookup** | 0.10 | 0.10 | 0.10 | 10000 |
-| **Mixed Query (RAG)** | 0.05 | 0.30 | 108.66 | 20833 |
+| **Vector Search (SQ8)** | 0.30 | 0.38 | 0.44 | 3344 |
+| **Graph Scan (Quad)** | 0.01 | 0.01 | 0.11 | 111111 |
+| **Metadata Lookup** | 0.01 | 0.01 | 0.03 | 125000 |
+| **Mixed Query (RAG)** | 0.36 | 1.11 | 103.29 | 2786 |
 
 ## 4. Observations
 * **Vector Search:** Excellent speed (P95 < 10ms)
 * **Graph Scan:** Excellent speed (P95 < 1ms)
 * **Metadata Lookup:** Excellent speed (P95 < 1ms)
 * **Ingestion:** Acceptable throughput (>1K docs/sec)
+* **Memory Efficiency:** Acceptable (20660 bytes/doc)
+
 
 ---
 

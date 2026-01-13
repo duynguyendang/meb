@@ -14,11 +14,13 @@ import (
 
 var (
 	// Test configuration flags
-	flagNumDocs    = flag.Int("n", 10_000_000, "Number of documents to generate")
-	flagBatch      = flag.Int("b", 1000, "Batch size for ingestion")
-	flagDataDir    = flag.String("dir", "./stress_data", "Data directory for the database")
+	flagNumDocs      = flag.Int("n", 10_000_000, "Number of documents to generate")
+	flagBatch        = flag.Int("b", 1000, "Batch size for ingestion")
+	flagDataDir      = flag.String("dir", "./stress_data", "Data directory for the database")
 	flagQuerySamples = flag.Int("q", 10_000, "Number of query samples for benchmarks")
-	flagReport     = flag.String("report", "test_report.md", "Output report file")
+	flagReport       = flag.String("report", "test_report.md", "Output report file")
+	flagBlockCache   = flag.Int("block-cache", 2048, "Block cache size in MB")
+	flagIndexCache   = flag.Int("index-cache", 512, "Index cache size in MB")
 )
 
 // Stats holds all metrics collected during the stress test
@@ -129,12 +131,14 @@ func setupDatabase() (*meb.MEBStore, error) {
 	cfg := &store.Config{
 		DataDir:        *flagDataDir,
 		InMemory:       false,
-		BlockCacheSize: 2 << 30,         // 2GB
-		IndexCacheSize: 512 << 20,       // 512MB
-		LRUCacheSize:   1000000,         // 1M entries
+		BlockCacheSize: 128 << 20, // 128MB
+		IndexCacheSize: 64 << 20,  // 64MB
+		LRUCacheSize:   1000000,   // 1M entries
 		Compression:    true,
 		SyncWrites:     false,
-		NumDictShards:  16, // Sharded for concurrent workload
+		NumDictShards:  16,       // Sharded for concurrent workload
+		MemTableSize:   16 << 20, // 16MB
+		NumMemtables:   2,        // 2 Memtables
 	}
 
 	return meb.NewMEBStore(cfg)
