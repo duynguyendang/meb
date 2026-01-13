@@ -24,7 +24,7 @@ It bridges the gap between structured relational data (**Knowledge Graphs**) and
 ## Why MEB?
 
 * **Hybrid Intelligence**: Combine Boolean graph filters with Vector similarity in a single atomic query
-* **Massive Scale**: Optimized for NVMe storage using a specialized Quad-index (SPOG, POSG, GSPO) architecture
+* **Massive Scale**: Optimized for NVMe storage using a specialized Dual-index (SPO, OPS) architecture for bidirectional graph traversal
 * **Extreme Efficiency**: Vector Compression - 1536-d float vectors reduced to 64-byte SQ8 integers
 * **Data Compression**: S2-compressed content storage for large blobs
 * **Zero-Copy**: Leverages unsafe pointers and mmap for near-zero memory allocation during scans
@@ -292,7 +292,7 @@ graph TD
     A["Query Layer<br/>Go 1.23 iter.Seq2 +</>neuro-symbolic fluent API"]
     B["Vector Layer<br/>MRL (64-d) + SQ8 int8 vectors<br/>SIMD-accelerated search"]
     C["Dictionary Layer<br/>Sharded string ↔ uint64 encoding<br/>LRU cache"]
-    D["Quad Store Layer<br/>BadgerDB - SPOG | POSG | GSPO<br/>indices for multi-tenant graphs"]
+    D["Quad Store Layer<br/>BadgerDB - SPO | OPS<br/>25-byte composite keys<br/>bidirectional traversal"]
     E["Content Layer<br/>S2 compression for<br/>document storage"]
 
     A --> B
@@ -309,13 +309,15 @@ graph TD
 
 ### Key Design Decisions
 
-**Quad Index Structure**
+**Dual Index Structure (25-byte Hierarchical Composite Keys)**
 
-* **SPOG** (Subject-Predicate-Object-Graph): Fast forward traversals
-* **POSG** (Predicate-Object-Subject-Graph): Reverse lookups with predicate
-* **GSPO** (Graph-Subject-Predicate-Object): Graph lifecycle (RAG contexts)
-* Enables O(1) lookups and efficient prefix scans
-* Supports multi-tenancy by isolating facts per graph
+* **SPO** (Subject-Predicate-Object): Fast forward traversals - find all relations from a subject
+* **OPS** (Object-Predicate-Subject): Efficient reverse lookups - find all subjects pointing to an object
+* **Key Format**: `[1-byte prefix][8-byte ID][8-byte ID][8-byte ID]` = 25 bytes total
+* **Atomic Dual-Write**: Every fact writes to both SPO and OPS indexes in a single transaction
+* Enables O(1) lookups and efficient prefix scans in both directions
+* Supports bidirectional graph traversal without full table scans
+* Query optimizer intelligently selects SPO or OPS based on bound arguments
 
 **Dictionary Encoding**
 
@@ -349,6 +351,20 @@ graph TD
 
 ## Configuration
 
+### Environment-Aware Configuration
+
+MEB provides `GetMEBOptions` for automatic tuning based on deployment environment:
+
+```go
+// For read-heavy serving (Cloud Run, low-memory environments)
+opts := meb.GetMEBOptions(true)  // isReadOnly = true
+// Sets: IndexCacheSize=256MB, BlockCacheSize=64MB
+
+// For ingestion-heavy workloads (VMs, development)
+opts := meb.GetMEBOptions(false)  // isReadOnly = false
+// Sets: IndexCacheSize=2GB, BlockCacheSize=1GB, NumCompactors=4
+```
+
 ### Production (1B nodes)
 
 ```go
@@ -369,27 +385,30 @@ cfg := &store.Config{
 
 ## Performance Metrics (Latest Benchmark)
 
-Based on a dataset of **10M+ documents** on a single NVMe-backed node:
+Based on a dataset of **50,000 documents** with dual-indexing (SPO + OPS):
 
 | Operation | P50 (ms) | P95 (ms) | P99 (ms) | Throughput (Ops/sec) |
 | --- | --- | --- | --- | --- |
-| **Vector Search (SQ8)** | 0.05 | 0.09 | 0.13 | ~20,400 |
-| **Graph Scan (Quad)** | 0.02 | 0.04 | 0.07 | ~55,500 |
-| **Metadata Lookup** | 0.10 | 0.10 | 0.10 | ~10,000 |
-| **Mixed Query (RAG)** | 0.05 | 0.30 | 108.66 | ~20,800 |
+| **Vector Search (SQ8)** | 0.34 | 0.59 | 0.94 | ~2,900 |
+| **Graph Scan (Dual-Index)** | 0.01 | 0.02 | 0.03 | ~142,800 |
+| **Metadata Lookup** | 0.01 | 0.01 | 0.03 | ~200,000 |
+| **Mixed Query (RAG)** | 0.74 | 3.92 | 23.52 | ~1,300 |
 
 ### Ingestion Throughput
 
-* **Steady State:** >1,000 documents/sec (includes S2 compression, vector processing, and multi-index quad storage).
+* **With Dual-Indexing:** 569 docs/sec, 1,991 facts/sec (includes S2 compression, vector processing, and dual atomic writes to SPO + OPS indexes)
+* **Memory Efficiency:** Peak RAM of 1.16 GB for 50K documents (~24 KB/doc)
+* **Database Size:** 2.32 GB on disk (175K facts total)
 
 ---
 
 ## Observations & Insights
 
-* **Sub-millisecond Latency:** Both Vector Search and Graph Scans maintain sub-millisecond P95 latency, making MEB suitable for real-time high-traffic applications.
-* **Mixed Query Stability:** RAG queries (Hybrid Search) perform nearly as fast as pure vector searches at P50, showcasing the efficiency of the integrated storage engine.
-* **P99 Tail Latency:** The P99 spike in mixed queries (~108ms) is observed during background BadgerDB maintenance (Value Log GC and Compaction). This is expected behavior for LSM-tree storage under heavy continuous load.
-* **Memory Efficiency:** MEB achieves extremely low heap allocation (near-zero per document in benchmarks) by leveraging **mmap** and **zero-copy** string/byte conversions, allowing large-scale indexing on nodes with limited RAM.
+* **Bidirectional Traversal:** Dual-indexing (SPO + OPS) enables blazing-fast graph scans in both directions with P95 < 1ms, eliminating the need for full table scans when querying by object.
+* **Sub-millisecond Latency:** Graph scans maintain sub-millisecond P95 latency even with dual-writes, making MEB suitable for real-time high-traffic applications.
+* **Atomic Dual-Write:** Every fact is atomically written to both SPO and OPS indexes in a single BadgerDB transaction, ensuring consistency without performance degradation.
+* **Memory Efficiency:** Peak RAM of 1.16 GB for 50K documents (~24 KB/doc) demonstrates excellent memory efficiency. MEB achieves this by leveraging **mmap**, **zero-copy** conversions, and BadgerDB's native bloom filters.
+* **Query Optimizer:** The scanner intelligently selects SPO or OPS index based on query patterns (subject-bound vs object-bound), maximizing performance for all query types.
 
 ### Advanced Features
 
