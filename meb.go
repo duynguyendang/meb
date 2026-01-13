@@ -467,13 +467,15 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			}
 		}
 
-		// Add to main index: S|P|O (24 bytes)
-		// We drop explicit Graph support in the key for density, or assume Graph is handled outside/implicitly?
-		// Requirement strictly asked for 24-byte key: S+P+O.
-		spogKey := keys.BuildKey(sID, pID, oID)
-
-		// Use idempotent overwrite (Set)
+		// Add to main index: SPO (25 bytes)
+		spogKey := keys.EncodeSPOKey(sID, pID, oID)
 		if err := batch.Set(spogKey, nil); err != nil {
+			return err
+		}
+
+		// Add to inverse index: OPS (25 bytes)
+		opsKey := keys.EncodeOPSKey(sID, pID, oID)
+		if err := batch.Set(opsKey, nil); err != nil {
 			return err
 		}
 
@@ -482,6 +484,34 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	}
 
 	return batch.Flush()
+}
+
+// GetMEBOptions returns BadgerDB options optimized for the host environment.
+func GetMEBOptions(isReadOnly bool) badger.Options {
+	opts := badger.DefaultOptions("")
+
+	// Detect environment (simplified logic for now)
+	// In a real scenario, this would check environment variables or runtime flags.
+	// Default to "cloud_run" profile for safety (low memory) if not specified.
+
+	opts.ReadOnly = isReadOnly
+	opts.Logger = nil // Disable default logger to avoid noise
+
+	// Profile: Cloud Run (Serving) - Low Memory
+	// Optimization: bloom filters off for read-only if valid, small cache
+	if isReadOnly {
+		opts.IndexCacheSize = 256 << 20 // 256MB
+		opts.BlockCacheSize = 64 << 20  // 64MB
+
+	} else {
+		// Profile: VM (Ingestion) - High Throughput
+		opts.IndexCacheSize = 2 << 30 // 2GB
+		opts.BlockCacheSize = 1 << 30 // 1GB
+		opts.NumCompactors = 4
+		opts.CompactL0OnClose = true
+	}
+
+	return opts
 }
 
 // DeleteGraph removes all facts belonging to the specified graph context.
@@ -598,8 +628,7 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2
 	return func(yield func(Fact, error) bool) {
 		// Collect bound arguments
 		var sID, pID, oID uint64
-		// var gID uint64 // Graph not supported in 24-byte key
-		var sBound, pBound, oBound, gBound bool
+		var sBound, pBound, oBound bool
 		var err error
 
 		// Convert bound arguments to IDs
@@ -619,164 +648,144 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2
 			pBound = true
 		}
 
-		if g != "" {
-			// gID, err = m.dict.GetID(g) // Optim: don't look up ID if we just check string equality later
-			// if err != nil {
-			// return // Graph not found
-			// }
-			gBound = true
-
-			if o != "" {
-				oID, err = m.dict.GetID(o)
-				if err != nil {
-					return // Object not found -> no facts
-				}
-				oBound = true
+		if o != "" {
+			oID, err = m.dict.GetID(o)
+			if err != nil {
+				return // Object not found -> no facts
 			}
+			oBound = true
+		}
 
-			// Reject full table scans (no arguments bound)
-			if !sBound && !pBound && !oBound {
-				// If only G is bound, we can't scan efficiently with SPO keys
+		// Reject full table scans (no arguments bound)
+		if !sBound && !pBound && !oBound {
+			// If only G is bound (which we ignore in keys), we can't scan efficiently
+			return
+		}
+
+		// Determine Index and Prefix
+		var prefix []byte
+		var useOPS bool
+
+		if sBound {
+			// Strategy: Use SPO index
+			// Prefix: [S] or [S|P] (We can't do S|P|O efficiently if O is also bound but we want to iterate?
+			//          Actually if S, P, O are ALL bound, we just check existence.
+			//          For iteration, we usually have at least one unbound.
+			//          If all bound, prefix scan works fine too (returns 1 item).
+			prefix = keys.EncodeSPOPrefix(sID, pID)
+		} else if oBound {
+			// Strategy: Use OPS index
+			// Prefix: [O] or [O|P]
+			useOPS = true
+			prefix = keys.EncodeOPSPrefix(oID, pID)
+		} else {
+			// Only P bound?
+			// Defined in requirements: "Inverse Index (OPS)... Purpose: O(1) for Find all entities related to O".
+			// If only P bound, we still can't scan efficiently without full scan?
+			// Most triples stores don't optimize for (? P ?) without additional index (POS).
+			// We only have SPO and OPS.
+			// So we return empty or error?
+			// Let's assume we return empty as per "Scan returns... efficiently".
+			return
+		}
+
+		// Create read-only transaction
+		txn := m.db.NewTransaction(false)
+		defer txn.Discard()
+
+		// Create iterator
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false // We only need keys
+
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		// Scan using the prefix
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			// Check for context cancellation
+			select {
+			case <-ctx.Done():
+				yield(Fact{}, ctx.Err())
 				return
+			default:
 			}
 
-			// Determine Prefix
-			var prefix []byte
+			item := it.Item()
+			key := item.Key()
 
-			if sBound {
-				// Efficient S-scan: [S] or [S|P] or [S|P|O]
-				prefix = make([]byte, 8)
-				binary.BigEndian.PutUint64(prefix, sID)
+			if len(key) != keys.TripleKeySize { // 25 bytes
+				continue // Skip non-fact keys
+			}
 
-				if pBound {
-					pBytes := make([]byte, 8)
-					binary.BigEndian.PutUint64(pBytes, pID)
-					prefix = append(prefix, pBytes...)
-
-					if oBound {
-						oBytes := make([]byte, 8)
-						binary.BigEndian.PutUint64(oBytes, oID)
-						prefix = append(prefix, oBytes...)
-					}
-				}
+			// Decode the key
+			var foundSID, foundPID, foundOID uint64
+			if useOPS {
+				foundSID, foundPID, foundOID = keys.DecodeOPSKey(key)
 			} else {
-				// No Subject bound.
-				// Since we ONLY use S|P|O keys (24 bytes), we CANNOT efficiently scan P or O without S.
-				// We must fallback to full scan or return error/empty?
-				// For "2 Billion Nodes" scale, full scan is prohibitive.
-				// We return empty for now, assuming query planner handles this or user provides S.
-				// "Task 4: Optimized Prefix Scanner... Scanner that takes SubjectID..."
-				// This implies the contract is S-based.
-				return
+				foundSID, foundPID, foundOID = keys.DecodeSPOKey(key)
 			}
 
-			// Create read-only transaction
-			txn := m.db.NewTransaction(false)
-			defer txn.Discard()
+			// Validate with specific bindings (filter step)
+			// (Prefix scan handles most, but if we did S|P prefix and O was also bound (existence check), we need to verify O)
+			if sBound && foundSID != sID {
+				continue
+			}
+			if pBound && foundPID != pID {
+				continue
+			}
+			if oBound && foundOID != oID {
+				continue
+			}
 
-			// Create iterator
-			opts := badger.DefaultIteratorOptions
-			opts.PrefetchValues = false // We only need keys
-			// opts.Prefix = prefix // Badger option optim?
+			// Resolve Strings
+			var subject, predicate, objectStr string
 
-			it := txn.NewIterator(opts)
-			defer it.Close()
-
-			// Scan using the prefix
-			for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-				// Check for context cancellation
-				select {
-				case <-ctx.Done():
-					yield(Fact{}, ctx.Err())
-					return
-				default:
-				}
-
-				item := it.Item()
-				key := item.Key()
-
-				if len(key) != 24 {
-					continue // Skip non-fact keys (system keys etc)
-				}
-
-				// Decode the key manually (S|P|O)
-				// S is bytes 0-8, P is 8-16, O is 16-24
-
-				// If we are strictly scanning by S, sID is known.
-				// But let's decode from key to be safe/correct.
-				foundSID := binary.BigEndian.Uint64(key[0:8])
-				foundPID := binary.BigEndian.Uint64(key[8:16])
-				foundOID := binary.BigEndian.Uint64(key[16:24])
-
-				// Lazy Resolution: We have IDs. We effectively "yield" potentially just IDs?
-				// The interface requires returning `Fact` (strings).
-				// Requirement: "Lazy Resolution: The scanner should return uint64 IDs. Only resolve these back to Strings using the Dictionary at the final output stage."
-				// BUT `Scan` signature returns `iter.Seq2[Fact, error]`. `Fact` has strings.
-				// To strictly follow requirement, we should probably change `Scan` signature or have a low-level Scan.
-				// Changing `Scan` signature breaks `FactStore` interface.
-				// So we resolve here. "Final output stage" effectively means "before leaving the Store boundary"
-				// OR we change the API.
-				// Given "Task 4... Lazy Resolution", I will try to resolve here but maybe batch it?
-				// BadgerDB iterator loop is sequential.
-				// Resolving string for S is fast (known/cached since we bound it).
-				// P and O might need lookup.
-
-				// Resolve Strings
-				var subject, predicate, objectStr string
-
-				// Subject
-				if sBound && foundSID == sID {
-					subject = s // Use bound string
-				} else {
-					var err error
-					subject, err = m.dict.GetString(foundSID)
-					if err != nil {
-						yield(Fact{}, err)
-						return
-					}
-				}
-
-				// Predicate
-				if pBound && foundPID == pID {
-					predicate = p
-				} else {
-					var err error
-					predicate, err = m.dict.GetString(foundPID)
-					if err != nil {
-						yield(Fact{}, err)
-						return
-					}
-				}
-
-				// Object
-				if oBound && foundOID == oID {
-					objectStr = o
-				} else {
-					var err error
-					objectStr, err = m.dict.GetString(foundOID)
-					if err != nil {
-						yield(Fact{}, err)
-						return
-					}
-				}
-
-				// Graph is lost in 24-byte key. Defaulting.
-				graph := "default"
-				if gBound && g != "default" {
-					continue // Key doesn't enforce Graph, so we filter it out if user asked for specific non-default
-				}
-
-				// Build the Fact
-				fact := Fact{
-					Subject:   subject,
-					Predicate: predicate,
-					Object:    objectStr,
-					Graph:     graph,
-				}
-
-				if !yield(fact, nil) {
+			// Subject
+			if sBound {
+				subject = s
+			} else {
+				var err error
+				subject, err = m.dict.GetString(foundSID)
+				if err != nil {
+					yield(Fact{}, err)
 					return
 				}
+			}
+
+			// Predicate
+			if pBound {
+				predicate = p
+			} else {
+				var err error
+				predicate, err = m.dict.GetString(foundPID)
+				if err != nil {
+					yield(Fact{}, err)
+					return
+				}
+			}
+
+			// Object
+			if oBound {
+				objectStr = o
+			} else {
+				var err error
+				objectStr, err = m.dict.GetString(foundOID)
+				if err != nil {
+					yield(Fact{}, err)
+					return
+				}
+			}
+
+			// Build the Fact
+			fact := Fact{
+				Subject:   subject,
+				Predicate: predicate,
+				Object:    objectStr,
+				Graph:     "default", // Graph info partially lost in dual-index mode, handled externally or assumed default
+			}
+
+			if !yield(fact, nil) {
+				return
 			}
 		}
 	}
@@ -1347,6 +1356,8 @@ func Filter(seq iter.Seq2[Fact, error], pred func(Fact) bool) iter.Seq2[Fact, er
 //	    }
 //	    return name, nil
 //	})
+//
+// Map transforms a sequence of facts into a sequence of values of type T.
 func Map[T any](seq iter.Seq2[Fact, error], fn func(Fact) (T, error)) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		for f, err := range seq {

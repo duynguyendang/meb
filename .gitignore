@@ -32,4 +32,5 @@ go.work.sum
 # .vscode/
 .claude/
 docs/
-stress_test_data/
+stress_data/
+badger/
