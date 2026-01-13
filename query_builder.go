@@ -3,8 +3,8 @@ package meb
 import (
 	"fmt"
 	"iter"
-	"unsafe"
 
+	"github.com/duynguyendang/meb/utils"
 	"github.com/duynguyendang/meb/vector"
 )
 
@@ -18,7 +18,7 @@ const (
 type GraphFilter struct {
 	Predicate string
 	Object    interface{} // string, int, float64, etc.
-	Graph     string     // Graph context for this filter. Defaults to "default".
+	Graph     string      // Graph context for this filter. Defaults to "default".
 }
 
 // Store defines the interface required by the query builder.
@@ -32,21 +32,21 @@ type Store interface {
 // Builder provides a fluent API for neuro-symbolic search.
 // It combines vector similarity search with graph filtering.
 type Builder struct {
-	store       Store
-	vectorQuery []float32
-	threshold   float32 // Minimum similarity threshold (0-1)
-	filters     []GraphFilter
-	graph       string // Default graph for queries
-	limit       int
+	store               Store
+	vectorQuery         []float32
+	threshold           float32 // Minimum similarity threshold (0-1)
+	filters             []GraphFilter
+	graph               string // Default graph for queries
+	limit               int
 	candidateMultiplier int
 }
 
 // NewBuilder creates a new query builder.
 func NewBuilder(store Store) *Builder {
 	return &Builder{
-		store:              store,
-		graph:              "default", // Default graph context
-		limit:              10,                           // Default limit
+		store:               store,
+		graph:               "default", // Default graph context
+		limit:               10,        // Default limit
 		candidateMultiplier: DefaultCandidateMultiplier,
 	}
 }
@@ -149,8 +149,8 @@ func (b *Builder) Execute() ([]Result, error) {
 			contentBytes, err := b.store.GetContent(vecResult.ID)
 			contentStr := ""
 			if err == nil && contentBytes != nil {
-				// Convert bytes to string without copying
-				contentStr = toString(contentBytes)
+				// Convert bytes to string without copying using unsafe util
+				contentStr = utils.BytesToString(contentBytes)
 			}
 			// Ignore errors - content is optional
 
@@ -178,6 +178,7 @@ func (b *Builder) matchesFilters(candidateKey string) bool {
 		// Use Scan to check if fact exists: Scan(candidateKey, filter.Predicate, filter.Object, filter.Graph)
 		matched := false
 
+		// We just need to find ONE matching fact to satisfy the filter
 		for _, err := range b.store.Scan(candidateKey, filter.Predicate, fmt.Sprintf("%v", filter.Object), filter.Graph) {
 			if err != nil {
 				return false
@@ -193,24 +194,4 @@ func (b *Builder) matchesFilters(candidateKey string) bool {
 	}
 
 	return true
-}
-
-// toString converts a byte slice to string without copying.
-//
-// SAFETY CONTRACT: This function uses unsafe operations for zero-copy conversion.
-// The caller MUST ensure that the byte slice 'b' is never modified after this
-// function returns. Violating this contract will result in undefined behavior.
-//
-// Usage: Only use this when 'b' is guaranteed to be immutable after conversion,
-// such as when it's a freshly allocated slice returned from GetContent that
-// won't be reused or modified.
-//
-// For general use cases where safety is a concern, use string(b) instead.
-func toString(b []byte) string {
-	// SAFETY: The unsafe.String constructor creates a string that shares the
-	// underlying byte array with 'b'. As long as 'b' is not modified after
-	// this call, this is safe. In the context of Execute(), b comes from
-	// GetContent which returns a new byte slice that is not subsequently
-	// modified, making this conversion safe.
-	return unsafe.String(unsafe.SliceData(b), len(b))
 }
