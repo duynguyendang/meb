@@ -1,9 +1,8 @@
 package adapter
 
 import (
-	"encoding/binary"
-
 	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/keys"
 )
 
 // FactSource is the interface that the Mangle Inference Engine expects
@@ -60,49 +59,62 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 		pBound = true
 		pVal = args[1].(string)
 	}
-	// Object binding check removed as OPS is unsupported currently
+	// Object binding check
+	var oBound bool
+	var oVal string
+	if args[2] != nil {
+		oBound = true
+		oVal = args[2].(string)
+	}
 
 	// Reject full table scans
-	if !sBound && !pBound {
+	if !sBound && !pBound && !oBound {
 		return &EmptyIterator{}
 	}
 
-	// Strategy: Use SPO index (24-byte S|P|O keys)
-	// Note: OPS index is not currently maintained in the main store (meb.go), so we rely on SPO.
-
+	// Strategy: Choose between SPO and OPS index
 	var prefix []byte
 
 	if sBound {
-		// Convert subject to ID
-		sID, err := a.dict.GetID(sVal) // Use GetID (read-only), not GetOrCreateID
+		// Use SPO Index
+		sID, err := a.dict.GetID(sVal)
 		if err != nil {
 			return &EmptyIterator{}
 		}
 
-		// S prefix (8 bytes)
-		prefix = make([]byte, 8)
-		binary.LittleEndian.PutUint64(prefix, sID) // Note: Badger uses BigEndian usually? meb.go uses BigEndian.
-		// Wait, meb.go uses BigEndian. Let's stick to keys/encoding.go which uses BigEndian.
-
-		// Correction: Utilize BigEndian as per keys/encoding.go
-		binary.BigEndian.PutUint64(prefix, sID)
-
+		var pID uint64
 		if pBound {
-			// Subject + Predicate bound
-			pID, err := a.dict.GetID(pVal)
+			pID, err = a.dict.GetID(pVal)
 			if err != nil {
 				return &EmptyIterator{}
 			}
-
-			// Append P (8 bytes)
-			pBytes := make([]byte, 8)
-			binary.BigEndian.PutUint64(pBytes, pID)
-			prefix = append(prefix, pBytes...)
 		}
+
+		// Use helper to generate SPO prefix
+		prefix = keys.EncodeSPOPrefix(sID, pID)
+
+	} else if oBound {
+		// Use OPS Index
+		oID, err := a.dict.GetID(oVal)
+		if err != nil {
+			return &EmptyIterator{}
+		}
+
+		var pID uint64
+		if pBound {
+			pID, err = a.dict.GetID(pVal)
+			if err != nil {
+				return &EmptyIterator{}
+			}
+		}
+
+		// Use helper to generate OPS prefix
+		prefix = keys.EncodeOPSPrefix(oID, pID)
+
 	} else {
-		// No Subject bound.
-		// Since we only maintain S|P|O index, we cannot efficiently query without S.
-		// (OPS index support is currently disabled/removed in meb.go)
+		// Only Predicate bound?
+		// We don't have a POS index.
+		// Return empty iterator for now (inefficient to scan without S or O).
 		return &EmptyIterator{}
 	}
 
