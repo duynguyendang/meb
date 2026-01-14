@@ -9,6 +9,7 @@ const (
 	// Triple indices (legacy, kept for backward compatibility)
 	SPOPrefix   byte = 0x01 // Subject-Predicate-Object index
 	OPSPrefix   byte = 0x02 // Object-Predicate-Subject index
+	PSOPrefix   byte = 0x03 // Predicate-Subject-Object index
 	ChunkPrefix byte = 0x10 // Content blob storage
 
 	// Quad indices (new for multi-tenancy/RAG contexts)
@@ -64,6 +65,47 @@ func EncodeOPSKey(subject, predicate, object uint64) []byte {
 	binary.BigEndian.PutUint64(key[9:17], predicate)
 	binary.BigEndian.PutUint64(key[17:25], subject)
 	return key
+}
+
+// EncodePSOKey encodes a triple into a PSO (Predicate-Subject-Object) key.
+// Uses BigEndian encoding to ensure lexicographic ordering matches numeric ordering.
+func EncodePSOKey(subject, predicate, object uint64) []byte {
+	key := make([]byte, TripleKeySize)
+	key[0] = PSOPrefix
+	binary.BigEndian.PutUint64(key[1:9], predicate)
+	binary.BigEndian.PutUint64(key[9:17], subject)
+	binary.BigEndian.PutUint64(key[17:25], object)
+	return key
+}
+
+// DecodePSOKey decodes a PSO key back into subject, predicate, object IDs.
+func DecodePSOKey(key []byte) (subject, predicate, object uint64) {
+	if len(key) < TripleKeySize || key[0] != PSOPrefix {
+		return 0, 0, 0
+	}
+	predicate = binary.BigEndian.Uint64(key[1:9])
+	subject = binary.BigEndian.Uint64(key[9:17])
+	object = binary.BigEndian.Uint64(key[17:25])
+	return
+}
+
+// EncodePSOPrefix creates a prefix for PSO range scans with bound values.
+func EncodePSOPrefix(predicate, subject uint64) []byte {
+	if predicate == 0 {
+		return []byte{PSOPrefix}
+	}
+	if subject == 0 {
+		prefix := make([]byte, PrefixSize+IDSize) // 9 bytes
+		prefix[0] = PSOPrefix
+		binary.BigEndian.PutUint64(prefix[1:9], predicate)
+		return prefix
+	}
+	// Full prefix: predicate + subject
+	prefix := make([]byte, PrefixSize+2*IDSize) // 17 bytes
+	prefix[0] = PSOPrefix
+	binary.BigEndian.PutUint64(prefix[1:9], predicate)
+	binary.BigEndian.PutUint64(prefix[9:17], subject)
+	return prefix
 }
 
 // DecodeSPOKey decodes an SPO key back into subject, predicate, object IDs.

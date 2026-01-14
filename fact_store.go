@@ -51,6 +51,14 @@ func (m *MEBStore) GetFacts(atom ast.Atom, callback func(ast.Atom) error) error 
 		}
 	}
 
+	// Extract graph (optional 4th arg for "triples", 3rd for others)
+	graphIndex := objectIndex + 1
+	if len(atom.Args) > graphIndex {
+		if constTerm, ok := atom.Args[graphIndex].(ast.Constant); ok {
+			g = constTerm.Symbol
+		}
+	}
+
 	// Check for full table scan (no bound arguments)
 	if s == "" && p == "" && o == "" && g == "" {
 		return ErrFullTableScan

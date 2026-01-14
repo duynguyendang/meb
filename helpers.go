@@ -166,62 +166,104 @@ func (m *MEBStore) termToGoValue(term ast.BaseTerm) any {
 
 // === Query Parsing Functions ===
 
-// parseQuery parses a simple Datalog query string.
-// Format: ?predicate(arg1, arg2, ...)
-func parseQuery(query string) (string, []string, error) {
+// ParsedAtom represents a single atom in the query (either data or constraint).
+type ParsedAtom struct {
+	Predicate string
+	Args      []string
+}
+
+// parseQuery parses a Datalog query string which may contain multiple atoms.
+// Returns a list of all atoms found in the query.
+func parseQuery(query string) ([]ParsedAtom, error) {
 	query = strings.TrimSpace(query)
 
-	// Remove leading ?
+	// Remove leading ? from the very beginning
 	query = strings.TrimPrefix(query, "?")
 
-	// Find predicate and arguments
-	start := strings.Index(query, "(")
-	end := strings.LastIndex(query, ")")
-
-	if start == -1 || end == -1 || start >= end {
-		return "", nil, fmt.Errorf("%w: expected format '?predicate(arg1, arg2, ...)' but got '%s'", ErrInvalidQuery, query)
+	// Use smart splitter to get top-level atoms
+	atoms := SmartSplit(query)
+	if len(atoms) == 0 {
+		return nil, fmt.Errorf("%w: empty query", ErrInvalidQuery)
 	}
 
-	predicate := strings.TrimSpace(query[:start])
-	argsStr := strings.TrimSpace(query[start+1 : end])
+	var parsedAtoms []ParsedAtom
+	for _, atomStr := range atoms {
+		// syntactic sugar: "A != B" -> neq(A, B)
+		if strings.Contains(atomStr, "!=") {
+			parts := strings.Split(atomStr, "!=")
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid inequality format: %s", atomStr)
+			}
+			lhs := strings.TrimSpace(parts[0])
+			rhs := strings.TrimSpace(parts[1])
+			parsedAtoms = append(parsedAtoms, ParsedAtom{
+				Predicate: "neq",
+				Args:      []string{lhs, rhs},
+			})
+			continue
+		}
+
+		pred, args, err := parseAtom(atomStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse atom '%s': %w", atomStr, err)
+		}
+		parsedAtoms = append(parsedAtoms, ParsedAtom{
+			Predicate: pred,
+			Args:      args,
+		})
+	}
+
+	return parsedAtoms, nil
+}
+
+// parseAtom parses a single atom string like "predicate(arg1, arg2)"
+func parseAtom(atom string) (string, []string, error) {
+	atom = strings.TrimSpace(atom)
+	start := strings.Index(atom, "(")
+	end := strings.LastIndex(atom, ")")
+
+	if start == -1 || end == -1 || start >= end {
+		return "", nil, fmt.Errorf("%w: expected format 'predicate(args...)' but got '%s'", ErrInvalidQuery, atom)
+	}
+
+	predicate := strings.TrimSpace(atom[:start])
+	argsStr := strings.TrimSpace(atom[start+1 : end])
 
 	var args []string
 	if argsStr != "" {
-		args = splitArgs(argsStr)
+		args = SmartSplit(argsStr)
 	}
-
 	return predicate, args, nil
 }
 
-// splitArgs splits argument string by comma, handling nested structures.
-func splitArgs(s string) []string {
-	var args []string
+// SmartSplit splits a string by comma, correctly handling quotes and nested parentheses.
+func SmartSplit(query string) []string {
+	var results []string
 	var current strings.Builder
 	depth := 0
+	inQuotes := false
 
-	for _, ch := range s {
-		switch ch {
+	for _, r := range query {
+		switch r {
+		case '"':
+			inQuotes = !inQuotes
 		case '(':
-			depth++
-			current.WriteRune(ch)
-		case ')':
-			depth--
-			current.WriteRune(ch)
-		case ',':
-			if depth == 0 {
-				args = append(args, strings.TrimSpace(current.String()))
-				current.Reset()
-			} else {
-				current.WriteRune(ch)
+			if !inQuotes {
+				depth++
 			}
-		default:
-			current.WriteRune(ch)
+		case ')':
+			if !inQuotes {
+				depth--
+			}
+		case ',':
+			if !inQuotes && depth == 0 {
+				results = append(results, strings.TrimSpace(current.String()))
+				current.Reset()
+				continue
+			}
 		}
+		current.WriteRune(r)
 	}
-
-	if current.Len() > 0 {
-		args = append(args, strings.TrimSpace(current.String()))
-	}
-
-	return args
+	results = append(results, strings.TrimSpace(current.String()))
+	return results
 }

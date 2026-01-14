@@ -5,22 +5,22 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 // scanStrategy represents the index selection strategy for Scan operations.
 type scanStrategy struct {
 	prefix []byte
-	useOPS bool // true if using OPS index, false for SPO index
+	index  byte // SPOPrefix, OPSPrefix, or PSOPrefix
 }
 
 // selectScanStrategy determines the best index and prefix for a scan operation.
 // Returns error if no efficient scan strategy exists (e.g., no arguments bound).
 func selectScanStrategy(sBound, pBound, oBound bool, sID, pID, oID uint64) (*scanStrategy, error) {
 	if !sBound && !pBound && !oBound {
-		// No arguments bound - cannot scan efficiently
-		return nil, fmt.Errorf("cannot scan without at least one bound argument")
+		// No arguments bound - allow full scan if caller explicitly used empty strings
 	}
 
 	var strategy scanStrategy
@@ -28,14 +28,19 @@ func selectScanStrategy(sBound, pBound, oBound bool, sID, pID, oID uint64) (*sca
 	if sBound {
 		// Use SPO index with S or S|P prefix
 		strategy.prefix = keys.EncodeSPOPrefix(sID, pID)
-		strategy.useOPS = false
+		strategy.index = keys.SPOPrefix
 	} else if oBound {
 		// Use OPS index with O or O|P prefix
 		strategy.prefix = keys.EncodeOPSPrefix(oID, pID)
-		strategy.useOPS = true
+		strategy.index = keys.OPSPrefix
+	} else if pBound {
+		// Use PSO index with P prefix
+		strategy.prefix = keys.EncodePSOPrefix(pID, sID)
+		strategy.index = keys.PSOPrefix
 	} else {
-		// Only P bound - no efficient scan possible with current indices
-		return nil, fmt.Errorf("cannot scan efficiently with only predicate bound")
+		// No arguments bound - fallback to SPO scan for all facts
+		strategy.prefix = []byte{keys.SPOPrefix}
+		strategy.index = keys.SPOPrefix
 	}
 
 	return &strategy, nil
@@ -47,7 +52,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o string) (sID, pID, oID uint64, sBound,
 	if s != "" {
 		sID, err = m.dict.GetID(s)
 		if err != nil {
-			return 0, 0, 0, false, false, false, nil // Subject not found -> no facts
+			return 0, 0, 0, false, false, false, fmt.Errorf("subject not found: %w", err)
 		}
 		sBound = true
 	}
@@ -55,7 +60,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o string) (sID, pID, oID uint64, sBound,
 	if p != "" {
 		pID, err = m.dict.GetID(p)
 		if err != nil {
-			return 0, 0, 0, false, false, false, nil // Predicate not found -> no facts
+			return 0, 0, 0, false, false, false, fmt.Errorf("predicate not found: %w", err)
 		}
 		pBound = true
 	}
@@ -63,7 +68,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o string) (sID, pID, oID uint64, sBound,
 	if o != "" {
 		oID, err = m.dict.GetID(o)
 		if err != nil {
-			return 0, 0, 0, false, false, false, nil // Object not found -> no facts
+			return 0, 0, 0, false, false, false, fmt.Errorf("object not found: %w", err)
 		}
 		oBound = true
 	}
@@ -133,10 +138,13 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2
 
 			// Decode the key based on which index we're using
 			var foundSID, foundPID, foundOID uint64
-			if strategy.useOPS {
-				foundSID, foundPID, foundOID = keys.DecodeOPSKey(key)
-			} else {
+			switch strategy.index {
+			case keys.SPOPrefix:
 				foundSID, foundPID, foundOID = keys.DecodeSPOKey(key)
+			case keys.OPSPrefix:
+				foundSID, foundPID, foundOID = keys.DecodeOPSKey(key)
+			case keys.PSOPrefix:
+				foundSID, foundPID, foundOID = keys.DecodePSOKey(key)
 			}
 
 			// Apply additional filters for bound arguments

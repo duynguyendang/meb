@@ -39,12 +39,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 	"github.com/duynguyendang/meb/predicates"
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
+
+	"github.com/dgraph-io/badger/v4"
 	"github.com/google/mangle/ast"
 )
 
@@ -60,9 +61,6 @@ type MEBStore struct {
 
 	// Configuration
 	config *store.Config
-
-	// Transaction pool for reads
-	txPool *sync.Pool
 
 	// Mutex for predicate table registration
 	mu sync.RWMutex
@@ -100,6 +98,9 @@ func (m *MEBStore) loadStats() error {
 
 // saveStats writes the RAM counter to disk.
 func (m *MEBStore) saveStats() error {
+	if m.config.ReadOnly {
+		return nil
+	}
 	return m.withWriteTxn(func(txn *badger.Txn) error {
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, m.numFacts.Load())
@@ -171,12 +172,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		dict:       dictEncoder,
 		predicates: make(map[ast.PredicateSym]*predicates.PredicateTable),
 		config:     cfg,
-		txPool: &sync.Pool{
-			New: func() interface{} {
-				return db.NewTransaction(false)
-			},
-		},
-		vectors: vector.NewRegistry(db),
+		vectors:    vector.NewRegistry(db),
 	}
 
 	// Load vector snapshot from disk
@@ -205,15 +201,14 @@ func (m *MEBStore) registerDefaultPredicates() {
 	m.predicates[triplesPred] = predicates.NewPredicateTable(m.db, m.dict, triplesPred, keys.SPOPrefix)
 }
 
-// newTxn gets a transaction from the pool or creates a new read-only transaction.
+// newTxn creates a new read-only transaction.
 func (m *MEBStore) newTxn() *badger.Txn {
-	return m.txPool.Get().(*badger.Txn)
+	return m.db.NewTransaction(false)
 }
 
-// releaseTxn returns a transaction to the pool (for read-only transactions).
+// releaseTxn discards the transaction.
 func (m *MEBStore) releaseTxn(txn *badger.Txn) {
 	txn.Discard()
-	m.txPool.Put(txn)
 }
 
 // Reset clears the store by deleting all data.
@@ -242,9 +237,11 @@ func (m *MEBStore) Close() error {
 	slog.Info("closing store", "factCount", m.numFacts.Load())
 
 	// Save vector snapshot before closing
-	if err := m.vectors.SaveSnapshot(); err != nil {
-		slog.Error("failed to save vector snapshot", "error", err)
-		return fmt.Errorf("failed to save vector snapshot: %w", err)
+	if !m.config.ReadOnly {
+		if err := m.vectors.SaveSnapshot(); err != nil {
+			slog.Error("failed to save vector snapshot", "error", err)
+			return fmt.Errorf("failed to save vector snapshot: %w", err)
+		}
 	}
 
 	// Save fact count stats to disk
@@ -302,10 +299,16 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		// Count only primary SPOG keys
-		prefix := []byte{keys.QuadSPOGPrefix}
+		// Count only primary SPO keys
+		// Note: We use SPOPrefix (0x01) because AddFactBatch currently writes 25-byte Triple keys.
+		// Although QuadSPOGPrefix (0x20) is defined, it is not yet used for writing facts.
+		prefix := []byte{keys.SPOPrefix}
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			count++
+			item := it.Item()
+			// Ensure we are counting valid keys
+			if len(item.Key()) == keys.TripleKeySize {
+				count++
+			}
 		}
 		return nil
 	})
