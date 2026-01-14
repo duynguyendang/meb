@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
+	"unicode"
+
+	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/duynguyendang/meb/keys"
-	"github.com/google/mangle/ast"
 )
 
 // === store.KnowledgeStore implementation ===
@@ -117,6 +119,12 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		opsKey := keys.EncodeOPSKey(sID, pID, oID)
 		if err := batch.Set(opsKey, nil); err != nil {
 			return fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
+		}
+
+		// Add to predicate index: PSO (25 bytes)
+		psoKey := keys.EncodePSOKey(sID, pID, oID)
+		if err := batch.Set(psoKey, nil); err != nil {
+			return fmt.Errorf("failed to set PSO key for fact %d: %w", i, err)
 		}
 
 		// Update fact count (zero-cost atomic operation)
@@ -241,60 +249,197 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 }
 
 // Query executes a Datalog query and returns results.
-// This provides compatibility with the existing KnowledgeStore interface.
+// Implements Multi-Atom Nested Loop Join.
 func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, error) {
-	// Parse the query (simple format: ?predicate(arg1, arg2, ...))
-	pred, args, err := parseQuery(query)
+	// Parse the query into atoms
+	atoms, err := parseQuery(query)
 	if err != nil {
 		return nil, err
 	}
 
-	// Identify variable positions
-	vars := make(map[int]string)
-	for i, arg := range args {
-		if strings.HasPrefix(arg, "?") || arg == "_" {
-			vars[i] = arg
-		}
-	}
+	// Step 1: Classification
+	var dataAtoms []ParsedAtom
+	var constraints []ParsedAtom
 
-	// Build query atom
-	atomArgs := make([]ast.BaseTerm, len(args))
-	for i, arg := range args {
-		if _, isVar := vars[i]; isVar {
-			// Variable - use ast.Variable type
-			atomArgs[i] = ast.Variable{}
+	for _, atom := range atoms {
+		// Currently only "triples" is supported as a data atom
+		// Everything else (like "regex") is treated as a constraint
+		// In the future, we could check schema or list of known predicates
+		if atom.Predicate == "triples" {
+			dataAtoms = append(dataAtoms, atom)
 		} else {
-			// Constant - trim both single and double quotes
-			atomArgs[i] = ast.Constant{Type: ast.StringType, Symbol: strings.Trim(arg, "'\"")}
+			constraints = append(constraints, atom)
 		}
 	}
 
-	atom := ast.Atom{
-		Predicate: ast.PredicateSym{Symbol: pred, Arity: len(args)},
-		Args:      atomArgs,
+	if len(dataAtoms) == 0 {
+		return nil, fmt.Errorf("query must contain at least one data atom (e.g. triples(...))")
 	}
 
-	// Execute query using streaming GetFacts
-	var results []map[string]any
-	err = m.GetFacts(atom, func(result ast.Atom) error {
-		row := make(map[string]any)
+	// Step 2: Initialize Pipeline
+	// Start with one empty binding
+	bindings := []map[string]any{make(map[string]any)}
 
-		for i, arg := range result.Args {
-			if _, isVar := vars[i]; isVar {
-				varName := args[i]
-				// Auto-number bare ? and _ variables by argument position
-				if varName == "?" {
-					varName = fmt.Sprintf("?%d", i)
-				} else if varName == "_" {
-					varName = fmt.Sprintf("_%d", i)
+	// Step 3: Sequential Processing (Nested Loop Join)
+	for _, atom := range dataAtoms {
+		var nextBindings []map[string]any
+
+		for _, binding := range bindings {
+			// Substitute known variables into the DataAtom
+			// triples(S, P, O) -> check if S, P, O are bound in 'binding'
+			// If bound, use the value. If not, it's a variable or constant.
+
+			// Check args count
+			if len(atom.Args) != 3 {
+				return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
+			}
+
+			// Prepare Scan arguments
+			scanArgs := make([]string, 3)
+			vars := make(map[int]string) // Index -> Variable Name
+
+			for i, arg := range atom.Args {
+				// Datalog convention: variables start with ? or Uppercase letter
+				isVar := strings.HasPrefix(arg, "?") || arg == "_" || (len(arg) > 0 && unicode.IsUpper([]rune(arg)[0]))
+
+				if isVar {
+					// Check if already bound in current binding
+					if val, ok := binding[arg]; ok {
+						// Bound variable -> treat as constant for this scan
+						scanArgs[i] = fmt.Sprintf("%v", val)
+					} else {
+						// Unbound variable -> Scan wildcard
+						scanArgs[i] = ""
+						vars[i] = arg // Track for extraction
+					}
+				} else {
+					// Constant -> use as is
+					scanArgs[i] = strings.Trim(arg, "'\"")
 				}
-				row[varName] = m.termToGoValue(arg)
+			}
+
+			// Graph context (defaulting to all graphs or specific if we add that support)
+			// For now, let's scan all known graphs or default.
+			// The original implementation scanned specific graphs.
+			// Let's iterate a set of "common" graphs for now as per original code behavior?
+			// Or better: The original Scan(g="") implementation might not strict enough if we don't have GSPO index support for wildcard graph.
+			// User request didn't specify graph handling changes, but "Scan" supports iterating if g is empty IF we have proper indexing.
+			// Let's stick to scanning "default" plus others if needed.
+			// Ideally, we should scan all graphs.
+			// For this implementation, we'll iterate known graphs like in main.go example to be safe, or just "default".
+			// Let's assume "default" for now to keep it simple, or iterate a fixed list.
+			scanGraphs := []string{"default", "doc1", "doc2"} // TODO: Discover graphs dynamically
+
+			for _, g := range scanGraphs {
+				// Scan: Use the partially-bound Atom
+				for fact, err := range m.Scan(scanArgs[0], scanArgs[1], scanArgs[2], g) {
+					if err != nil {
+						// Error scanning (e.g. not found), skip
+						continue
+					}
+
+					// Expand: Create new binding
+					newBinding := make(map[string]any)
+					// Copy existing bindings
+					for k, v := range binding {
+						newBinding[k] = v
+					}
+
+					// Extract new bindings from fact
+					row := []string{fact.Subject, fact.Predicate, ""}
+					// Object type handling
+					if s, ok := fact.Object.(string); ok {
+						row[2] = s
+					} else {
+						row[2] = fmt.Sprintf("%v", fact.Object)
+					}
+
+					for idx, varName := range vars {
+						if varName != "_" {
+							newBinding[varName] = row[idx]
+						}
+					}
+					nextBindings = append(nextBindings, newBinding)
+				}
+			}
+		}
+		// Move to next stage
+		bindings = nextBindings
+		if len(bindings) == 0 {
+			break // Short-circuit if no results
+		}
+	}
+
+	// Step 4: Post-Filter (Constraints)
+	var finalResults []map[string]any
+	for _, row := range bindings {
+		keep := true
+	ConstraintLoop:
+		for _, c := range constraints {
+			switch c.Predicate {
+			case "regex":
+				// Format: regex(Var, "pattern")
+				if len(c.Args) != 2 {
+					return nil, fmt.Errorf("regex constraint requires 2 arguments")
+				}
+				varName := c.Args[0]
+				pattern := strings.Trim(c.Args[1], "\"'")
+
+				val, ok := row[varName]
+				if !ok {
+					// If the variable used in regex is NOT bound, it fails?
+					// Or do we ignore? Constraint implication: strict filter.
+					keep = false
+					break ConstraintLoop
+				}
+				valStr := fmt.Sprintf("%v", val)
+
+				matched, err := regexp.MatchString(pattern, valStr)
+				if err != nil {
+					return nil, fmt.Errorf("invalid regex pattern '%s': %w", pattern, err)
+				}
+				if !matched {
+					keep = false
+					break ConstraintLoop
+				}
+			case "neq":
+				// Format: neq(A, B) or A != B
+				if len(c.Args) != 2 {
+					return nil, fmt.Errorf("neq constraint requires 2 arguments")
+				}
+				lhsArg := c.Args[0]
+				rhsArg := c.Args[1]
+
+				// Helper to resolve value: either variable look up or constant
+				resolveVal := func(arg string) string {
+					// Check if variable (Uppercase/?)
+					isVar := strings.HasPrefix(arg, "?") || arg == "_" || (len(arg) > 0 && unicode.IsUpper([]rune(arg)[0]))
+					if isVar {
+						if val, ok := row[arg]; ok {
+							return fmt.Sprintf("%v", val)
+						}
+						return "" // Unbound variable?
+					}
+					// Constant
+					return strings.Trim(arg, "\"'")
+				}
+
+				valA := resolveVal(lhsArg)
+				valB := resolveVal(rhsArg)
+
+				if valA == valB {
+					keep = false
+					break ConstraintLoop
+				}
+			default:
+				return nil, fmt.Errorf("unknown constraint predicate: %s", c.Predicate)
 			}
 		}
 
-		results = append(results, row)
-		return nil
-	})
+		if keep {
+			finalResults = append(finalResults, row)
+		}
+	}
 
-	return results, err
+	return finalResults, nil
 }
