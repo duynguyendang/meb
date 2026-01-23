@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -318,17 +319,12 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 				}
 			}
 
-			// Graph context (defaulting to all graphs or specific if we add that support)
-			// For now, let's scan all known graphs or default.
-			// The original implementation scanned specific graphs.
-			// Let's iterate a set of "common" graphs for now as per original code behavior?
-			// Or better: The original Scan(g="") implementation might not strict enough if we don't have GSPO index support for wildcard graph.
-			// User request didn't specify graph handling changes, but "Scan" supports iterating if g is empty IF we have proper indexing.
-			// Let's stick to scanning "default" plus others if needed.
-			// Ideally, we should scan all graphs.
-			// For this implementation, we'll iterate known graphs like in main.go example to be safe, or just "default".
-			// Let's assume "default" for now to keep it simple, or iterate a fixed list.
-			scanGraphs := []string{"default", "doc1", "doc2"} // TODO: Discover graphs dynamically
+			// Scan all graphs dynamically by discovering them from the GSPO index
+			scanGraphs, err := m.getAllGraphs()
+			if err != nil {
+				slog.Warn("failed to discover graphs, falling back to default", "error", err)
+				scanGraphs = []string{"default"}
+			}
 
 			for _, g := range scanGraphs {
 				// Scan: Use the partially-bound Atom
@@ -442,4 +438,58 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 	}
 
 	return finalResults, nil
+}
+
+// getAllGraphs discovers all unique graphs in the store by scanning the GSPO index.
+// Returns a slice of graph names, sorted for consistent ordering.
+// This is an expensive operation and should be cached or used sparingly.
+func (m *MEBStore) getAllGraphs() ([]string, error) {
+	graphSet := make(map[uint64]struct{})
+
+	txn := m.db.NewTransaction(false)
+	defer txn.Discard()
+
+	prefix := []byte{keys.QuadGSPOPrefix}
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		item := it.Item()
+		key := item.Key()
+
+		if len(key) != keys.QuadKeySize {
+			continue
+		}
+
+		// Decode to get the graph ID
+		_, _, _, gID := keys.DecodeQuadKey(key)
+		if gID != 0 {
+			graphSet[gID] = struct{}{}
+		}
+	}
+
+	if len(graphSet) == 0 {
+		return []string{"default"}, nil
+	}
+
+	// Convert IDs to strings
+	graphs := make([]string, 0, len(graphSet))
+	for gID := range graphSet {
+		gName, err := m.dict.GetString(gID)
+		if err != nil {
+			// Skip graphs that can't be resolved
+			slog.Debug("failed to resolve graph ID", "graphID", gID, "error", err)
+			continue
+		}
+		graphs = append(graphs, gName)
+	}
+
+	// Sort for consistent ordering
+	// (using simple insertion sort for small sets, or could use sort.Strings)
+	sort.Strings(graphs)
+
+	return graphs, nil
 }
