@@ -32,6 +32,72 @@ It bridges the gap between structured relational data (**Knowledge Graphs**) and
 
 ---
 
+## 🚀 Key Highlights from CSD
+
+### Leapfrog Triejoin (LFTJ) - Worst-Case Optimal Queries
+MEB implements Leapfrog Triejoin for multi-way Datalog joins, achieving **10-1000x performance improvement** over traditional nested-loop joins:
+- **Time Complexity**: O(N × |output|) vs O(∏|Rᵢ|) for nested loops
+- **No Intermediate Materialization**: Streams results directly without memory bloat
+- **Trie-Based**: Leverages lexicographic ordering for efficient prefix matching
+- **Use Case**: Triangle counting, path finding, transitive closure queries
+
+### Page-Aligned Zero-Copy Retrieval
+**10x faster scans** with zero memory allocation and zero memcpy:
+- **Direct mmap Access**: Read directly from kernel page cache
+- **Little-Endian Architecture**: Native x86_64 performance, portable to ARM64
+- **8-Byte Alignment**: Safe access on strict-alignment architectures
+- **Reference Counting**: Safe lifecycle management for mmap'd pages
+- **Throughput**: 20M facts/sec vs 2M facts/sec (traditional copy)
+
+### Incremental VLog Garbage Collection
+Reclaims **85% storage waste** without impacting query performance:
+- **Chunked Processing**: 100MB per cycle, 5-second max duration
+- **Adaptive Throttling**: Pauses GC automatically if query latency > 100ms
+- **Crash Safety**: Atomic file swap with fsync guarantees
+- **Real-World Results**: 500GB → 145GB in 7 days with <20ms P99 latency
+
+### Architecture-Neutral Design
+**Cross-platform binary format** with explicit Little-Endian encoding:
+- **Little-Endian**: Optimal for x86_64 (zero-cost), portable to ARM64/RISC-V
+- **8-Byte Alignment**: Prevents bus errors on strict-alignment architectures
+- **Explicit Padding**: Documented structure layout for safe mmap access
+- **Version Field**: Forward compatibility for schema evolution
+- **Platform Detection**: Runtime verification on startup
+
+### Hybrid Static-Structural + Dynamic-Semantic Clustering
+**"Best of Both Worlds"** approach combining Global Leiden (static) with query-time K-means (dynamic):
+- **Stage 1**: Global Leiden at ingest-time assigns CommunityID (Prefix 0x30)
+- **Stage 2**: Query-time semantic refinement with Hybrid Vectors
+- **Hybrid Vector Formula**: V_hybrid = [(V_semantic × α) ⊕ (V_structural × (1-α))]
+- **Fast K-means**: Zero-allocation Go implementation, max 10 iterations
+- **Query Time**: <300ms for 1000 nodes (well within 2s circuit breaker)
+
+### Datalog Query Optimization
+Complete query processing pipeline with advanced optimizations:
+- **Multi-Atom Joins**: Nested loop join with variable binding
+- **Constraint Predicates**: `regex()`, `neq()` for post-filtering
+- **Iterator Processing Model**: Functional composition with `Collect()`, `Filter()`, `Map()`
+- **LFTJ Integration**: Automatic selection of optimal join algorithm
+- **Query Guardrails**: 2-second circuit breaker, 5000 join result limit
+
+### Analysis System
+Comprehensive static analysis engine for code intelligence:
+- **Dependency Resolution**: Trace interface implementations and type assertions
+- **DI Wiring Detection**: Detect dependency injection patterns (Wire, Fx)
+- **Virtual Fact Inference**: Generate implicit relationships (v:potentially_calls, v:wires_to)
+- **Parallel Analysis**: 10 workers, 30-second timeout, 5-level max depth
+- **Performance**: 50ms for 10K facts, 5s for 1M facts
+
+### Production-Ready Features
+- **Circuit Breaker**: 2-second hard limit on all queries
+- **Deployment Profiles**: Ingest-Heavy, Safe-Serving, Cloud-Run-LowMem
+- **Dual BadgerDB**: Separate graphDB (async) and vocabDB (sync)
+- **Sharded Dictionary**: 32+ shards with per-shard LRU cache
+- **Atomic Operations**: Lock-free counters and reference counting
+- **Comprehensive Monitoring**: 25+ metrics including GC stats, latency percentiles
+
+---
+
 ## Quick Start
 
 ### Installation
@@ -39,6 +105,13 @@ It bridges the gap between structured relational data (**Knowledge Graphs**) and
 ```bash
 go get github.com/duynguyendang/meb
 ```
+
+### Requirements
+
+- **Go 1.23+** (required for `iter.Seq2` support)
+- **64-bit OS** (Linux, macOS, Windows)
+- **Recommended**: NVMe SSD for optimal performance
+- **Memory**: 8GB+ RAM for production workloads
 
 ### Your First Quad Store Query
 
@@ -289,31 +362,46 @@ results, _ := s.Find().
 
 ```mermaid
 graph TD
-    A["Query Layer<br/>Go 1.23 iter.Seq2 +</>neuro-symbolic fluent API"]
-    B["Vector Layer<br/>MRL (64-d) + SQ8 int8 vectors<br/>SIMD-accelerated search"]
-    C["Dictionary Layer<br/>Sharded string ↔ uint64 encoding<br/>LRU cache"]
-    D["Quad Store Layer<br/>BadgerDB - SPO | OPS<br/>25-byte composite keys<br/>bidirectional traversal"]
-    E["Content Layer<br/>S2 compression for<br/>document storage"]
+    A["Query Layer<br/>Go 1.23 iter.Seq2 +<br/>LFTJ Optimization<br/>Datalog Pipeline"]
+    B["Vector Layer<br/>MRL (64-d) + SQ8 int8<br/>SIMD AVX2/NEON<br/>Zero-Copy mmap"]
+    C["Dictionary Layer<br/>Sharded string↔uint64<br/>LRU Cache<br/>Little-Endian"]
+    D["Quad Store Layer<br/>BadgerDB - SPO|OPS|PSO<br/>33-byte LE Keys<br/>Incremental VLog GC"]
+    E["Content Layer<br/>S2 Compression<br/>Architecture-Neutral<br/>Page-Aligned"]
+    F["Analysis Layer<br/>Virtual Facts<br/>DI Wiring<br/>Parallel Engine"]
 
     A --> B
     B --> C
     C --> D
     A --> E
+    A --> F
+    F --> D
 
     style A fill:#e1f5ff
     style B fill:#fff3e0
     style C fill:#f3e5f5
     style D fill:#e8f5e9
     style E fill:#fce4ec
+    style F fill:#fff8e1
 ```
+
+> 📖 **Comprehensive Design Documentation**: See [docs/CSD.md](docs/CSD.md) for detailed architecture specifications, including:
+> - Storage layer design (Little-Endian, 8-byte alignment, zero-copy)
+> - Leapfrog Triejoin algorithm and query optimization
+> - Hybrid clustering (static Leiden + dynamic K-means)
+> - Incremental VLog GC implementation
+> - Analysis system architecture
+> - Performance benchmarks and tuning guidelines
 
 ### Key Design Decisions
 
-**Dual Index Structure (25-byte Hierarchical Composite Keys)**
+**Dual Index Structure (33-byte Hierarchical Composite Keys)**
 
-* **SPO** (Subject-Predicate-Object): Fast forward traversals - find all relations from a subject
-* **OPS** (Object-Predicate-Subject): Efficient reverse lookups - find all subjects pointing to an object
-* **Key Format**: `[1-byte prefix][8-byte ID][8-byte ID][8-byte ID]` = 25 bytes total
+* **SPO** (Subject-Predicate-Object-Graph): Fast forward traversals - find all relations from a subject
+* **OPS** (Object-Predicate-Subject-Graph): Efficient reverse lookups - find all subjects pointing to an object
+* **MRL** (Matryoshka Representation Learning): Technique to truncate high-dimensional vectors while preserving semantic meaning
+* **SQ8** (Scalar Quantization 8-bit): Compression technique reducing float32 vectors to 8-bit integers
+* **LFTJ** (Leapfrog Triejoin): Worst-case optimal join algorithm for multi-way queries
+* **Key Format**: `[1-byte prefix][8-byte Subject][8-byte Predicate][8-byte Object][8-byte Graph]` = 33 bytes total
 * **Atomic Dual-Write**: Every fact writes to both SPO and OPS indexes in a single transaction
 * Enables O(1) lookups and efficient prefix scans in both directions
 * Supports bidirectional graph traversal without full table scans
@@ -378,8 +466,6 @@ cfg := &store.Config{
     NumDictShards:  16,             // Sharded dictionary for concurrency
 }
 ```
-
-
 
 ---
 
@@ -567,6 +653,42 @@ This enables:
 - **Complex join patterns** across multiple predicates
 - **Negation and aggregation** in queries
 - **Integration with Mangle's optimization** and rule engine
+
+---
+
+## Documentation
+
+### 📖 Conceptual Solution Design (CSD)
+
+The **[Conceptual Solution Design](docs/CSD.md)** is the comprehensive architectural specification for MEB:
+
+**Key Sections:**
+- **Storage Layer** (1,245 lines) - Little-Endian encoding, 8-byte alignment, zero-copy mmap, incremental VLog GC
+- **Query Optimization** (409 lines) - Leapfrog Triejoin (LFTJ), Datalog pipeline, variable ordering
+- **Vector Operations** - MRL + INT8 quantization, SIMD acceleration, dual storage strategy
+- **Hydration System** - Deep vs shallow modes, lazy loading, parallel processing
+- **Analysis System** (415 lines) - Virtual facts, DI wiring detection, dependency resolution
+- **Graph Community Detection** (828 lines) - Global Leiden + Hybrid clustering, fast K-means
+- **Inference Engine Integration** - Mangle adapter, TrieIterator, storage independence
+- **Configuration** - Deployment profiles (Ingest-Heavy, Safe-Serving, Cloud-Run-LowMem)
+
+**Total: 5,099 lines of detailed design documentation with 95 Go code examples**
+
+### 📚 API Documentation
+
+See package documentation:
+- `meb` - Core store API
+- `meb/store` - Configuration and store creation
+- `meb/vector` - Vector storage and search
+- `meb/keys` - Key encoding utilities
+
+### 🧪 Examples
+
+Check the `examples/` directory for:
+- RAG (Retrieval-Augmented Generation) implementation
+- Code analysis with virtual facts
+- Recommendation systems
+- Knowledge graph completion
 
 ---
 

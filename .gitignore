@@ -31,6 +31,5 @@ go.work.sum
 # .idea/
 # .vscode/
 .claude/
-docs/
 stress_data/
 badger/
