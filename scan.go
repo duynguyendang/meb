@@ -162,17 +162,20 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 		txn := m.db.NewTransaction(false)
 		defer txn.Discard()
 
-		opts := opts
-
-		opts.ctx, _ = context.WithCancel(context.Background())
+		// Use the context from opts, don't shadow it
+		// If opts.ctx is nil, create a background context
+		scanCtx := opts.ctx
+		if scanCtx == nil {
+			scanCtx = context.Background()
+		}
 
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
 
 		for it.Seek(opts.strategy.prefix); it.ValidForPrefix(opts.strategy.prefix); it.Next() {
 			select {
-			case <-opts.ctx.Done():
-				yield(Fact{}, opts.ctx.Err())
+			case <-scanCtx.Done():
+				yield(Fact{}, scanCtx.Err())
 				return
 			default:
 			}

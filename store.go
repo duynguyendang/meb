@@ -356,6 +356,40 @@ func (m *MEBStore) Find() *Builder {
 	return NewBuilder(m)
 }
 
+// RunValueLogGC runs garbage collection on BadgerDB value logs to reclaim disk space.
+// The ratio parameter specifies the ratio of garbage to data that must be exceeded
+// for a value log file to be rewritten. Valid range is (0, 1). Lower values will
+// reclaim more space but take longer.
+func (m *MEBStore) RunValueLogGC(ratio float64) error {
+	if ratio <= 0 || ratio > 1 {
+		ratio = 0.5
+	}
+
+	slog.Info("running value log garbage collection", "ratio", ratio)
+
+	// Run GC on facts DB
+	if err := m.db.RunValueLogGC(ratio); err != nil && err != badger.ErrNoRewrite {
+		slog.Error("failed to run GC on facts DB", "error", err)
+		return fmt.Errorf("failed to run GC on facts DB: %w", err)
+	} else if err == badger.ErrNoRewrite {
+		slog.Info("no GC needed for facts DB")
+	} else {
+		slog.Info("GC completed on facts DB")
+	}
+
+	// Run GC on dictionary DB
+	if err := m.dictDB.RunValueLogGC(ratio); err != nil && err != badger.ErrNoRewrite {
+		slog.Error("failed to run GC on dictionary DB", "error", err)
+		return fmt.Errorf("failed to run GC on dictionary DB: %w", err)
+	} else if err == badger.ErrNoRewrite {
+		slog.Info("no GC needed for dictionary DB")
+	} else {
+		slog.Info("GC completed on dictionary DB")
+	}
+
+	return nil
+}
+
 // CircuitBreaker returns the circuit breaker for query timeout protection.
 func (m *MEBStore) CircuitBreaker() *circuit.Breaker {
 	return m.breaker

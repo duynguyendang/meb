@@ -3,6 +3,7 @@ package meb
 import (
 	"fmt"
 	"iter"
+	"reflect"
 )
 
 // === Generic Helper Functions ===
@@ -47,7 +48,7 @@ func Value[T any](f Fact) (T, bool) {
 func MustValue[T any](f Fact) T {
 	v, ok := Value[T](f)
 	if !ok {
-		panic(fmt.Sprintf("failed to cast %v to %T", f.Object, *new(T)))
+		panic(fmt.Sprintf("failed to cast %v to %v", f.Object, reflect.TypeOf(*new(T))))
 	}
 	return v
 }

@@ -297,7 +297,7 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 
 			// Check args count
 			if len(atom.Args) != 3 {
-				return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
+			return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
 			}
 
 			// Prepare Scan arguments

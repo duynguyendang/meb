@@ -150,16 +150,29 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 			opts.ReadOnly = true
 		}
 
+		// Minimize WAL files for serving mode (no heavy ingestion)
+		opts.NumVersionsToKeep = 1 // Only keep latest version
+
+	case "ReadOnly":
+		// Read-only mode - minimal resources, no WAL growth
+		opts.ReadOnly = true
+		opts.ValueLogFileSize = 16 << 20 // 16MB - small since we don't write
+		opts.NumCompactors = 2
+		opts.NumVersionsToKeep = 1
+
 	case "Ingest-Heavy":
 		fallthrough
 	default:
 		// Optimized for High Performance / High RAM (Ingestion)
 
-		// Large ValueLog
+		// Large ValueLog for bulk writes
 		opts.ValueLogFileSize = 1 << 30 // 1GB
 
 		// Standard Compactors
 		opts.NumCompactors = 4
+
+		// Keep multiple versions during heavy ingestion
+		opts.NumVersionsToKeep = 0 // Keep all versions
 	}
 
 	// === Cache Sizes ===
