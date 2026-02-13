@@ -33,15 +33,20 @@
 package meb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 
+	"github.com/duynguyendang/meb/circuit"
+	"github.com/duynguyendang/meb/clustering"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 	"github.com/duynguyendang/meb/predicates"
+	"github.com/duynguyendang/meb/query"
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
 
@@ -72,6 +77,9 @@ type MEBStore struct {
 
 	// Vector registry for MRL vector search
 	vectors *vector.VectorRegistry
+
+	// Circuit breaker for query timeout protection
+	breaker *circuit.Breaker
 }
 
 // loadStats reads the counter from disk into RAM.
@@ -173,6 +181,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		predicates: make(map[ast.PredicateSym]*predicates.PredicateTable),
 		config:     cfg,
 		vectors:    vector.NewRegistry(db),
+		breaker:    circuit.NewBreaker(nil), // Use default config with 2s timeout
 	}
 
 	// Load vector snapshot from disk
@@ -197,8 +206,9 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 // registerDefaultPredicates registers the built-in predicates.
 func (m *MEBStore) registerDefaultPredicates() {
 	// Register "triples" predicate for subject-predicate-object relationships
+	// Uses quad SPOG prefix (0x20) for 33-byte keys
 	triplesPred := ast.PredicateSym{Symbol: "triples", Arity: 3}
-	m.predicates[triplesPred] = predicates.NewPredicateTable(m.db, m.dict, triplesPred, keys.SPOPrefix)
+	m.predicates[triplesPred] = predicates.NewPredicateTable(m.db, m.dict, triplesPred, keys.QuadSPOGPrefix)
 }
 
 // newTxn creates a new read-only transaction.
@@ -299,14 +309,12 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		// Count only primary SPO keys
-		// Note: We use SPOPrefix (0x01) because AddFactBatch currently writes 25-byte Triple keys.
-		// Although QuadSPOGPrefix (0x20) is defined, it is not yet used for writing facts.
-		prefix := []byte{keys.SPOPrefix}
+		// Count only primary SPOG quad keys (33 bytes)
+		prefix := []byte{keys.QuadSPOGPrefix}
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			item := it.Item()
-			// Ensure we are counting valid keys
-			if len(item.Key()) == keys.TripleKeySize {
+			// Ensure we are counting valid quad keys
+			if len(item.Key()) == keys.QuadKeySize {
 				count++
 			}
 		}
@@ -346,4 +354,76 @@ func (m *MEBStore) Vectors() *vector.VectorRegistry {
 //	    Execute()
 func (m *MEBStore) Find() *Builder {
 	return NewBuilder(m)
+}
+
+// CircuitBreaker returns the circuit breaker for query timeout protection.
+func (m *MEBStore) CircuitBreaker() *circuit.Breaker {
+	return m.breaker
+}
+
+// SetCircuitBreakerConfig updates the circuit breaker configuration.
+// This allows runtime adjustment of query timeout and failure thresholds.
+func (m *MEBStore) SetCircuitBreakerConfig(config *circuit.Config) {
+	m.breaker = circuit.NewBreaker(config)
+	slog.Info("circuit breaker configuration updated",
+		"timeout", config.QueryTimeout,
+		"failureThreshold", config.FailureThreshold,
+	)
+}
+
+// CircuitBreakerMetrics returns the current circuit breaker metrics.
+func (m *MEBStore) CircuitBreakerMetrics() circuit.Metrics {
+	return m.breaker.Metrics()
+}
+
+// LFTJEngine returns a new Leapfrog Triejoin query engine.
+// LFTJ provides worst-case optimal multi-way join performance (10-1000x faster than nested loops).
+//
+// Example usage:
+//
+//	engine := store.LFTJEngine()
+//	query := query.LFTJQuery{...}
+//	for result, err := range engine.Execute(ctx, query) {
+//	    // Process result
+//	}
+func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
+	return query.NewLFTJEngine(m.db)
+}
+
+// ExecuteLFTJQuery executes a multi-way join query using Leapfrog Triejoin.
+func (m *MEBStore) ResolveID(id uint64) (string, error) {
+	return m.dict.GetString(id)
+}
+
+// This is the recommended method for complex multi-atom queries.
+// Returns an iterator over joined tuples.
+//
+// Performance: O(N × |output|) vs O(|R₁| × |R₂| × ... × |Rₙ|) for nested loops
+func (m *MEBStore) ExecuteLFTJQuery(ctx context.Context, q query.LFTJQuery) iter.Seq2[map[string]uint64, error] {
+	engine := m.LFTJEngine()
+	return engine.Execute(ctx, q)
+}
+
+// CommunityDetector returns a new community detector for graph clustering.
+func (m *MEBStore) CommunityDetector() *clustering.CommunityDetector {
+	return clustering.NewCommunityDetector(m.db)
+}
+
+// DetectCommunities runs the Leiden algorithm to detect communities in a graph.
+// This is a compute-intensive operation that should be run asynchronously in production.
+func (m *MEBStore) DetectCommunities(graphID string) (*clustering.CommunityHierarchy, error) {
+	detector := m.CommunityDetector()
+	return detector.Detect(graphID)
+}
+
+// GetCommunityMembers returns all members of a specific community at a given level.
+func (m *MEBStore) GetCommunityMembers(graphID string, level uint8, commID uint64) ([]uint64, error) {
+	detector := m.CommunityDetector()
+	return detector.GetCommunityMembers(graphID, level, commID)
+}
+
+// GetNodeCommunityPath returns the hierarchy path for a node (e.g., [L0, L1, L2]).
+func (m *MEBStore) GetNodeCommunityPath(graphID string, nodeID uint64) ([]uint64, error) {
+	detector := m.CommunityDetector()
+	return detector.GetNodeCommunityPath(graphID, nodeID)
 }

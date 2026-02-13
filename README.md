@@ -14,11 +14,12 @@ MEB is a **high-performance, standalone Embedded Neuro-Symbolic Store** designed
 
 It bridges the gap between structured relational data (**Knowledge Graphs**) and unstructured semantic data (**Vector Embeddings**) in a single, lightweight binary.
 
-**Built for extreme scale:**
+**Key Features:**
 
-- **1 Billion+ facts** on disk
-- **50 Million+ vectors** in memory
-- **Sub-millisecond** query performance
+- **Quad Store (SPOG)**: Native quad storage with Subject-Predicate-Object-Graph model for multi-tenancy
+- **1 Billion+ facts** on disk with 33-byte quad keys
+- **50 Million+ vectors** in memory with INT8 quantization
+- **Sub-millisecond** query performance with triple indexing (SPOG, POSG, GSPO)
 - **Zero-dependency:** No CGO, no external database server, just import and go
 
 ## Why MEB?

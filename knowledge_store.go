@@ -29,7 +29,12 @@ func (m *MEBStore) AddFact(fact Fact) error {
 
 // AddFactBatch inserts multiple facts in a single operation using quad indices.
 // Uses batch dictionary encoding for optimal performance.
-// Populates 2 indices: SPO (forward), OPS (reverse).
+// Populates 3 indices: SPOG (Subject-Predicate-Object-Graph),
+//
+//	POSG (Predicate-Object-Subject-Graph),
+//	GSPO (Graph-Subject-Predicate-Object).
+//
+// All keys are 33-byte quad format for multi-tenant support.
 func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	// Validate all facts first
 	if err := validateFacts(facts); err != nil {
@@ -94,7 +99,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		// Get IDs for Subject, Predicate, Graph from refs
 		sID := ids[factStringRefs[i][0].index]
 		pID := ids[factStringRefs[i][1].index]
-		// gID := ids[factStringRefs[i][2].index] // Graph ID unused in 24-byte key mode
+		gID := ids[factStringRefs[i][2].index] // Graph ID now used in 33-byte quad key mode
 
 		// Handle Object (could be string or other type)
 		var oID uint64
@@ -110,22 +115,22 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			}
 		}
 
-		// Add to main index: SPO (25 bytes)
-		spogKey := keys.EncodeSPOKey(sID, pID, oID)
+		// Add to main index: SPOG (33 bytes) - Subject-Predicate-Object-Graph
+		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, sID, pID, oID, gID)
 		if err := batch.Set(spogKey, nil); err != nil {
-			return fmt.Errorf("failed to set SPO key for fact %d: %w", i, err)
+			return fmt.Errorf("failed to set SPOG key for fact %d: %w", i, err)
 		}
 
-		// Add to inverse index: OPS (25 bytes)
-		opsKey := keys.EncodeOPSKey(sID, pID, oID)
-		if err := batch.Set(opsKey, nil); err != nil {
-			return fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
+		// Add to inverse index: POSG (33 bytes) - Predicate-Object-Subject-Graph
+		posgKey := keys.EncodeQuadKey(keys.QuadPOSGPrefix, sID, pID, oID, gID)
+		if err := batch.Set(posgKey, nil); err != nil {
+			return fmt.Errorf("failed to set POSG key for fact %d: %w", i, err)
 		}
 
-		// Add to predicate index: PSO (25 bytes)
-		psoKey := keys.EncodePSOKey(sID, pID, oID)
-		if err := batch.Set(psoKey, nil); err != nil {
-			return fmt.Errorf("failed to set PSO key for fact %d: %w", i, err)
+		// Add to graph index: GSPO (33 bytes) - Graph-Subject-Predicate-Object
+		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, sID, pID, oID, gID)
+		if err := batch.Set(gspoKey, nil); err != nil {
+			return fmt.Errorf("failed to set GSPO key for fact %d: %w", i, err)
 		}
 
 		// Update fact count (zero-cost atomic operation)

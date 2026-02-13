@@ -4,9 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
-	"github.com/dgraph-io/badger/v4"
 	"github.com/google/mangle/ast"
 )
 
@@ -170,27 +170,16 @@ func (pt *PredicateTable) buildPrefix(info bindingInfo) []byte {
 	return prefix
 }
 
-// decodeKey decodes a BadgerDB key back into uint64 IDs.
-// Handles both SPO and OPS key formats.
+// decodeKey decodes a BadgerDB quad key back into uint64 IDs.
+// MEB v2 only supports 33-byte quad keys (SPOG format).
 func (pt *PredicateTable) decodeKey(key []byte) []uint64 {
-	if len(key) < 25 {
+	if len(key) != keys.QuadKeySize {
 		return nil
 	}
 
-	// Check prefix
-	prefix := key[0]
-
-	var subject, predicate, object uint64
-
-	if prefix == keys.SPOPrefix {
-		subject, predicate, object = keys.DecodeSPOKey(key)
-	} else if prefix == keys.OPSPrefix {
-		subject, predicate, object = keys.DecodeOPSKey(key)
-	} else {
-		return nil
-	}
-
-	return []uint64{subject, predicate, object}
+	// Decode quad key (33 bytes)
+	subject, predicate, object, graph := keys.DecodeQuadKey(key)
+	return []uint64{subject, predicate, object, graph}
 }
 
 // matchesBindings checks if the given IDs match the binding pattern.

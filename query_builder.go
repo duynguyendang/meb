@@ -27,6 +27,7 @@ type Store interface {
 	Vectors() *vector.VectorRegistry
 	Scan(s, p, o, g string) iter.Seq2[Fact, error]
 	GetContent(id uint64) ([]byte, error)
+	ResolveID(id uint64) (string, error)
 }
 
 // Builder provides a fluent API for neuro-symbolic search.
@@ -140,8 +141,11 @@ func (b *Builder) Execute() ([]Result, error) {
 			continue
 		}
 
-		// Convert ID to string for Scan
-		candidateKey := fmt.Sprintf("id:%d", vecResult.ID)
+		// Resolve vector ID to original string for graph filtering
+		candidateKey, err := b.store.ResolveID(vecResult.ID)
+		if err != nil {
+			continue // Skip deleted IDs
+		}
 
 		// Apply graph filters using Scan for each filter
 		if b.matchesFilters(candidateKey) {

@@ -124,26 +124,16 @@ func (bit *BadgerIterator) Close() error {
 	return nil
 }
 
-// decodeKey decodes a BadgerDB key back into subject, predicate, object strings.
+// decodeKey decodes a BadgerDB quad key back into subject, predicate, object strings.
+// MEB v2 only supports 33-byte quad keys (SPOG format).
 func (bit *BadgerIterator) decodeKey(key []byte) (subject, predicate, object string, err error) {
-
-	var sID, pID, oID uint64
-
-	// We strictly use 25-byte keys (TripleKeySize)
-	if len(key) != keys.TripleKeySize {
+	// Only support 33-byte quad keys
+	if len(key) != keys.QuadKeySize {
 		return "", "", "", nil
 	}
 
-	prefix := key[0]
-	switch prefix {
-	case keys.SPOPrefix:
-		sID, pID, oID = keys.DecodeSPOKey(key)
-	case keys.OPSPrefix:
-		sID, pID, oID = keys.DecodeOPSKey(key)
-	default:
-		// Unsupported prefix in this iterator
-		return "", "", "", nil
-	}
+	// Decode quad key (ignore graph ID for triples adapter)
+	sID, pID, oID, _ := keys.DecodeQuadKey(key)
 
 	// Lazy decode: only convert to strings if decodeStrings is enabled
 	if bit.decodeStrings && bit.dict != nil {
