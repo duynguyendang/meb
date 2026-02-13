@@ -1,10 +1,10 @@
 # MEB Implementation TODO
 
-> **Quick Status**: 7/12 core features implemented (58% complete)  
-> **Current Version**: MEB v2 with LFTJ + Zero-Copy + Leiden  
+> **Quick Status**: 10/12 core features implemented (83% complete)  
+> **Current Version**: MEB v2 with LFTJ + Zero-Copy + Leiden + Hybrid + CBO  
 > **Last Updated**: 2026-02-13  
 > **Build**: ✅ Clean compile, all tests passing  
-> **Next Priority**: Incremental VLog GC (Item #8)
+> **Next Priority**: Incremental VLog GC (Item #10)
 
 ---
 
@@ -37,7 +37,7 @@
 ---
 
 ### 2. Incremental VLog Garbage Collection
-**Status:** Not Implemented  
+**Status:** HOLD
 **CSD Section:** 8.4 Incremental Value Log Garbage Collection  
 **Description:** Reclaim 85% storage waste without impacting query performance  
 **Impact:** Critical for production deployments with high write loads  
@@ -198,52 +198,50 @@
 ---
 
 ### 10. Greedy Query Optimizer (CBO)
-**Status:** Not Implemented  
+**Status:** ✅ IMPLEMENTED  
 **CSD Section:** 2. Architecture Overview (Pragmatic Query Optimizer)  
 **Description:** Join smaller predicates first using cardinality estimates  
 **Impact:** Better query performance for complex joins  
-**Tasks:**
-- [ ] Add per-predicate fact counts to PredicateTable
-- [ ] Implement cardinality estimation
-- [ ] Add join ordering optimization
-- [ ] Implement bound variable tracking
-- [ ] Add cost-based plan selection
+**Implementation:**
+- ✅ **Cardinality estimation** - Per-predicate fact counts
+- ✅ **Greedy join ordering** - Join smallest predicates first
+- ✅ **Selectivity estimation** - Based on bound arguments
+- ✅ **Cost-based plan selection** - Calculate plan costs
+- ✅ **Query plan explanation** - ExplainPlan() for debugging
 
-**Files to Create/Modify:**
-- `query/optimizer.go` - Query optimizer
-- `predicates/triples.go` - Add cardinality tracking
+**Files Created:**
+- `query/optimizer.go` - QueryOptimizer, JoinPlan, QueryPlan
 
 ---
 
 ### 11. Complete ContentStore Methods
-**Status:** Partially Implemented  
+**Status:** ✅ IMPLEMENTED  
 **CSD Section:** 4.4 ContentStore  
-**Missing:** GetDocumentMetadata, DeleteDocument, HasDocument  
-**Tasks:**
-- [ ] Implement GetDocumentMetadata
-- [ ] Implement DeleteDocument
-- [ ] Implement HasDocument
-- [ ] Add document existence checking
+**Description:** Complete the ContentStore API with metadata and lifecycle methods  
+**Implementation:**
+- ✅ **GetDocumentMetadata** - Retrieve metadata from "metadata" graph facts
+- ✅ **DeleteDocument** - Delete content, and metadata facts for a document
+- ✅ **HasDocument** - Check if document exists (content, vector, or metadata)
 
-**Files to Modify:**
-- `content.go` - Complete implementation
+**Files Modified:**
+- `content.go` - Added GetDocumentMetadata(), DeleteDocument(), HasDocument()
 
 ---
 
 ### 12. Hybrid Static-Structural + Dynamic-Semantic Clustering
-**Status:** Not Implemented  
+**Status:** ✅ IMPLEMENTED  
 **CSD Section:** 15.5 Hybrid Clustering  
 **Description:** Combine static Leiden with query-time K-means  
 **Impact:** Best of both worlds clustering approach  
-**Tasks:**
-- [ ] Implement fast K-means in Go (zero-allocation)
-- [ ] Implement hybrid vector formula
-- [ ] Add dynamic sub-clustering on filtered results
-- [ ] Implement synthesis layer from clusters to insight
+**Implementation:**
+- ✅ **HybridVector** - 80-byte vector (64-dim semantic + 16-dim structural)
+- ✅ **K-means++ initialization** - Fast convergence
+- ✅ **Cosine distance clustering** - INT8 SIMD optimized
+- ✅ **KnowledgePackage** - Synthesis layer output
+- ✅ **HybridClustering API** - ClusterWithHybrid() on MEBStore
 
-**Files to Create:**
-- `clustering/hybrid.go`
-- `clustering/kmeans.go`
+**Files Created:**
+- `clustering/hybrid.go` - HybridVector, KMeansEngine, HybridClustering
 
 ---
 
@@ -275,13 +273,13 @@
 
 ### ✅ Phase 3 (Completed): Community Detection
 7. ✅ Graph Community Detection - Leiden clustering
+8. ✅ Complete ContentStore - Metadata methods
+9. ✅ Greedy Query Optimizer - Cardinality-based optimization
+10. ✅ Hybrid Clustering - Static + dynamic clustering
 
 ### Phase 4 (Next): Storage & Advanced Features
-8. Incremental VLog GC - 85% storage reclamation
-9. Analysis System - Virtual fact inference
-10. Greedy Query Optimizer - Cardinality-based optimization
-11. Hybrid Clustering - Static + dynamic clustering
-12. Complete ContentStore - Metadata methods
+11. Incremental VLog GC - 85% storage reclamation
+12. Analysis System - Virtual fact inference
 
 ---
 

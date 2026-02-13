@@ -427,3 +427,45 @@ func (m *MEBStore) GetNodeCommunityPath(graphID string, nodeID uint64) ([]uint64
 	detector := m.CommunityDetector()
 	return detector.GetNodeCommunityPath(graphID, nodeID)
 }
+
+func (m *MEBStore) HybridClustering() *clustering.HybridClustering {
+	return clustering.NewHybridClustering(m.db)
+}
+
+func (m *MEBStore) ClusterWithHybrid(
+	graphID string,
+	queryEmbedding []float32,
+	limit int,
+	numClusters int,
+) (*clustering.HybridClusteringResult, error) {
+	hc := m.HybridClustering()
+
+	if err := hc.LoadCommunities(graphID); err != nil {
+		return nil, err
+	}
+
+	vectorResults, err := m.Vectors().Search(queryEmbedding, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(vectorResults) == 0 {
+		return nil, nil
+	}
+
+	nodeIDs := make([]uint64, len(vectorResults))
+	for i, vr := range vectorResults {
+		nodeIDs[i] = vr.ID
+	}
+
+	return hc.ClusterResults(vectorResults, nodeIDs, numClusters)
+}
+
+func (m *MEBStore) QueryOptimizer() *query.QueryOptimizer {
+	return query.NewQueryOptimizer(m.db)
+}
+
+func (m *MEBStore) OptimizeQuery(datalogQuery string) (*query.QueryPlan, error) {
+	optimizer := m.QueryOptimizer()
+	return optimizer.OptimizeDatalogQuery(datalogQuery)
+}
