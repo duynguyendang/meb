@@ -105,69 +105,32 @@ func DecodeQuadKey(key []byte) (s, p, o, g uint64) {
 	return
 }
 
+// buildQuadPrefix builds a quad prefix from components in order.
+// Only non-zero components are added to the prefix for efficient range scans.
+func buildQuadPrefix(prefix byte, components ...uint64) []byte {
+	result := []byte{prefix}
+	buf := make([]byte, IDSize)
+
+	for _, comp := range components {
+		if comp == 0 {
+			break
+		}
+		binary.BigEndian.PutUint64(buf, comp)
+		result = append(result, buf...)
+	}
+
+	return result
+}
+
 // EncodeQuadSPOGPrefix creates a prefix for SPOG range scans with bound values.
 // Supports partial bindings for efficient prefix scans.
 func EncodeQuadSPOGPrefix(s, p, o, g uint64) []byte {
-	// Start with prefix
-	prefix := []byte{QuadSPOGPrefix}
-
-	// Add bound components in order: S, P, O, G
-	if s != 0 {
-		buf := make([]byte, IDSize)
-		binary.BigEndian.PutUint64(buf, s)
-		prefix = append(prefix, buf...)
-
-		if p != 0 {
-			buf = make([]byte, IDSize)
-			binary.BigEndian.PutUint64(buf, p)
-			prefix = append(prefix, buf...)
-
-			if o != 0 {
-				buf = make([]byte, IDSize)
-				binary.BigEndian.PutUint64(buf, o)
-				prefix = append(prefix, buf...)
-
-				if g != 0 {
-					buf = make([]byte, IDSize)
-					binary.BigEndian.PutUint64(buf, g)
-					prefix = append(prefix, buf...)
-				}
-			}
-		}
-	}
-
-	return prefix
+	return buildQuadPrefix(QuadSPOGPrefix, s, p, o, g)
 }
 
 // EncodeQuadPOSGPrefix creates a prefix for POSG range scans with bound values.
 func EncodeQuadPOSGPrefix(p, o, s, g uint64) []byte {
-	prefix := []byte{QuadPOSGPrefix}
-
-	if p != 0 {
-		buf := make([]byte, IDSize)
-		binary.BigEndian.PutUint64(buf, p)
-		prefix = append(prefix, buf...)
-
-		if o != 0 {
-			buf = make([]byte, IDSize)
-			binary.BigEndian.PutUint64(buf, o)
-			prefix = append(prefix, buf...)
-
-			if s != 0 {
-				buf = make([]byte, IDSize)
-				binary.BigEndian.PutUint64(buf, s)
-				prefix = append(prefix, buf...)
-
-				if g != 0 {
-					buf = make([]byte, IDSize)
-					binary.BigEndian.PutUint64(buf, g)
-					prefix = append(prefix, buf...)
-				}
-			}
-		}
-	}
-
-	return prefix
+	return buildQuadPrefix(QuadPOSGPrefix, p, o, s, g)
 }
 
 // EncodeQuadGSPOPrefix creates a prefix for GSPO range scans for graph lifecycle operations.

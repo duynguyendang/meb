@@ -7,57 +7,48 @@ import (
 	"github.com/google/mangle/factstore"
 )
 
+// extractQuadFromAtom extracts subject, predicate, object, and graph from an atom.
+// For "triples" predicate, uses args: triples(S, P, O, G)
+// For other predicates, uses atom.Predicate and args: predicate(S, O)
+func extractQuadFromAtom(atom ast.Atom) (subject, predicate, object, graph string) {
+	graph = "default"
+
+	if atom.Predicate.Symbol == "triples" && len(atom.Args) >= 3 {
+		if constTerm, ok := atom.Args[0].(ast.Constant); ok {
+			subject = constTerm.Symbol
+		}
+		if constTerm, ok := atom.Args[1].(ast.Constant); ok {
+			predicate = constTerm.Symbol
+		}
+		if constTerm, ok := atom.Args[2].(ast.Constant); ok {
+			object = constTerm.Symbol
+		}
+		if len(atom.Args) > 3 {
+			if constTerm, ok := atom.Args[3].(ast.Constant); ok {
+				graph = constTerm.Symbol
+			}
+		}
+	} else {
+		predicate = atom.Predicate.Symbol
+		if len(atom.Args) >= 2 {
+			if constTerm, ok := atom.Args[0].(ast.Constant); ok {
+				subject = constTerm.Symbol
+			}
+			if constTerm, ok := atom.Args[1].(ast.Constant); ok {
+				object = constTerm.Symbol
+			}
+		}
+	}
+
+	return
+}
+
 // === factstore.FactStore implementation ===
 
 // GetFacts streams facts matching the given atom using the callback.
 // It implements streaming semantics - never loads all results into memory.
 func (m *MEBStore) GetFacts(atom ast.Atom, callback func(ast.Atom) error) error {
-	// Convert atom arguments to Scan parameters
-	var s, p, o, g string
-
-	// For the "triples" predicate, the predicate is actually stored as part of the quad
-	// The Datalog syntax ?triples(S, P, O) maps to the quad store format
-	// where P is the actual predicate from the fact
-
-	// Extract subject (first arg)
-	if len(atom.Args) > 0 {
-		if constTerm, ok := atom.Args[0].(ast.Constant); ok {
-			s = constTerm.Symbol
-		}
-	}
-
-	// Extract predicate (second arg for "triples" predicate, otherwise from atom.Predicate)
-	if atom.Predicate.Symbol == "triples" && len(atom.Args) > 1 {
-		// For ?triples(S, P, O), the predicate is the second argument
-		if constTerm, ok := atom.Args[1].(ast.Constant); ok {
-			p = constTerm.Symbol
-		}
-	} else {
-		// For other predicates, use the atom's predicate symbol
-		p = atom.Predicate.Symbol
-	}
-
-	// Extract object (third arg for "triples", otherwise second arg)
-	var objectIndex int
-	if atom.Predicate.Symbol == "triples" {
-		objectIndex = 2 // Third argument
-	} else {
-		objectIndex = 1 // Second argument
-	}
-
-	if len(atom.Args) > objectIndex {
-		if constTerm, ok := atom.Args[objectIndex].(ast.Constant); ok {
-			o = constTerm.Symbol
-		}
-	}
-
-	// Extract graph (optional 4th arg for "triples", 3rd for others)
-	graphIndex := objectIndex + 1
-	if len(atom.Args) > graphIndex {
-		if constTerm, ok := atom.Args[graphIndex].(ast.Constant); ok {
-			g = constTerm.Symbol
-		}
-	}
+	s, p, o, g := extractQuadFromAtom(atom)
 
 	// Check for full table scan (no bound arguments)
 	if s == "" && p == "" && o == "" && g == "" {
@@ -104,34 +95,7 @@ func (m *MEBStore) Add(atom ast.Atom) bool {
 		return false
 	}
 
-	// For the "triples" predicate, extract the actual predicate and object from arguments
-	var subject, predicate, object string
-	var graph string = "default" // Default graph
-
-	if atom.Predicate.Symbol == "triples" && len(atom.Args) >= 3 {
-		// ?triples(S, P, O) format
-		if constTerm, ok := atom.Args[0].(ast.Constant); ok {
-			subject = constTerm.Symbol
-		}
-		if constTerm, ok := atom.Args[1].(ast.Constant); ok {
-			predicate = constTerm.Symbol
-		}
-		if constTerm, ok := atom.Args[2].(ast.Constant); ok {
-			object = constTerm.Symbol
-		}
-	} else {
-		// Other predicates: use atom.Predicate as the predicate
-		// This is for backward compatibility with non-triples predicates
-		if len(atom.Args) >= 2 {
-			if constTerm, ok := atom.Args[0].(ast.Constant); ok {
-				subject = constTerm.Symbol
-			}
-			predicate = atom.Predicate.Symbol
-			if constTerm, ok := atom.Args[1].(ast.Constant); ok {
-				object = constTerm.Symbol
-			}
-		}
-	}
+	subject, predicate, object, graph := extractQuadFromAtom(atom)
 
 	// Add fact using the quad store format
 	fact := Fact{

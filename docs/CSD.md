@@ -168,51 +168,86 @@ User Input:     Fact{Subject: S, Predicate: P, Object: O}
 Storage:        <S, P, O, "default"> as 33-byte quad key
 ```
 
-### 3.3 Predicate Constants
+### 3.3 Flexible Predicate System
+
+MEB uses a flexible namespace-based predicate system that avoids fixed constants and supports domain-specific predicates:
 
 ```go
-const (
-    // Structural Predicates
-    PredDefines       = "defines"           // Type/function definition
-    PredCalls         = "calls"             // Function invocation
-    PredImports       = "imports"           // Package import
-    PredImplements    = "implements"        // Interface implementation
-    PredHasMethod     = "has_method"        // Method of type
-    PredHasField      = "has_field"         // Field of struct
-    PredReturns       = "returns"           // Return type
-    PredAccepts       = "accepts"           // Parameter type
-    PredTypeOf        = "type_of"           // Variable type
-    PredDependsOn     = "depends_on"        // Dependency relationship
-    PredHasDoc        = "has_doc"           // Documentation association
-    PredHasSourceCode = "has_source_code"   // Raw source code
-    PredInPackage     = "in_package"        // Package membership
-    PredHasTag        = "has_tag"           // Architectural tag
-    PredHash          = "hash_sha256"       // Content hash
-    
-    // Semantic Classification Predicates
-    PredType          = "type"              // Categorization (interface, struct, func, etc.)
-    PredHasRole       = "has_role"          // Universal architectural roles
-    PredName          = "name"              // Human-readable identifier
-    
-    // Cross-Layer Predicates
-    PredCallsAPI      = "calls_api"         // Frontend → Virtual URI
-    PredHandledBy     = "handled_by"        // Virtual URI → Backend Handler
-    
-    // Virtual predicates (inferred)
-    PotentiallyCalls  = "v:potentially_calls"
-    WiresTo           = "v:wires_to"
-)
+// Predicate is a string-based type supporting namespaced predicates
+type Predicate string
+
+// Namespace provides fluent API for creating namespaced predicates
+type Namespace struct {
+    prefix string
+}
+
+// Create namespaces
+func NS(prefix string) *Namespace {
+    return &Namespace{prefix: prefix}
+}
+
+// Pre-defined namespaces
+var KB = NS("kb")
+var Code = NS("code")
+var Entity = NS("entity")
+var System = NS("system")
+
+// Create predicates from namespace
+func (n *Namespace) P(name string) Predicate {
+    if n.prefix == "" {
+        return Predicate(name)
+    }
+    return Predicate(n.prefix + ":" + name)
+}
+
+// Parse from string
+func MustParse(s string) Predicate {
+    return Predicate(s)
+}
 ```
 
-**Universal Roles (PredHasRole):**
-- `entry_point` - Application entry points (main, handlers)
-- `data_model` - Data structures and models
-- `utility` - Helper functions and utilities
-- `service` - Business logic services
-- `middleware` - Cross-cutting concerns
+**Usage:**
 
-**Cross-Layer Semantics:**
-The `calls_api` and `handled_by` predicates enable tracing across architectural boundaries (e.g., frontend API calls to backend handlers).
+```go
+// Knowledge base predicates
+KB.P("entity_of")    // "kb:entity_of"
+KB.P("related_to")  // "kb:related_to"
+KB.P("mentions")    // "kb:mentions"
+KB.P("has_title")   // "kb:has_title"
+KB.P("contains")    // "kb:contains"
+KB.P("link_to")    // "kb:link_to"
+
+// Code predicates
+Code.P("defines")    // "code:defines"
+Code.P("calls")      // "code:calls"
+Code.P("imports")    // "code:imports"
+Code.P("in_package") // "code:in_package"
+Code.P("has_tag")    // "code:has_tag"
+
+// Custom domains
+NS("custom").P("relationship")  // "custom:relationship"
+NS("project-x").P("owned_by")  // "project-x:owned_by"
+
+// Direct parse
+MustParse("kb:references")  // "kb:references"
+```
+
+**Why Flexible Predicates?**
+
+| Aspect | Fixed Constants | Flexible Namespaces |
+|--------|-----------------|---------------------|
+| Extensibility | Add new constants | `NS("new").P("predicate")` |
+| Domain Isolation | Global constants | Namespaced (kb: vs code:) |
+| Custom Domains | Modify constants | `NS("mydomain")` |
+
+**Namespaces:**
+- `kb` - Knowledge base (documents, notes, articles)
+- `code` - Source code analysis
+- `entity` - Named entity relationships
+- `system` - System metadata
+- `entity` - Named entity relationships
+- `system` - System metadata
+- `graph` - Graph structure
 
 
 ## 4. Store Architecture
@@ -5092,6 +5127,111 @@ var (
     ErrGCSFuseNotAllowed   = errors.New("GCS Fuse direct access not allowed, use local ephemeral disk")
 )
 ```
+
+## 22. SOLID and DRY Principles
+
+MEB's codebase adheres to SOLID and DRY principles to ensure maintainability, testability, and long-term code health.
+
+### 22.1 SOLID Compliance
+
+| Principle | Implementation |
+|-----------|----------------|
+| **Single Responsibility** | Each type has a focused purpose: `Fact` (data), `Builder` (query construction), `PredicateTable` (index management) |
+| **Open/Closed** | Extensible via interfaces: `Store`, `Extractor`, `Connector`, `Dictionary` |
+| **Interface Segregation** | Small, focused interfaces: `Extractor` has 3 methods, `Connector` has 3 methods |
+| **Dependency Inversion** | `Builder` depends on `Store` interface, not concrete `MEBStore` |
+| **Liskov Substitution** | Any implementation of `Dictionary` can be substituted (single-threaded vs sharded) |
+
+### 22.2 DRY - Code Reuse Patterns
+
+#### 22.2.1 Scan Logic Consolidation (`scan.go`)
+
+The `Scan()` and `ScanZeroCopy()` methods previously contained ~150 lines of duplicated logic. This has been refactored into shared helpers:
+
+```go
+// Shared scan state
+type scanResult struct {
+    foundSID uint64
+    foundPID uint64
+    foundOID uint64
+    foundGID uint64
+    key      []byte
+}
+
+type scanOptions struct {
+    ctx      context.Context
+    s, p, o, g string
+    sID, pID, oID, gID uint64
+    sBound, pBound, oBound, gBound bool
+    strategy *scanStrategy
+}
+
+// Unified preparation - called once
+func (m *MEBStore) prepareScan(s, p, o, g string) *scanOptions
+
+// Core iteration logic - reused by all scan variants
+func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact, bool)) iter.Seq2[Fact, error]
+```
+
+**Lines eliminated:** ~150
+
+#### 22.2.2 Predicate Extraction (`fact_store.go`)
+
+The `GetFacts()` and `Add()` methods both extracted subject/predicate/object/graph from atoms with identical logic:
+
+```go
+// Single helper function for all atom parsing
+func extractQuadFromAtom(atom ast.Atom) (subject, predicate, object, graph string)
+```
+
+**Lines eliminated:** ~40
+
+#### 22.2.3 Prefix Encoding (`keys/encoding.go`)
+
+`EncodeQuadSPOGPrefix()` and `EncodeQuadPOSGPrefix()` had identical nested-if structure:
+
+```go
+// Generic helper replaces two nearly identical functions
+func buildQuadPrefix(prefix byte, components ...uint64) []byte
+
+func EncodeQuadSPOGPrefix(s, p, o, g uint64) []byte {
+    return buildQuadPrefix(QuadSPOGPrefix, s, p, o, g)
+}
+
+func EncodeQuadPOSGPrefix(p, o, s, g uint64) []byte {
+    return buildQuadPrefix(QuadPOSGPrefix, p, o, s, g)
+}
+```
+
+**Lines eliminated:** ~35
+
+#### 22.2.4 Dictionary Error Handling
+
+Error messages for missing dictionary IDs were repeated in 4 places:
+
+```go
+// Centralized error creation
+func dictError(field, value string, err error) error {
+    return fmt.Errorf("%s %q not found: %w", field, value, err)
+}
+```
+
+### 22.3 Summary
+
+| Refactoring | Lines Eliminated |
+|-------------|-----------------|
+| Scan logic consolidation | ~150 |
+| Predicate extraction | ~40 |
+| Prefix encoding | ~35 |
+| Error handling | ~10 |
+| **Total** | **~235 lines** |
+
+### 22.4 Benefits
+
+- **Maintainability**: Changes to scan logic need only be made in one place
+- **Testability**: Helper functions can be unit tested independently
+- **Readability**: Reduced cognitive load from understanding duplicate code
+- **Performance**: Shared implementation means shared optimizations
 
 ---
 

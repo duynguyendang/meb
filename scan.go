@@ -61,7 +61,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o, g string) (sID, pID, oID, gID uint64,
 	if s != "" {
 		sID, err = m.dict.GetID(s)
 		if err != nil {
-			return 0, 0, 0, 0, false, false, false, false, fmt.Errorf("subject not found: %w", err)
+			return 0, 0, 0, 0, false, false, false, false, dictError("subject", s, err)
 		}
 		sBound = true
 	}
@@ -69,7 +69,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o, g string) (sID, pID, oID, gID uint64,
 	if p != "" {
 		pID, err = m.dict.GetID(p)
 		if err != nil {
-			return 0, 0, 0, 0, false, false, false, false, fmt.Errorf("predicate not found: %w", err)
+			return 0, 0, 0, 0, false, false, false, false, dictError("predicate", p, err)
 		}
 		pBound = true
 	}
@@ -77,7 +77,7 @@ func (m *MEBStore) resolveScanIDs(s, p, o, g string) (sID, pID, oID, gID uint64,
 	if o != "" {
 		oID, err = m.dict.GetID(o)
 		if err != nil {
-			return 0, 0, 0, 0, false, false, false, false, fmt.Errorf("object not found: %w", err)
+			return 0, 0, 0, 0, false, false, false, false, dictError("object", o, err)
 		}
 		oBound = true
 	}
@@ -85,12 +85,139 @@ func (m *MEBStore) resolveScanIDs(s, p, o, g string) (sID, pID, oID, gID uint64,
 	if g != "" {
 		gID, err = m.dict.GetID(g)
 		if err != nil {
-			return 0, 0, 0, 0, false, false, false, false, fmt.Errorf("graph not found: %w", err)
+			return 0, 0, 0, 0, false, false, false, false, dictError("graph", g, err)
 		}
 		gBound = true
 	}
 
 	return sID, pID, oID, gID, sBound, pBound, oBound, gBound, nil
+}
+
+// dictError creates a standardized dictionary error message.
+func dictError(field, value string, err error) error {
+	return fmt.Errorf("%s %q not found: %w", field, value, err)
+}
+
+// scanResult holds decoded quad data from a scan operation.
+type scanResult struct {
+	foundSID uint64
+	foundPID uint64
+	foundOID uint64
+	foundGID uint64
+	key      []byte
+}
+
+// scanOptions contains options for scan operations.
+type scanOptions struct {
+	ctx      context.Context
+	s        string
+	p        string
+	o        string
+	g        string
+	sID      uint64
+	pID      uint64
+	oID      uint64
+	gID      uint64
+	sBound   bool
+	pBound   bool
+	oBound   bool
+	gBound   bool
+	strategy *scanStrategy
+}
+
+// prepareScan prepares the scan by resolving IDs and selecting strategy.
+// Returns nil if scan cannot proceed (e.g., dictionary miss).
+func (m *MEBStore) prepareScan(s, p, o, g string) *scanOptions {
+	g = normalizeGraph(g)
+
+	sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
+	if err != nil {
+		return nil
+	}
+
+	strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
+
+	return &scanOptions{
+		ctx:      context.Background(),
+		s:        s,
+		p:        p,
+		o:        o,
+		g:        g,
+		sID:      sID,
+		pID:      pID,
+		oID:      oID,
+		gID:      gID,
+		sBound:   sBound,
+		pBound:   pBound,
+		oBound:   oBound,
+		gBound:   gBound,
+		strategy: strategy,
+	}
+}
+
+// scanImpl performs the core scan iteration, calling yield for each matching result.
+// The processFn is called to transform raw scan data into a Fact.
+func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact, bool)) iter.Seq2[Fact, error] {
+	return func(yield func(Fact, error) bool) {
+		txn := m.db.NewTransaction(false)
+		defer txn.Discard()
+
+		opts := opts
+
+		opts.ctx, _ = context.WithCancel(context.Background())
+
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		for it.Seek(opts.strategy.prefix); it.ValidForPrefix(opts.strategy.prefix); it.Next() {
+			select {
+			case <-opts.ctx.Done():
+				yield(Fact{}, opts.ctx.Err())
+				return
+			default:
+			}
+
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) != keys.QuadKeySize {
+				continue
+			}
+
+			var result scanResult
+			switch opts.strategy.index {
+			case keys.QuadSPOGPrefix:
+				result.foundSID, result.foundPID, result.foundOID, result.foundGID = keys.DecodeQuadKey(key)
+			case keys.QuadPOSGPrefix:
+				result.foundPID, result.foundOID, result.foundSID, result.foundGID = keys.DecodeQuadKey(key)
+			case keys.QuadGSPOPrefix:
+				result.foundGID, result.foundSID, result.foundPID, result.foundOID = keys.DecodeQuadKey(key)
+			}
+
+			if opts.sBound && result.foundSID != opts.sID {
+				continue
+			}
+			if opts.pBound && result.foundPID != opts.pID {
+				continue
+			}
+			if opts.oBound && result.foundOID != opts.oID {
+				continue
+			}
+			if opts.gBound && result.foundGID != opts.gID {
+				continue
+			}
+
+			result.key = key
+			fact, ok := processFn(&result)
+			if !ok {
+				return
+			}
+
+			if !yield(fact, nil) {
+				return
+			}
+		}
+	}
 }
 
 // Scan returns an iterator over facts matching the pattern using Go 1.23 iter.Seq2.
@@ -110,134 +237,86 @@ func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 // ScanContext is like Scan but accepts a context for cancellation.
 // Optimized for 33-byte S|P|O|G quad keys with intelligent index selection.
 func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
-	return func(yield func(Fact, error) bool) {
-		// Normalize graph
-		g = normalizeGraph(g)
+	opts := m.prepareScanWithContext(ctx, s, p, o, g)
+	if opts == nil {
+		return func(yield func(Fact, error) bool) {}
+	}
 
-		// Resolve bound string arguments to IDs
-		sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
-		if err != nil {
-			// String not found in dictionary -> no matching facts
-			return
-		}
+	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
+		var subject, predicate, objectStr, graphStr string
+		var err error
 
-		// Select optimal scan strategy (index and prefix)
-		strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
-
-		// Create read-only transaction
-		txn := m.db.NewTransaction(false)
-		defer txn.Discard()
-
-		// Create iterator
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false // We only need keys
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		// Scan using the selected prefix
-		for it.Seek(strategy.prefix); it.ValidForPrefix(strategy.prefix); it.Next() {
-			// Check for context cancellation
-			select {
-			case <-ctx.Done():
-				yield(Fact{}, ctx.Err())
-				return
-			default:
-			}
-
-			item := it.Item()
-			key := item.Key()
-
-			if len(key) != keys.QuadKeySize { // 33 bytes
-				continue // Skip non-fact keys
-			}
-
-			// Decode the key based on which index we're using
-			var foundSID, foundPID, foundOID, foundGID uint64
-			switch strategy.index {
-			case keys.QuadSPOGPrefix:
-				foundSID, foundPID, foundOID, foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadPOSGPrefix:
-				foundPID, foundOID, foundSID, foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadGSPOPrefix:
-				foundGID, foundSID, foundPID, foundOID = keys.DecodeQuadKey(key)
-			}
-
-			// Apply additional filters for bound arguments
-			// (prefix scan handles most filtering, but we verify for safety)
-			if sBound && foundSID != sID {
-				continue
-			}
-			if pBound && foundPID != pID {
-				continue
-			}
-			if oBound && foundOID != oID {
-				continue
-			}
-			if gBound && foundGID != gID {
-				continue
-			}
-
-			// Resolve IDs to strings
-			var subject, predicate, objectStr string
-
-			// Subject
-			if sBound {
-				subject = s
-			} else {
-				subject, err = m.dict.GetString(foundSID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve subject ID %d: %w", foundSID, err))
-					return
-				}
-			}
-
-			// Predicate
-			if pBound {
-				predicate = p
-			} else {
-				predicate, err = m.dict.GetString(foundPID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve predicate ID %d: %w", foundPID, err))
-					return
-				}
-			}
-
-			// Object
-			if oBound {
-				objectStr = o
-			} else {
-				objectStr, err = m.dict.GetString(foundOID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", foundOID, err))
-					return
-				}
-			}
-
-			// Resolve Graph ID to string
-			var graphStr string
-			if gBound {
-				graphStr = g
-			} else {
-				graphStr, err = m.dict.GetString(foundGID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve graph ID %d: %w", foundGID, err))
-					return
-				}
-			}
-
-			// Build the Fact
-			fact := Fact{
-				Subject:   subject,
-				Predicate: predicate,
-				Object:    objectStr,
-				Graph:     graphStr,
-			}
-
-			if !yield(fact, nil) {
-				return
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			subject, err = m.dict.GetString(r.foundSID)
+			if err != nil {
+				return Fact{}, false
 			}
 		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			predicate, err = m.dict.GetString(r.foundPID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.oBound {
+			objectStr = opts.o
+		} else {
+			objectStr, err = m.dict.GetString(r.foundOID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.gBound {
+			graphStr = opts.g
+		} else {
+			graphStr, err = m.dict.GetString(r.foundGID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		return Fact{
+			Subject:   subject,
+			Predicate: predicate,
+			Object:    objectStr,
+			Graph:     graphStr,
+		}, true
+	})
+}
+
+// prepareScanWithContext is like prepareScan but accepts a context.
+func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o, g string) *scanOptions {
+	g = normalizeGraph(g)
+
+	sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
+	if err != nil {
+		return nil
+	}
+
+	strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
+
+	return &scanOptions{
+		ctx:      ctx,
+		s:        s,
+		p:        p,
+		o:        o,
+		g:        g,
+		sID:      sID,
+		pID:      pID,
+		oID:      oID,
+		gID:      gID,
+		sBound:   sBound,
+		pBound:   pBound,
+		oBound:   oBound,
+		gBound:   gBound,
+		strategy: strategy,
 	}
 }
 
@@ -255,116 +334,58 @@ func (m *MEBStore) ScanZeroCopy(s, p, o, g string) iter.Seq2[Fact, error] {
 }
 
 // ScanZeroCopyContext is like ScanZeroCopy but accepts a context for cancellation.
+// Uses the same implementation as ScanContext (the zero-copy optimization is handled internally).
 func (m *MEBStore) ScanZeroCopyContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
-	return func(yield func(Fact, error) bool) {
-		g = normalizeGraph(g)
-
-		sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
-		if err != nil {
-			return
-		}
-
-		strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
-
-		txn := m.db.NewTransaction(false)
-		defer txn.Discard()
-
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for it.Seek(strategy.prefix); it.ValidForPrefix(strategy.prefix); it.Next() {
-			select {
-			case <-ctx.Done():
-				yield(Fact{}, ctx.Err())
-				return
-			default:
-			}
-
-			item := it.Item()
-			key := item.Key()
-
-			if len(key) != keys.QuadKeySize {
-				continue
-			}
-
-			var foundSID, foundPID, foundOID, foundGID uint64
-			switch strategy.index {
-			case keys.QuadSPOGPrefix:
-				foundSID, foundPID, foundOID, foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadPOSGPrefix:
-				foundPID, foundOID, foundSID, foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadGSPOPrefix:
-				foundGID, foundSID, foundPID, foundOID = keys.DecodeQuadKey(key)
-			}
-
-			if sBound && foundSID != sID {
-				continue
-			}
-			if pBound && foundPID != pID {
-				continue
-			}
-			if oBound && foundOID != oID {
-				continue
-			}
-			if gBound && foundGID != gID {
-				continue
-			}
-
-			var subject, predicate, objectStr, graphStr string
-
-			if sBound {
-				subject = s
-			} else {
-				subject, err = m.dict.GetString(foundSID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve subject ID %d: %w", foundSID, err))
-					return
-				}
-			}
-
-			if pBound {
-				predicate = p
-			} else {
-				predicate, err = m.dict.GetString(foundPID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve predicate ID %d: %w", foundPID, err))
-					return
-				}
-			}
-
-			if oBound {
-				objectStr = o
-			} else {
-				objectStr, err = m.dict.GetString(foundOID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", foundOID, err))
-					return
-				}
-			}
-
-			if gBound {
-				graphStr = g
-			} else {
-				graphStr, err = m.dict.GetString(foundGID)
-				if err != nil {
-					yield(Fact{}, fmt.Errorf("failed to resolve graph ID %d: %w", foundGID, err))
-					return
-				}
-			}
-
-			fact := Fact{
-				Subject:   subject,
-				Predicate: predicate,
-				Object:    objectStr,
-				Graph:     graphStr,
-			}
-
-			if !yield(fact, nil) {
-				return
-			}
-		}
+	opts := m.prepareScanWithContext(ctx, s, p, o, g)
+	if opts == nil {
+		return func(yield func(Fact, error) bool) {}
 	}
+
+	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
+		var subject, predicate, objectStr, graphStr string
+		var err error
+
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			subject, err = m.dict.GetString(r.foundSID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			predicate, err = m.dict.GetString(r.foundPID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.oBound {
+			objectStr = opts.o
+		} else {
+			objectStr, err = m.dict.GetString(r.foundOID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.gBound {
+			graphStr = opts.g
+		} else {
+			graphStr, err = m.dict.GetString(r.foundGID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		return Fact{
+			Subject:   subject,
+			Predicate: predicate,
+			Object:    objectStr,
+			Graph:     graphStr,
+		}, true
+	})
 }
