@@ -169,8 +169,9 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 	}
 
 	// 3. Delete vector (from registry)
-	// Note: Vector registry doesn't have direct delete, but removing is complex
-	// The vector will be overwritten if re-added
+	if !m.vectors.Delete(id) {
+		slog.Debug("vector not found for deletion", "key", docKey, "id", id)
+	}
 
 	// 4. Delete metadata facts (scan and delete)
 	// We need to collect keys first, then delete
@@ -229,9 +230,8 @@ func (m *MEBStore) HasDocument(docKey string) (bool, error) {
 	}
 
 	// Check for vector
-	if m.vectors.Count() > 0 {
-		// Check if this specific ID is in the vector registry
-		// The registry tracks IDs internally
+	if m.vectors.HasVector(id) {
+		return true, nil
 	}
 
 	// Check for metadata facts

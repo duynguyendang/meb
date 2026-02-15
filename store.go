@@ -61,6 +61,9 @@ type MEBStore struct {
 	dictDB *badger.DB // Separate DB for dictionary
 	dict   dict.Dictionary
 
+	// Transaction pool for high-throughput scenarios
+	txPool *TxPool
+
 	// Predicate tables
 	predicates map[ast.PredicateSym]*predicates.PredicateTable
 
@@ -181,8 +184,11 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		predicates: make(map[ast.PredicateSym]*predicates.PredicateTable),
 		config:     cfg,
 		vectors:    vector.NewRegistry(db),
-		breaker:    circuit.NewBreaker(nil), // Use default config with 2s timeout
+		breaker:    circuit.NewBreaker(nil),
+		txPool:     NewTxPool(db, 16),
 	}
+
+	m.txPool.Init()
 
 	// Load vector snapshot from disk
 	if err := m.vectors.LoadSnapshot(); err != nil {
@@ -265,6 +271,9 @@ func (m *MEBStore) Close() error {
 		slog.Error("failed to close vectors", "error", err)
 		return err
 	}
+
+	// Close transaction pool
+	m.txPool.Close()
 
 	// Close dictionary
 	if err := m.dict.Close(); err != nil {

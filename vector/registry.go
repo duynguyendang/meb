@@ -116,3 +116,43 @@ func (r *VectorRegistry) Close() error {
 	r.wg.Wait()
 	return nil
 }
+
+// Delete removes a vector from the registry by ID.
+// Returns true if the vector was found and deleted, false if not found.
+func (r *VectorRegistry) Delete(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	idx, exists := r.idMap[id]
+	if !exists {
+		return false
+	}
+
+	lastIdx := uint32(len(r.revMap) - 1)
+	lastID := r.revMap[lastIdx]
+
+	if idx != lastIdx {
+		r.revMap[idx] = lastID
+		r.idMap[lastID] = idx
+
+		srcOffset := int(lastIdx) * MRLDim
+		dstOffset := int(idx) * MRLDim
+		copy(r.data[dstOffset:dstOffset+MRLDim], r.data[srcOffset:srcOffset+MRLDim])
+	}
+
+	r.revMap = r.revMap[:lastIdx]
+	delete(r.idMap, id)
+	r.data = r.data[:len(r.data)-MRLDim]
+
+	slog.Debug("vector deleted", "id", id, "remaining", len(r.revMap))
+
+	return true
+}
+
+// HasVector checks if a vector exists for the given ID.
+func (r *VectorRegistry) HasVector(id uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, exists := r.idMap[id]
+	return exists
+}
