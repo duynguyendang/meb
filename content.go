@@ -257,3 +257,19 @@ func (m *MEBStore) HasDocument(docKey string) (bool, error) {
 
 	return false, nil
 }
+
+// GetContentByKey retrieves and decompresses content for a given document key.
+func (m *MEBStore) GetContentByKey(docKey string) ([]byte, error) {
+id, err := m.dict.GetID(docKey)
+if err != nil {
+return nil, fmt.Errorf("failed to get document ID: %w", err)
+}
+return m.GetContent(id)
+}
+
+// LookupID returns the internal uint64 ID for a given string key.
+// Returns false if the key is not found in the dictionary.
+func (m *MEBStore) LookupID(key string) (uint64, bool) {
+id, err := m.dict.GetID(key)
+return id, err == nil
+}
