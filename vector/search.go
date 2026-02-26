@@ -1,14 +1,36 @@
 package vector
 
 import (
+	"container/heap"
 	"log/slog"
 	"runtime"
+	"sort"
 )
 
 // SearchResult represents a single search result with similarity score.
 type SearchResult struct {
 	ID    uint64  // GraphID
 	Score float32 // Cosine similarity (higher is better)
+}
+
+type scoreIndex struct {
+	score float32
+	idx   int
+}
+
+// scoreHeap implements heap.Interface for a min-heap of scoreIndex
+type scoreHeap []scoreIndex
+
+func (h scoreHeap) Len() int           { return len(h) }
+func (h scoreHeap) Less(i, j int) bool { return h[i].score < h[j].score }
+func (h scoreHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *scoreHeap) Push(x any)        { *h = append(*h, x.(scoreIndex)) }
+func (h *scoreHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
 }
 
 // Search performs a parallel linear scan to find the top-k most similar vectors.
@@ -89,13 +111,7 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) ([]SearchResult, erro
 
 // scanChunk scans a chunk of vectors and returns local top-k results.
 func (r *VectorRegistry) scanChunk(vectors []float32, query []float32, startIdx, endIdx, k int) []SearchResult {
-	type scoreIndex struct {
-		score float32
-		idx   int
-	}
-
-	// Simple heap implementation for top-k
-	topK := make([]scoreIndex, 0, k)
+	h := make(scoreHeap, 0, k)
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product
@@ -103,33 +119,21 @@ func (r *VectorRegistry) scanChunk(vectors []float32, query []float32, startIdx,
 		score := DotProduct(query, vectors[offset:offset+MRLDim])
 
 		// Maintain top-k
-		if len(topK) < k {
-			topK = append(topK, scoreIndex{score: score, idx: idx})
-			// Bubble up to maintain order
-			for i := len(topK) - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
+		if len(h) < k {
+			h = append(h, scoreIndex{score: score, idx: idx})
+			if len(h) == k {
+				heap.Init(&h)
 			}
-		} else if score > topK[k-1].score {
-			topK[k-1] = scoreIndex{score: score, idx: idx}
-			// Bubble up
-			for i := k - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
-			}
+		} else if score > h[0].score {
+			h[0] = scoreIndex{score: score, idx: idx}
+			heap.Fix(&h, 0)
 		}
 	}
 
 	// Convert to SearchResult
-	results := make([]SearchResult, 0, len(topK))
+	results := make([]SearchResult, 0, len(h))
 	r.mu.RLock()
-	for _, si := range topK {
+	for _, si := range h {
 		if si.idx < len(r.revMap) {
 			results = append(results, SearchResult{
 				ID:    r.revMap[si.idx],
@@ -145,13 +149,7 @@ func (r *VectorRegistry) scanChunk(vectors []float32, query []float32, startIdx,
 // scanChunkSIMD scans a chunk of vectors using SIMD-optimized dot product.
 // Zero-allocation per vector scanned (except for the final results).
 func (r *VectorRegistry) scanChunkSIMD(data []float32, query []float32, startIdx, endIdx, k int) []SearchResult {
-	type scoreIndex struct {
-		score float32
-		idx   int
-	}
-
-	// Pre-allocate top-K array to avoid allocations during scan
-	topK := make([]scoreIndex, 0, k)
+	h := make(scoreHeap, 0, k)
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product using SIMD-optimized function
@@ -159,34 +157,22 @@ func (r *VectorRegistry) scanChunkSIMD(data []float32, query []float32, startIdx
 		offset := idx * MRLDim
 		score := DotProduct64(data[offset:offset+MRLDim], query)
 
-		// Maintain top-k using simple bubble-up (fast for small k)
-		if len(topK) < k {
-			topK = append(topK, scoreIndex{score: score, idx: idx})
-			// Bubble up to maintain order
-			for i := len(topK) - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
+		// Maintain top-k
+		if len(h) < k {
+			h = append(h, scoreIndex{score: score, idx: idx})
+			if len(h) == k {
+				heap.Init(&h)
 			}
-		} else if score > topK[k-1].score {
-			topK[k-1] = scoreIndex{score: score, idx: idx}
-			// Bubble up
-			for i := k - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
-			}
+		} else if score > h[0].score {
+			h[0] = scoreIndex{score: score, idx: idx}
+			heap.Fix(&h, 0)
 		}
 	}
 
 	// Convert to SearchResult (only allocate for final results)
-	results := make([]SearchResult, 0, len(topK))
+	results := make([]SearchResult, 0, len(h))
 	r.mu.RLock()
-	for _, si := range topK {
+	for _, si := range h {
 		if si.idx < len(r.revMap) {
 			results = append(results, SearchResult{
 				ID:    r.revMap[si.idx],
@@ -202,13 +188,7 @@ func (r *VectorRegistry) scanChunkSIMD(data []float32, query []float32, startIdx
 // scanChunkInt8 scans a chunk of vectors using int8 scalar quantization.
 // Provides ~3x speedup over float32 due to better cache efficiency and faster integer arithmetic.
 func (r *VectorRegistry) scanChunkInt8(data []int8, query []int8, startIdx, endIdx, k int) []SearchResult {
-	type scoreIndex struct {
-		score float32
-		idx   int
-	}
-
-	// Pre-allocate top-K array to avoid allocations during scan
-	topK := make([]scoreIndex, 0, k)
+	h := make(scoreHeap, 0, k)
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product using int8 SIMD-optimized function
@@ -216,34 +196,22 @@ func (r *VectorRegistry) scanChunkInt8(data []int8, query []int8, startIdx, endI
 		offset := idx * MRLDim
 		score := DotProductInt8(data[offset:offset+MRLDim], query)
 
-		// Maintain top-k using simple bubble-up (fast for small k)
-		if len(topK) < k {
-			topK = append(topK, scoreIndex{score: score, idx: idx})
-			// Bubble up to maintain order
-			for i := len(topK) - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
+		// Maintain top-k
+		if len(h) < k {
+			h = append(h, scoreIndex{score: score, idx: idx})
+			if len(h) == k {
+				heap.Init(&h)
 			}
-		} else if score > topK[k-1].score {
-			topK[k-1] = scoreIndex{score: score, idx: idx}
-			// Bubble up
-			for i := k - 1; i > 0; i-- {
-				if topK[i].score > topK[i-1].score {
-					topK[i], topK[i-1] = topK[i-1], topK[i]
-				} else {
-					break
-				}
-			}
+		} else if score > h[0].score {
+			h[0] = scoreIndex{score: score, idx: idx}
+			heap.Fix(&h, 0)
 		}
 	}
 
 	// Convert to SearchResult (only allocate for final results)
-	results := make([]SearchResult, 0, len(topK))
+	results := make([]SearchResult, 0, len(h))
 	r.mu.RLock()
-	for _, si := range topK {
+	for _, si := range h {
 		if si.idx < len(r.revMap) {
 			results = append(results, SearchResult{
 				ID:    r.revMap[si.idx],
@@ -258,19 +226,16 @@ func (r *VectorRegistry) scanChunkInt8(data []int8, query []int8, startIdx, endI
 
 // getTopK extracts the top-k results from a merged list.
 func getTopK(results []SearchResult, k int) []SearchResult {
-	if len(results) <= k {
+	if len(results) == 0 {
 		return results
 	}
 
-	// Simple bubble sort by score descending (highest first)
-	// Only need to sort the first k positions
-	for i := 0; i < k; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[j].Score > results[i].Score {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
-	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Score > results[j].Score // descending
+	})
 
-	return results[:k]
+	if len(results) > k {
+		return results[:k]
+	}
+	return results
 }

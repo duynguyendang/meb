@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -28,7 +29,12 @@ func (m *MEBStore) AddFact(fact Fact) error {
 
 // AddFactBatch inserts multiple facts in a single operation using quad indices.
 // Uses batch dictionary encoding for optimal performance.
-// Populates 2 indices: SPO (forward), OPS (reverse).
+// Populates 3 indices: SPOG (Subject-Predicate-Object-Graph),
+//
+//	POSG (Predicate-Object-Subject-Graph),
+//	GSPO (Graph-Subject-Predicate-Object).
+//
+// All keys are 33-byte quad format for multi-tenant support.
 func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	// Validate all facts first
 	if err := validateFacts(facts); err != nil {
@@ -93,7 +99,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		// Get IDs for Subject, Predicate, Graph from refs
 		sID := ids[factStringRefs[i][0].index]
 		pID := ids[factStringRefs[i][1].index]
-		// gID := ids[factStringRefs[i][2].index] // Graph ID unused in 24-byte key mode
+		gID := ids[factStringRefs[i][2].index] // Graph ID now used in 33-byte quad key mode
 
 		// Handle Object (could be string or other type)
 		var oID uint64
@@ -109,22 +115,22 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			}
 		}
 
-		// Add to main index: SPO (25 bytes)
-		spogKey := keys.EncodeSPOKey(sID, pID, oID)
+		// Add to main index: SPOG (33 bytes) - Subject-Predicate-Object-Graph
+		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, sID, pID, oID, gID)
 		if err := batch.Set(spogKey, nil); err != nil {
-			return fmt.Errorf("failed to set SPO key for fact %d: %w", i, err)
+			return fmt.Errorf("failed to set SPOG key for fact %d: %w", i, err)
 		}
 
-		// Add to inverse index: OPS (25 bytes)
-		opsKey := keys.EncodeOPSKey(sID, pID, oID)
-		if err := batch.Set(opsKey, nil); err != nil {
-			return fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
+		// Add to inverse index: POSG (33 bytes) - Predicate-Object-Subject-Graph
+		posgKey := keys.EncodeQuadKey(keys.QuadPOSGPrefix, sID, pID, oID, gID)
+		if err := batch.Set(posgKey, nil); err != nil {
+			return fmt.Errorf("failed to set POSG key for fact %d: %w", i, err)
 		}
 
-		// Add to predicate index: PSO (25 bytes)
-		psoKey := keys.EncodePSOKey(sID, pID, oID)
-		if err := batch.Set(psoKey, nil); err != nil {
-			return fmt.Errorf("failed to set PSO key for fact %d: %w", i, err)
+		// Add to graph index: GSPO (33 bytes) - Graph-Subject-Predicate-Object
+		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, sID, pID, oID, gID)
+		if err := batch.Set(gspoKey, nil); err != nil {
+			return fmt.Errorf("failed to set GSPO key for fact %d: %w", i, err)
 		}
 
 		// Update fact count (zero-cost atomic operation)
@@ -291,7 +297,7 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 
 			// Check args count
 			if len(atom.Args) != 3 {
-				return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
+			return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
 			}
 
 			// Prepare Scan arguments
@@ -318,17 +324,12 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 				}
 			}
 
-			// Graph context (defaulting to all graphs or specific if we add that support)
-			// For now, let's scan all known graphs or default.
-			// The original implementation scanned specific graphs.
-			// Let's iterate a set of "common" graphs for now as per original code behavior?
-			// Or better: The original Scan(g="") implementation might not strict enough if we don't have GSPO index support for wildcard graph.
-			// User request didn't specify graph handling changes, but "Scan" supports iterating if g is empty IF we have proper indexing.
-			// Let's stick to scanning "default" plus others if needed.
-			// Ideally, we should scan all graphs.
-			// For this implementation, we'll iterate known graphs like in main.go example to be safe, or just "default".
-			// Let's assume "default" for now to keep it simple, or iterate a fixed list.
-			scanGraphs := []string{"default", "doc1", "doc2"} // TODO: Discover graphs dynamically
+			// Scan all graphs dynamically by discovering them from the GSPO index
+			scanGraphs, err := m.getAllGraphs()
+			if err != nil {
+				slog.Warn("failed to discover graphs, falling back to default", "error", err)
+				scanGraphs = []string{"default"}
+			}
 
 			for _, g := range scanGraphs {
 				// Scan: Use the partially-bound Atom
@@ -442,4 +443,58 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 	}
 
 	return finalResults, nil
+}
+
+// getAllGraphs discovers all unique graphs in the store by scanning the GSPO index.
+// Returns a slice of graph names, sorted for consistent ordering.
+// This is an expensive operation and should be cached or used sparingly.
+func (m *MEBStore) getAllGraphs() ([]string, error) {
+	graphSet := make(map[uint64]struct{})
+
+	txn := m.db.NewTransaction(false)
+	defer txn.Discard()
+
+	prefix := []byte{keys.QuadGSPOPrefix}
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		item := it.Item()
+		key := item.Key()
+
+		if len(key) != keys.QuadKeySize {
+			continue
+		}
+
+		// Decode to get the graph ID
+		_, _, _, gID := keys.DecodeQuadKey(key)
+		if gID != 0 {
+			graphSet[gID] = struct{}{}
+		}
+	}
+
+	if len(graphSet) == 0 {
+		return []string{"default"}, nil
+	}
+
+	// Convert IDs to strings
+	graphs := make([]string, 0, len(graphSet))
+	for gID := range graphSet {
+		gName, err := m.dict.GetString(gID)
+		if err != nil {
+			// Skip graphs that can't be resolved
+			slog.Debug("failed to resolve graph ID", "graphID", gID, "error", err)
+			continue
+		}
+		graphs = append(graphs, gName)
+	}
+
+	// Sort for consistent ordering
+	// (using simple insertion sort for small sets, or could use sort.Strings)
+	sort.Strings(graphs)
+
+	return graphs, nil
 }

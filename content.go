@@ -118,3 +118,142 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 	slog.Debug("document added successfully", "key", docKey, "id", id)
 	return nil
 }
+
+// GetDocumentMetadata retrieves all metadata for a document.
+// Returns metadata as a map of key->value pairs from facts in the "metadata" graph.
+func (m *MEBStore) GetDocumentMetadata(docKey string) (map[string]any, error) {
+	if docKey == "" {
+		return nil, fmt.Errorf("document key cannot be empty")
+	}
+
+	metadata := make(map[string]any)
+
+	// Scan for facts in "metadata" graph where subject matches docKey
+	for fact, err := range m.Scan(docKey, "", "", "metadata") {
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan metadata: %w", err)
+		}
+		metadata[fact.Predicate] = fact.Object
+	}
+
+	return metadata, nil
+}
+
+// DeleteDocument deletes all data associated with a document:
+// - Content (if any)
+// - Vector (if any)
+// - Metadata facts (in "metadata" graph)
+func (m *MEBStore) DeleteDocument(docKey string) error {
+	if docKey == "" {
+		return fmt.Errorf("document key cannot be empty")
+	}
+
+	slog.Debug("deleting document", "key", docKey)
+
+	// 1. Get the document ID
+	id, err := m.dict.GetID(docKey)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return nil // Already doesn't exist
+		}
+		return fmt.Errorf("failed to get document ID: %w", err)
+	}
+
+	// 2. Delete content
+	contentKey := keys.EncodeChunkKey(id)
+	if err := m.withWriteTxn(func(txn *badger.Txn) error {
+		return txn.Delete(contentKey)
+	}); err != nil && err != badger.ErrKeyNotFound {
+		slog.Error("failed to delete content", "key", docKey, "error", err)
+		return fmt.Errorf("failed to delete content: %w", err)
+	}
+
+	// 3. Delete vector (from registry)
+	if !m.vectors.Delete(id) {
+		slog.Debug("vector not found for deletion", "key", docKey, "id", id)
+	}
+
+	// 4. Delete metadata facts (scan and delete)
+	// We need to collect keys first, then delete
+	metadataGraphID, _ := m.dict.GetID("metadata")
+	metadataKeyPrefix := keys.EncodeQuadSPOGPrefix(id, 0, 0, metadataGraphID)
+
+	if err := m.withWriteTxn(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		for it.Seek(metadataKeyPrefix); it.ValidForPrefix(metadataKeyPrefix); it.Next() {
+			item := it.Item()
+			if err := txn.Delete(item.Key()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		slog.Error("failed to delete metadata facts", "key", docKey, "error", err)
+		return fmt.Errorf("failed to delete metadata facts: %w", err)
+	}
+
+	slog.Debug("document deleted successfully", "key", docKey)
+	return nil
+}
+
+// HasDocument checks if a document exists (has content, vector, or metadata).
+func (m *MEBStore) HasDocument(docKey string) (bool, error) {
+	if docKey == "" {
+		return false, nil
+	}
+
+	// Check if document ID exists in dictionary
+	id, err := m.dict.GetID(docKey)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get document ID: %w", err)
+	}
+
+	// Check for content
+	contentKey := keys.EncodeChunkKey(id)
+	var hasContent bool
+	if err := m.withReadTxn(func(txn *badger.Txn) error {
+		_, err := txn.Get(contentKey)
+		if err == nil {
+			hasContent = true
+		}
+		return nil
+	}); err != nil && err != badger.ErrKeyNotFound {
+		return false, fmt.Errorf("failed to check content: %w", err)
+	}
+	if hasContent {
+		return true, nil
+	}
+
+	// Check for vector
+	if m.vectors.HasVector(id) {
+		return true, nil
+	}
+
+	// Check for metadata facts
+	metadataGraphID, err := m.dict.GetID("metadata")
+	if err == nil {
+		metadataKeyPrefix := keys.EncodeQuadSPOGPrefix(id, 0, 0, metadataGraphID)
+		var hasMetadata bool
+		if err := m.withReadTxn(func(txn *badger.Txn) error {
+			it := txn.NewIterator(badger.DefaultIteratorOptions)
+			defer it.Close()
+			it.Seek(metadataKeyPrefix)
+			if it.ValidForPrefix(metadataKeyPrefix) {
+				hasMetadata = true
+			}
+			return nil
+		}); err != nil {
+			return false, fmt.Errorf("failed to check metadata: %w", err)
+		}
+		if hasMetadata {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
