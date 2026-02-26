@@ -24,7 +24,7 @@ type LFTJQuery struct {
 
 // RelationPattern defines a single relation to join
 type RelationPattern struct {
-	// Prefix is the index type (QuadSPOGPrefix, QuadPOSGPrefix, etc.)
+	// Prefix is the index type (QuadSPOGPrefix, QuadOPSGPrefix, etc.)
 	Prefix byte
 
 	// BoundPositions maps attribute positions to bound values
@@ -138,9 +138,9 @@ func (e *LFTJEngine) getColumnOrder(prefix byte) []int {
 	case keys.QuadSPOGPrefix:
 		// SPOG: Subject(0), Predicate(1), Object(2), Graph(3)
 		return []int{0, 1, 2, 3}
-	case keys.QuadPOSGPrefix:
-		// POSG: Predicate(1), Object(2), Subject(0), Graph(3)
-		return []int{1, 2, 0, 3}
+	case keys.QuadOPSGPrefix:
+		// OPSG: Object(2), Predicate(1), Subject(0), Graph(3)
+		return []int{2, 1, 0, 3}
 	case keys.QuadGSPOPrefix:
 		// GSPO: Graph(3), Subject(0), Predicate(1), Object(2)
 		return []int{3, 0, 1, 2}

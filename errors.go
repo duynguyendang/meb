@@ -6,7 +6,7 @@ import "fmt"
 var (
 	ErrInvalidFact   = fmt.Errorf("invalid fact")
 	ErrGraphNotFound = fmt.Errorf("graph not found")
-	ErrFullTableScan = fmt.Errorf("full table scan not allowed")
+	ErrStoreReadOnly = fmt.Errorf("store is read-only")
 	ErrInvalidQuery  = fmt.Errorf("invalid query")
 	ErrFactNotFound  = fmt.Errorf("fact not found")
 	ErrEmptyBatch    = fmt.Errorf("empty batch")

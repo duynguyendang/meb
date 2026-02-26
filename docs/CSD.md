@@ -65,7 +65,7 @@ MEB is a high-performance embedded knowledge graph database designed for code an
 
 **B. Intelligent Storage Strategy**
 - **BadgerDB Separation**: Large content in Value Log (`blob_db`), LSM-tree (`meta_db`) for Quads only
-- **33-Byte Key Encoding**: Fixed-size SPOG/POSG/GSPO keys for O(1) prefix scans
+- **33-Byte Key Encoding**: Fixed-size SPOG/OPSG/GSPO keys for O(1) prefix scans
 - **Local Ephemeral Disk**: Download snapshots to `/tmp` before opening (NO GCS Fuse direct access)
 
 **C. Two-Stage Clustering (Leiden)**
@@ -896,7 +896,7 @@ All facts stored as 33-byte composite keys using **Little-Endian byte order** fo
 ```go
 const (
     QuadSPOGPrefix byte = 0x20  // Subject-Predicate-Object-Graph
-    QuadPOSGPrefix byte = 0x21  // Predicate-Object-Subject-Graph
+    QuadOPSGPrefix byte = 0x21  // Object-Predicate-Subject-Graph
     QuadGSPOPrefix byte = 0x22  // Graph-Subject-Predicate-Object
 )
 
@@ -5108,7 +5108,8 @@ var (
     
     // Query Errors
     ErrInvalidQuery        = errors.New("invalid query syntax")
-    ErrFullTableScan       = errors.New("full table scan not allowed")
+    ErrGraphNotFound       = errors.New("graph not found")
+    ErrStoreReadOnly       = errors.New("store is read-only")
     ErrQueryTimeout        = errors.New("query exceeded timeout (circuit breaker)")
     ErrResultLimitExceeded = errors.New("query result limit exceeded")
     ErrMaxDepthExceeded    = errors.New("recursion max depth exceeded")
@@ -5188,7 +5189,7 @@ func extractQuadFromAtom(atom ast.Atom) (subject, predicate, object, graph strin
 
 #### 22.2.3 Prefix Encoding (`keys/encoding.go`)
 
-`EncodeQuadSPOGPrefix()` and `EncodeQuadPOSGPrefix()` had identical nested-if structure:
+`EncodeQuadSPOGPrefix()` and `EncodeQuadOPSGPrefix()` had identical nested-if structure:
 
 ```go
 // Generic helper replaces two nearly identical functions
@@ -5198,8 +5199,8 @@ func EncodeQuadSPOGPrefix(s, p, o, g uint64) []byte {
     return buildQuadPrefix(QuadSPOGPrefix, s, p, o, g)
 }
 
-func EncodeQuadPOSGPrefix(p, o, s, g uint64) []byte {
-    return buildQuadPrefix(QuadPOSGPrefix, p, o, s, g)
+func EncodeQuadOPSGPrefix(o, p, s, g uint64) []byte {
+    return buildQuadPrefix(QuadOPSGPrefix, o, p, s, g)
 }
 ```
 

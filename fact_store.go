@@ -50,11 +50,6 @@ func extractQuadFromAtom(atom ast.Atom) (subject, predicate, object, graph strin
 func (m *MEBStore) GetFacts(atom ast.Atom, callback func(ast.Atom) error) error {
 	s, p, o, g := extractQuadFromAtom(atom)
 
-	// Check for full table scan (no bound arguments)
-	if s == "" && p == "" && o == "" && g == "" {
-		return ErrFullTableScan
-	}
-
 	// Note: Graph is not currently supported in the Datalog API
 
 	// Use Scan to find matching facts

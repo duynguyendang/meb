@@ -25,7 +25,7 @@
 **Key Features:**
 - Worst-case optimal: O(N × |output|) vs O(∏|Rᵢ|) for nested loops
 - No intermediate materialization - streams results directly
-- Supports quad indexes: SPOG, POSG, GSPO
+- Supports quad indexes: SPOG, OPSG, GSPO
 - Variable ordering based on selectivity and bound positions
 
 **Files Created/Modified:**
@@ -84,14 +84,14 @@
 **Implementation:**
 - ✅ Removed all triple (25-byte) key support - pure quad store
 - ✅ Quad key encoding: `EncodeQuadKey()`, `DecodeQuadKey()` for 33-byte keys
-- ✅ Triple indexing with quads: SPOG (0x20), POSG (0x21), GSPO (0x22)
-- ✅ Prefix functions: `EncodeQuadSPOGPrefix()`, `EncodeQuadPOSGPrefix()`, `EncodeQuadGSPOPrefix()`
+- ✅ Triple indexing with quads: SPOG (0x20), OPSG (0x21), GSPO (0x22)
+- ✅ Prefix functions: `EncodeQuadSPOGPrefix()`, `EncodeQuadOPSGPrefix()`, `EncodeQuadGSPOPrefix()`
 - ✅ All storage operations use 33-byte quad keys
 - ✅ Comprehensive test suite in `keys/encoding_test.go`
 
 **Files Modified:**
 - `keys/encoding.go` - Quad-only key encoding (removed all triple functions)
-- `knowledge_store.go` - Triple-write (SPOG, POSG, GSPO) in AddFactBatch()
+- `knowledge_store.go` - Triple-write (SPOG, OPSG, GSPO) in AddFactBatch()
 - `scan.go` - Quad scan strategy with graph support
 - `predicates/triples.go` - Quad key decoding only
 - `adapter/iterator.go` - Quad key support only
@@ -298,13 +298,13 @@
 
 **Implementation Details:**
 - ✅ **Storage Format**: All facts stored as 33-byte quad keys (Subject-Predicate-Object-Graph)
-- ✅ **Triple Indexing**: SPOG (0x20), POSG (0x21), GSPO (0x22) for optimal query paths
+- ✅ **Triple Indexing**: SPOG (0x20), OPSG (0x21), GSPO (0x22) for optimal query paths
 - ✅ **Multi-tenancy**: Graph field enables complete tenant isolation
 - ✅ **Clean Architecture**: No legacy triple code - pure quad implementation
 - ✅ **Test Coverage**: Comprehensive test suite in `keys/encoding_test.go`
 - ✅ **Updated Components**:
   - `keys/encoding.go`: Quad-only encoding functions
-  - `knowledge_store.go`: Triple-write (SPOG, POSG, GSPO) with 33-byte keys
+  - `knowledge_store.go`: Triple-write (SPOG, OPSG, GSPO) with 33-byte keys
   - `scan.go`: Quad scan strategy with full graph support
   - `predicates/triples.go`: Quad key decoding
   - `adapter/iterator.go`: Quad key support

@@ -21,7 +21,7 @@ It bridges the gap between structured relational data (**Knowledge Graphs**) and
 - **Quad Store (SPOG)**: Native quad storage with Subject-Predicate-Object-Graph model for multi-tenancy
 - **1 Billion+ facts** on disk with 33-byte quad keys
 - **50 Million+ vectors** in memory with INT8 quantization
-- **Sub-millisecond** query performance with triple indexing (SPOG, POSG, GSPO)
+- **Sub-millisecond** query performance with triple indexing (SPOG, OPSG, GSPO)
 - **10/12 Core Features Implemented** (83% complete)
 - **Zero-dependency:** No CGO, no external database server, just import and go
 

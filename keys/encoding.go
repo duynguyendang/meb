@@ -9,7 +9,7 @@ import (
 const (
 	// Quad indices for multi-tenancy/RAG contexts
 	QuadSPOGPrefix byte = 0x20 // Subject-Predicate-Object-Graph index
-	QuadPOSGPrefix byte = 0x21 // Predicate-Object-Subject-Graph index
+	QuadOPSGPrefix byte = 0x21 // Object-Predicate-Subject-Graph index
 	QuadGSPOPrefix byte = 0x22 // Graph-Subject-Predicate-Object index (for lifecycle)
 
 	// Content storage
@@ -37,7 +37,7 @@ var KeyFactCount = []byte{SystemPrefix, 0x01} // Stores the total fact count
 
 // Quad encoding format:
 // SPOG: [prefix(1) | subject(8) | predicate(8) | object(8) | graph(8)] = 33 bytes
-// POSG: [prefix(1) | predicate(8) | object(8) | subject(8) | graph(8)] = 33 bytes
+// OPSG: [prefix(1) | object(8) | predicate(8) | subject(8) | graph(8)] = 33 bytes
 // GSPO: [prefix(1) | graph(8) | subject(8) | predicate(8) | object(8)] = 33 bytes
 
 // EncodeQuadKey encodes a quad into a key with the specified prefix.
@@ -54,9 +54,9 @@ func EncodeQuadKey(prefix byte, s, p, o, g uint64) []byte {
 		binary.BigEndian.PutUint64(key[9:17], p)  // Predicate
 		binary.BigEndian.PutUint64(key[17:25], o) // Object
 		binary.BigEndian.PutUint64(key[25:33], g) // Graph
-	case QuadPOSGPrefix:
-		binary.BigEndian.PutUint64(key[1:9], p)   // Predicate
-		binary.BigEndian.PutUint64(key[9:17], o)  // Object
+	case QuadOPSGPrefix:
+		binary.BigEndian.PutUint64(key[1:9], o)   // Object
+		binary.BigEndian.PutUint64(key[9:17], p)  // Predicate
 		binary.BigEndian.PutUint64(key[17:25], s) // Subject
 		binary.BigEndian.PutUint64(key[25:33], g) // Graph
 	case QuadGSPOPrefix:
@@ -90,9 +90,9 @@ func DecodeQuadKey(key []byte) (s, p, o, g uint64) {
 		p = binary.BigEndian.Uint64(key[9:17])
 		o = binary.BigEndian.Uint64(key[17:25])
 		g = binary.BigEndian.Uint64(key[25:33])
-	case QuadPOSGPrefix:
-		p = binary.BigEndian.Uint64(key[1:9])
-		o = binary.BigEndian.Uint64(key[9:17])
+	case QuadOPSGPrefix:
+		o = binary.BigEndian.Uint64(key[1:9])
+		p = binary.BigEndian.Uint64(key[9:17])
 		s = binary.BigEndian.Uint64(key[17:25])
 		g = binary.BigEndian.Uint64(key[25:33])
 	case QuadGSPOPrefix:
@@ -128,9 +128,9 @@ func EncodeQuadSPOGPrefix(s, p, o, g uint64) []byte {
 	return buildQuadPrefix(QuadSPOGPrefix, s, p, o, g)
 }
 
-// EncodeQuadPOSGPrefix creates a prefix for POSG range scans with bound values.
-func EncodeQuadPOSGPrefix(p, o, s, g uint64) []byte {
-	return buildQuadPrefix(QuadPOSGPrefix, p, o, s, g)
+// EncodeQuadOPSGPrefix creates a prefix for OPSG range scans with bound values.
+func EncodeQuadOPSGPrefix(o, p, s, g uint64) []byte {
+	return buildQuadPrefix(QuadOPSGPrefix, o, p, s, g)
 }
 
 // EncodeQuadGSPOPrefix creates a prefix for GSPO range scans for graph lifecycle operations.

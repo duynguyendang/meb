@@ -13,11 +13,11 @@ import (
 // scanStrategy represents the index selection strategy for Scan operations.
 type scanStrategy struct {
 	prefix []byte
-	index  byte // QuadSPOGPrefix, QuadPOSGPrefix, or QuadGSPOPrefix
+	index  byte // QuadSPOGPrefix, QuadOPSGPrefix, or QuadGSPOPrefix
 }
 
 // selectScanStrategy determines the best index and prefix for a scan operation.
-// Uses quad indexes (SPOG, POSG, GSPO) for multi-tenant graph storage.
+// Uses quad indexes (SPOG, OPSG, GSPO) for multi-tenant graph storage.
 // Returns error if no efficient scan strategy exists (e.g., no arguments bound).
 func selectScanStrategy(gBound, sBound, pBound, oBound bool, gID, sID, pID, oID uint64) *scanStrategy {
 	var strategy scanStrategy
@@ -31,17 +31,17 @@ func selectScanStrategy(gBound, sBound, pBound, oBound bool, gID, sID, pID, oID 
 		strategy.prefix = keys.EncodeQuadSPOGPrefix(sID, pID, oID, gID)
 		strategy.index = keys.QuadSPOGPrefix
 	} else if oBound {
-		// Object bound - use POSG index (Predicate-Object-Subject-Graph)
-		// Note: For object-bound queries without subject, we scan POSG
-		strategy.prefix = keys.EncodeQuadKey(keys.QuadPOSGPrefix, 0, pID, oID, gID)[:1] // Start with prefix only
-		if pID != 0 {
-			strategy.prefix = keys.EncodeQuadKey(keys.QuadPOSGPrefix, 0, pID, oID, gID)[:17] // P|O prefix
+		// Object bound - use OPSG index (Object-Predicate-Subject-Graph)
+		if pBound {
+			strategy.prefix = keys.EncodeQuadOPSGPrefix(oID, pID, 0, 0)
+		} else {
+			strategy.prefix = keys.EncodeQuadOPSGPrefix(oID, 0, 0, 0)
 		}
-		strategy.index = keys.QuadPOSGPrefix
+		strategy.index = keys.QuadOPSGPrefix
 	} else if pBound {
-		// Predicate bound only - use POSG with P prefix
-		strategy.prefix = keys.EncodeQuadKey(keys.QuadPOSGPrefix, 0, pID, 0, 0)[:9] // P prefix
-		strategy.index = keys.QuadPOSGPrefix
+		// Predicate bound only - use SPOG with prefix 0x20
+		strategy.prefix = []byte{keys.QuadSPOGPrefix}
+		strategy.index = keys.QuadSPOGPrefix
 	} else if gBound {
 		// Graph bound with other fields - use GSPO
 		strategy.prefix = keys.EncodeQuadGSPOPrefix(gID)
@@ -215,14 +215,14 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 
 // Scan returns an iterator over facts matching the pattern using Go 1.23 iter.Seq2.
 // Empty string means wildcard (match all).
-// Intelligently selects the best index (SPOG vs POSG) based on input arguments.
+// Intelligently selects the best index (SPOG vs OPSG) based on input arguments.
 //
 // Index Selection Strategy:
-//   - If Graph is bound + Subject is bound -> Use SPOG (Prefix: G|S|P...)
+//   - If Graph is bound (only) -> Use GSPO (Prefix: G...)
 //   - If Subject is bound -> Use SPOG (Prefix: S|P...)
-//   - If Object is bound -> Use POSG (Prefix: P|O...)
-//   - If Graph is bound (only) -> Use GSPO (Prefix: G|S...)
-//   - Else -> Return empty iterator (requires at least one bound arg)
+//   - If Object is bound -> Use OPSG (Prefix: O|P...)
+//   - If Graph is bound with other fields (but not S/O) -> Use GSPO (Prefix: G...)
+//   - Else -> Return iterator matching all (using SPOG)
 func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 	return m.ScanContext(context.Background(), s, p, o, g)
 }

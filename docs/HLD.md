@@ -83,7 +83,7 @@ MEB (Mangle Extension for Badger) is a high-performance embedded knowledge graph
 │  │  ┌─────────────────────────────────────────────────────────────┐ │   │
 │  │  │                    Quad Store                               │ │   │
 │  │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐               │ │   │
-│  │  │  │   SPOG   │  │   POSG   │  │   GSPO   │               │ │   │
+│  │  │  │   SPOG   │  │   OPSG   │  │   GSPO   │               │ │   │
 │  │  │  │ (forward)│  │ (reverse)│  │ (lifecycle)              │ │   │
 │  │  │  │  0x20    │  │  0x21    │  │  0x22    │               │ │   │
 │  │  │  └──────────┘  └──────────┘  └──────────┘               │ │   │
@@ -129,7 +129,7 @@ MEB (Mangle Extension for Badger) is a high-performance embedded knowledge graph
 
 Triple Indexes:
   SPOG (0x20) → Forward traversal:   Find all relations FROM a subject
-  POSG (0x21) → Reverse lookup:       Find all subjects TO an object  
+  OPSG (0x21) → Reverse lookup:       Find all subjects TO an object  
   GSPO (0x22) → Lifecycle:             Find all facts IN a graph
 ```
 │  └─────────────────────────────────────────────────────────────────┘   │
@@ -175,7 +175,7 @@ Need efficient bidirectional graph traversal without full table scans.
 **Decision**:
 Store all facts as 33-byte quads with three indexes:
 - **SPOG** (0x20): Subject-Predicate-Object-Graph - forward traversal
-- **POSG** (0x21): Predicate-Object-Subject-Graph - reverse lookups
+- **OPSG** (0x21): Object-Predicate-Subject-Graph - reverse lookups
 - **GSPO** (0x22): Graph-Subject-Predicate-Object - graph lifecycle
 
 **Key Format**:

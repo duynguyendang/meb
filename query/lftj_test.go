@@ -112,7 +112,7 @@ func TestLFTJEngineGetColumnOrder(t *testing.T) {
 		expected []int
 	}{
 		{0x20, []int{0, 1, 2, 3}}, // SPOG
-		{0x21, []int{1, 2, 0, 3}}, // POSG
+		{0x21, []int{2, 1, 0, 3}}, // OPSG
 		{0x22, []int{3, 0, 1, 2}}, // GSPO
 		{0xFF, []int{0, 1, 2, 3}}, // Unknown - default
 	}

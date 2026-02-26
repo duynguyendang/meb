@@ -31,7 +31,7 @@ func (m *MEBStore) AddFact(fact Fact) error {
 // Uses batch dictionary encoding for optimal performance.
 // Populates 3 indices: SPOG (Subject-Predicate-Object-Graph),
 //
-//	POSG (Predicate-Object-Subject-Graph),
+//	OPSG (Object-Predicate-Subject-Graph),
 //	GSPO (Graph-Subject-Predicate-Object).
 //
 // All keys are 33-byte quad format for multi-tenant support.
@@ -121,10 +121,10 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			return fmt.Errorf("failed to set SPOG key for fact %d: %w", i, err)
 		}
 
-		// Add to inverse index: POSG (33 bytes) - Predicate-Object-Subject-Graph
-		posgKey := keys.EncodeQuadKey(keys.QuadPOSGPrefix, sID, pID, oID, gID)
-		if err := batch.Set(posgKey, nil); err != nil {
-			return fmt.Errorf("failed to set POSG key for fact %d: %w", i, err)
+		// Add to inverse index: OPSG (33 bytes) - Object-Predicate-Subject-Graph
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, sID, pID, oID, gID)
+		if err := batch.Set(opsgKey, nil); err != nil {
+			return fmt.Errorf("failed to set OPSG key for fact %d: %w", i, err)
 		}
 
 		// Add to graph index: GSPO (33 bytes) - Graph-Subject-Predicate-Object
@@ -160,11 +160,10 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 		return nil
 	}
 
-	// First pass: collect all GSPO keys to delete
+	// Delete facts in batches while iterating through GSPO index
 	txn := m.db.NewTransaction(false)
 
 	prefix := keys.EncodeQuadGSPOPrefix(gID)
-
 	opts := badger.DefaultIteratorOptions
 	opts.PrefetchValues = false
 
@@ -173,11 +172,49 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 	type quadKeys struct {
 		gspo []byte
 		spog []byte
-		posg []byte
+		opsg []byte
 	}
 
 	const maxDeleteBatchSize = 1000
 	var keysToDelete []quadKeys
+	totalDeleted := 0
+
+	// Helper function to flush the current batch
+	flushBatch := func() error {
+		if len(keysToDelete) == 0 {
+			return nil
+		}
+
+		deleteTxn := m.db.NewTransaction(true)
+		for _, keys := range keysToDelete {
+			if err := deleteTxn.Delete(keys.spog); err != nil {
+				slog.Error("failed to delete SPOG key", "error", err)
+				deleteTxn.Discard()
+				return fmt.Errorf("failed to delete SPOG key: %w", err)
+			}
+			if err := deleteTxn.Delete(keys.opsg); err != nil {
+				slog.Error("failed to delete OPSG key", "error", err)
+				deleteTxn.Discard()
+				return fmt.Errorf("failed to delete OPSG key: %w", err)
+			}
+			if err := deleteTxn.Delete(keys.gspo); err != nil {
+				slog.Error("failed to delete GSPO key", "error", err)
+				deleteTxn.Discard()
+				return fmt.Errorf("failed to delete GSPO key: %w", err)
+			}
+			// Update fact count (zero-cost atomic operation)
+			m.numFacts.Add(^uint64(0)) // Atomic decrement
+		}
+
+		if err := deleteTxn.Commit(); err != nil {
+			slog.Error("failed to commit delete transaction", "error", err)
+			return fmt.Errorf("failed to commit delete batch: %w", err)
+		}
+
+		totalDeleted += len(keysToDelete)
+		keysToDelete = keysToDelete[:0] // Reset slice, keep underlying array
+		return nil
+	}
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		item := it.Item()
@@ -192,62 +229,34 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 
 		// Generate all three keys
 		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, s, p, o, g)
-		posgKey := keys.EncodeQuadKey(keys.QuadPOSGPrefix, s, p, o, g)
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, s, p, o, g)
 
 		keysToDelete = append(keysToDelete, quadKeys{
 			gspo: gspoKey,
 			spog: spogKey,
-			posg: posgKey,
+			opsg: opsgKey,
 		})
+
+		// Flush if batch is full
+		if len(keysToDelete) >= maxDeleteBatchSize {
+			if err := flushBatch(); err != nil {
+				it.Close()
+				txn.Discard()
+				return err
+			}
+		}
 	}
 	it.Close()
 	txn.Discard()
 
-	slog.Debug("collected keys for deletion", "count", len(keysToDelete))
-
-	if len(keysToDelete) == 0 {
-		slog.Info("no facts found in graph", "graph", graph)
-		return nil
+	// Flush any remaining keys
+	if err := flushBatch(); err != nil {
+		return err
 	}
 
-	// Second pass: delete all keys in batches
-	totalDeleted := 0
-	for i := 0; i < len(keysToDelete); i += maxDeleteBatchSize {
-		end := i + maxDeleteBatchSize
-		if end > len(keysToDelete) {
-			end = len(keysToDelete)
-		}
-
-		batch := keysToDelete[i:end]
-
-		deleteTxn := m.db.NewTransaction(true)
-		for _, keys := range batch {
-			if err := deleteTxn.Delete(keys.spog); err != nil {
-				slog.Error("failed to delete SPOG key", "error", err)
-				deleteTxn.Discard()
-				return fmt.Errorf("failed to delete SPOG key: %w", err)
-			}
-			if err := deleteTxn.Delete(keys.posg); err != nil {
-				slog.Error("failed to delete POSG key", "error", err)
-				deleteTxn.Discard()
-				return fmt.Errorf("failed to delete POSG key: %w", err)
-			}
-			if err := deleteTxn.Delete(keys.gspo); err != nil {
-				slog.Error("failed to delete GSPO key", "error", err)
-				deleteTxn.Discard()
-				return fmt.Errorf("failed to delete GSPO key: %w", err)
-			}
-			// Update fact count (zero-cost atomic operation)
-			m.numFacts.Add(^uint64(0)) // Atomic decrement
-		}
-
-		// Commit the transaction
-		if err := deleteTxn.Commit(); err != nil {
-			slog.Error("failed to commit delete transaction", "error", err)
-			return fmt.Errorf("failed to commit delete batch: %w", err)
-		}
-
-		totalDeleted += len(batch)
+	if totalDeleted == 0 {
+		slog.Info("no facts found in graph", "graph", graph)
+		return nil
 	}
 
 	slog.Info("graph deleted successfully", "graph", graph, "factsDeleted", totalDeleted)
@@ -297,7 +306,7 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 
 			// Check args count
 			if len(atom.Args) != 3 {
-			return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
+				return nil, fmt.Errorf("triples predicate requires 3 arguments, got %d", len(atom.Args))
 			}
 
 			// Prepare Scan arguments

@@ -94,7 +94,7 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 		prefix = keys.EncodeQuadKey(keys.QuadSPOGPrefix, sID, pID, 0, 0)[:17] // S|P prefix
 
 	} else if oBound {
-		// Use POSG Index (quad format)
+		// Use OPSG Index (quad format)
 		oID, err := a.dict.GetID(oVal)
 		if err != nil {
 			return &EmptyIterator{}
@@ -108,11 +108,11 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 			}
 		}
 
-		// Use helper to generate POSG quad prefix
+		// Use helper to generate OPSG quad prefix
 		if pID != 0 {
-			prefix = keys.EncodeQuadKey(keys.QuadPOSGPrefix, 0, pID, oID, 0)[:17] // P|O prefix
+			prefix = keys.EncodeQuadOPSGPrefix(oID, pID, 0, 0)
 		} else {
-			prefix = keys.EncodeQuadKey(keys.QuadPOSGPrefix, 0, 0, oID, 0)[:9] // O prefix only
+			prefix = keys.EncodeQuadOPSGPrefix(oID, 0, 0, 0)
 		}
 
 	} else {

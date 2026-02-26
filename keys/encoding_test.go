@@ -17,8 +17,8 @@ func TestEncodeDecodeQuadKey(t *testing.T) {
 			s:      1, p: 2, o: 3, g: 4,
 		},
 		{
-			name:   "POSG format",
-			prefix: QuadPOSGPrefix,
+			name:   "OPSG format",
+			prefix: QuadOPSGPrefix,
 			s:      1, p: 2, o: 3, g: 4,
 		},
 		{
