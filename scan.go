@@ -126,13 +126,10 @@ type scanOptions struct {
 }
 
 // prepareScan prepares the scan by resolving IDs and selecting strategy.
-// Returns nil if scan cannot proceed (e.g., dictionary miss).
-func (m *MEBStore) prepareScan(s, p, o, g string) *scanOptions {
-	g = normalizeGraph(g)
-
+func (m *MEBStore) prepareScan(s, p, o, g string) (*scanOptions, error) {
 	sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
@@ -152,7 +149,7 @@ func (m *MEBStore) prepareScan(s, p, o, g string) *scanOptions {
 		oBound:   oBound,
 		gBound:   gBound,
 		strategy: strategy,
-	}
+	}, nil
 }
 
 // scanImpl performs the core scan iteration, calling yield for each matching result.
@@ -188,14 +185,7 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 			}
 
 			var result scanResult
-			switch opts.strategy.index {
-			case keys.QuadSPOGPrefix:
-				result.foundSID, result.foundPID, result.foundOID, result.foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadPOSGPrefix:
-				result.foundPID, result.foundOID, result.foundSID, result.foundGID = keys.DecodeQuadKey(key)
-			case keys.QuadGSPOPrefix:
-				result.foundGID, result.foundSID, result.foundPID, result.foundOID = keys.DecodeQuadKey(key)
-			}
+			result.foundSID, result.foundPID, result.foundOID, result.foundGID = keys.DecodeQuadKey(key)
 
 			if opts.sBound && result.foundSID != opts.sID {
 				continue
@@ -240,9 +230,11 @@ func (m *MEBStore) Scan(s, p, o, g string) iter.Seq2[Fact, error] {
 // ScanContext is like Scan but accepts a context for cancellation.
 // Optimized for 33-byte S|P|O|G quad keys with intelligent index selection.
 func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
-	opts := m.prepareScanWithContext(ctx, s, p, o, g)
-	if opts == nil {
-		return func(yield func(Fact, error) bool) {}
+	opts, err := m.prepareScanWithContext(ctx, s, p, o, g)
+	if err != nil {
+		return func(yield func(Fact, error) bool) {
+			yield(Fact{}, err)
+		}
 	}
 
 	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
@@ -294,13 +286,10 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o, g string) iter.Seq2
 	})
 }
 
-// prepareScanWithContext is like prepareScan but accepts a context.
-func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o, g string) *scanOptions {
-	g = normalizeGraph(g)
-
+func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o, g string) (*scanOptions, error) {
 	sID, pID, oID, gID, sBound, pBound, oBound, gBound, err := m.resolveScanIDs(s, p, o, g)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	strategy := selectScanStrategy(gBound, sBound, pBound, oBound, gID, sID, pID, oID)
@@ -320,7 +309,7 @@ func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o, g string
 		oBound:   oBound,
 		gBound:   gBound,
 		strategy: strategy,
-	}
+	}, nil
 }
 
 // ScanZeroCopy performs a zero-copy scan over facts matching the pattern.
@@ -339,9 +328,11 @@ func (m *MEBStore) ScanZeroCopy(s, p, o, g string) iter.Seq2[Fact, error] {
 // ScanZeroCopyContext is like ScanZeroCopy but accepts a context for cancellation.
 // Uses the same implementation as ScanContext (the zero-copy optimization is handled internally).
 func (m *MEBStore) ScanZeroCopyContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
-	opts := m.prepareScanWithContext(ctx, s, p, o, g)
-	if opts == nil {
-		return func(yield func(Fact, error) bool) {}
+	opts, err := m.prepareScanWithContext(ctx, s, p, o, g)
+	if err != nil {
+		return func(yield func(Fact, error) bool) {
+			yield(Fact{}, err)
+		}
 	}
 
 	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
