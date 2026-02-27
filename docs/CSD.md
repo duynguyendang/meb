@@ -59,7 +59,7 @@ MEB is a high-performance embedded knowledge graph database designed for code an
 #### Must-Have Core Features
 
 **A. Memory-Efficient Vector Search**
-- **MRL Truncation**: Store only first 64 dimensions in `vector.bin` mmap (90% memory reduction)
+- **MRL Truncation**: Store only first 64 dimensions in BadgerDB `sys:mrl:vectors` (90% memory reduction)
 - **INT8 Quantization**: Float32 → INT8 for search buffer
 - **SIMD Acceleration**: AVX2/NEON dot-product for 64-byte vectors
 
@@ -414,11 +414,11 @@ MEB uses three distinct storage backends optimized for their specific data types
 │  └─────────────────────────────┘                            │
 │  Config: SyncWrites=true (strict persistence)               │
 │                                                             │
-│  3. VECTOR STORE (Hybrid: Flat File + BadgerDB)             │
-│     Path: {BaseDir}/vector/                                 │
+│  3. VECTOR STORE (BadgerDB extension)                        │
+│     Path: {BaseDir}/graph/                                  │
 │  ┌─────────────────────────────┐                            │
-│  │ vectors.bin                 │ INT8 quantized (64-d)     │
-│  │ (Memory-mapped)             │ For SIMD search           │
+│  │ sys:mrl:vectors             │ INT8 quantized (64-d)     │
+│  │ (BadgerDB KV native)        │ For SIMD search           │
 │  └─────────────────────────────┘                            │
 │  ┌─────────────────────────────┐                            │
 │  │ Full vectors in graph DB    │ Float32 (1536-d)          │
@@ -462,15 +462,18 @@ MEB implements multi-layer compression to maximize storage efficiency while main
 │                                                             │
 │  LAYER 3: Vector Quantization (MRL + INT8)                │
 │  ┌───────────────────────────────────────────────────────┐ │
-│  │ Float32 Vectors (1536-d)                              │ │
-│  │         ↓                                             │ │
-│  │    MRL Truncate to 64-d                               │ │
-│  │         ↓                                             │ │
-│  │    Quantize to INT8                                   │ │
-│  │         ↓                                             │ │
+| Data Class | Storage Engine | Key Prefix | Value Format |
+| :--- | :--- | :--- | :--- |
+| **Dictionary** | BadgerDB (`dict/`) | `[0x80] | ID(8)` | String |
+|                  |                  | `[0x81] | Hash(32)`| ID(8) |
+| **Facts (SPOG)** | BadgerDB (`data/`) | `[0x20] | S(8) \| P(8) \| O(8) \| G(8)` | None (Key-only) |
+| **Facts (OPSG)** |                  | `[0x21] | O(8) \| P(8) \| S(8) \| G(8)` | None (Key-only) |
+| **Stats/Meta** |                  | `[0x01]-[0x02]` | Counter/Config |
+| **Vectors**      | BadgerDB (`data/`) | `sys:mrl:vectors`      | INT8 quantized (64-d array) |
+|                  |                  | `sys:mrl:ids`          | uint64 ID array |          │ │
 │  │   ~24x compression (1536×4 → 64×1)                   │ │
 │  │         ↓                                             │ │
-│  │   vectors.bin (mmap'd)                                │ │
+│  │   BadgerDB: sys:mrl:vectors                           │ │
 │  └───────────────────────────────────────────────────────┘ │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
@@ -599,7 +602,9 @@ func Quantize(vector []float32) []int8 {
 │   ├── 000001.sst           # Dictionary SSTable
 │   └── MANIFEST             # Dictionary manifest
 └── vector/
-    └── vectors.bin          # Memory-mapped INT8 vectors
+    ├── 000001.vlog
+    ├── 000001.sst   # SPOG/OPSG/Vectors
+    └── MANIFEST
 ```
 
 ### 5.5 Benefits
@@ -623,7 +628,7 @@ MEB uses a **dual storage** approach for vectors to optimize both search speed a
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐ │
 │  │ 1. INT8 Quantized Vectors (Search)                    │ │
-│  │    Path: {BaseDir}/vector/vectors.bin                 │ │
+│  │    Type: BadgerDB Key (sys:mrl:vectors)               │ │
 │  │    Format: Flat file, memory-mapped                   │ │
 │  │    Dimensions: 64 (MRL compressed)                    │ │
 │  │    Precision: INT8 (1 byte per dimension)             │ │

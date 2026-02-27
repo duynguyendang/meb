@@ -1,6 +1,7 @@
 package dict
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -173,12 +174,23 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 	}
 	var misses []miss
 
+	// Deduplicate keys within the batch to prevent allocating multiple IDs
+	// for the same string if it appears multiple times in the same batch
+	// and isn't yet in the database.
+	batchLocalMap := make(map[string]uint64)
+
 	// 1. Fast Path: Check LRU cache first (lock-free)
 	for i, key := range keys {
 		if id, ok := e.forwardCache.Get(key); ok && id != 0 {
 			results[i] = id
+		} else if id, ok := batchLocalMap[key]; ok {
+			// Found it in earlier iteration of this same batch
+			results[i] = id
 		} else {
 			misses = append(misses, miss{index: i, key: key})
+			// Mark it as pending so subsequent matches in this batch
+			// don't get added to misses again. We will backfill results later.
+			batchLocalMap[key] = 0
 		}
 	}
 
@@ -203,7 +215,9 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 				return err
 			}
 			if err := item.Value(func(val []byte) error {
-				results[m.index] = binary.BigEndian.Uint64(val)
+				id := binary.BigEndian.Uint64(val)
+				results[m.index] = id
+				batchLocalMap[m.key] = id
 				return nil
 			}); err != nil {
 				return err
@@ -234,6 +248,7 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		for i, m := range toCreate {
 			newID := startID + uint64(i)
 			results[m.index] = newID
+			batchLocalMap[m.key] = newID
 
 			// Forward map: string -> ID
 			key := makeDictForwardKey(m.key)
@@ -261,16 +276,17 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 
 	// 3. Update cache for results found in DB
 	for _, m := range misses {
-		// If it was found (not added to toCreate, or added and now has result), update cache
-		// Actually simpler: just iterate all original misses and check if they have result now
-		// but we already updated cache for 'toCreate' items.
-		// We just need to update cache for items found in DB (not in toCreate)
-
 		id := results[m.index]
 		if id != 0 {
-			// Redundant add for toCreate items but safe/cheap
 			e.forwardCache.Add(m.key, id)
 			e.reverseCache.Add(id, m.key)
+		}
+	}
+
+	// 4. Backfill any duplicates that appeared later in the batch
+	for i, key := range keys {
+		if results[i] == 0 {
+			results[i] = batchLocalMap[key]
 		}
 	}
 
@@ -349,6 +365,20 @@ func (e *Encoder) GetID(s string) (uint64, error) {
 
 // makeDictForwardKey creates a BadgerDB key for string -> ID lookup.
 func makeDictForwardKey(s string) []byte {
+	// If the string is extremely long (e.g. file content), hashing it saves massive
+	// space in the BadgerDB LSM index and prevents uint16 overflow for strings > 65KB.
+	// We use 255 as a safe threshold for performance vs size tradeoffs.
+	if len(s) > 255 {
+		hash := sha256.Sum256([]byte(s))
+		// Format: [0x80 | 0xFFFF | sha256_hash]
+		// 0xFFFF signals that this key is a hashed representation
+		key := make([]byte, 3+len(hash))
+		key[0] = dictForwardPrefix
+		binary.BigEndian.PutUint16(key[1:3], 0xFFFF)
+		copy(key[3:], hash[:])
+		return key
+	}
+
 	// Format: [0x80 | string_length(2) | string_bytes]
 	key := make([]byte, 3+len(s))
 	key[0] = dictForwardPrefix

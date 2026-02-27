@@ -6,7 +6,7 @@ import (
 
 const (
 	// FullDim is the dimension of full vectors (OpenAI embedding standard).
-	FullDim = 1536
+	FullDim = 3072
 
 	// MRLDim is the truncated dimension for MRL search.
 	MRLDim = 64
