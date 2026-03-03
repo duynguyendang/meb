@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"strings"
+
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
 )
@@ -53,18 +55,18 @@ func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 
 	if args[0] != nil {
 		sBound = true
-		sVal = args[0].(string)
+		sVal = strings.Trim(args[0].(string), "\"")
 	}
 	if args[1] != nil {
 		pBound = true
-		pVal = args[1].(string)
+		pVal = strings.Trim(args[1].(string), "\"")
 	}
 	// Object binding check
 	var oBound bool
 	var oVal string
 	if args[2] != nil {
 		oBound = true
-		oVal = args[2].(string)
+		oVal = strings.Trim(args[2].(string), "\"")
 	}
 
 	// Reject full table scans
