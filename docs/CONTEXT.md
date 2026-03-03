@@ -52,6 +52,7 @@ This document serves as the canonical, authoritative "Live Architecture" snapsho
     ├── registry.go             # Vector registry
     ├── storage.go              # MRL + SQ8 persistence
     ├── quantization.go         # INT8 quantization
+    ├── pq.go                   # Product Quantization & Hybrid search
     ├── search.go               # Similarity search
     └── simd_int8.go            # SIMD-accelerated dot product
 ```
@@ -263,31 +264,33 @@ func (e *LFTJEngine) Execute(ctx context.Context, q LFTJQuery) iter.Seq2[map[str
 package vector
 
 const (
-    FullDim int = 1536  // OpenAI embedding dimension
+    FullDim int = 3072  // OpenAI embedding dimension
     MRLDim  int = 64    // Matryoshka Reduced dimension
 )
 
 // VectorRegistry manages vector storage and search
 type VectorRegistry struct {
-    db     *badger.DB
-    data   []int8        // SQ8 quantized vectors (64 bytes each)
-    idMap  map[uint64]uint32  // ID -> index
-    revMap []uint64       // index -> ID
+    db         *badger.DB
+    data       []int8        // SQ8 quantized vectors (64 bytes each)
+    pqData     []byte        // PQ encoded vectors (8 bytes each)
+    pqCodebook *PQCodebook   // Trained PQ codebook
+    idMap      map[uint64]uint32  // ID -> index
+    revMap     []uint64       // index -> ID
 }
 ```
 
 ### 6.2 Processing Pipeline
 
 ```
-Input: 1536-d float32 (OpenAI)
+Input: 3072-d float32 (OpenAI)
   ↓
-MRL: 1536-d → 64-d (Matryoshka Representation Learning)
+MRL: 3072-d → 64-d (Matryoshka Representation Learning)
   ↓
 L2 Normalize: Unit vectors
   ↓
-SQ8: float32 → int8 (4x compression, 64 bytes/vector)
+SQ8 / PQ: float32 → int8 (SQ8) & byte (PQ)
   ↓
-Search: SIMD-accelerated dot product (AVX2/NEON)
+Search: Hierarchical Search (Coarse SIMD dot product MRL → Fine PQ approximate distance)
 ```
 
 ---
