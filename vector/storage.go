@@ -79,6 +79,28 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		binary.BigEndian.PutUint64(idsBytes[i*8:(i+1)*8], id)
 	}
 
+	// Serialize pqData
+	pqDataBytes := make([]byte, len(r.pqData))
+	copy(pqDataBytes, r.pqData)
+
+	// Serialize PQCodebook
+	var cbBytes []byte
+	if r.pqCodebook != nil && r.pqCodebook.Trained {
+		cbBytes = make([]byte, 1+PQNumSubs*PQKClusters*PQSubBytes*4)
+		cbBytes[0] = 1 // trained
+		offset := 1
+		for s := 0; s < PQNumSubs; s++ {
+			for k := 0; k < PQKClusters; k++ {
+				for d := 0; d < PQSubBytes; d++ {
+					binary.LittleEndian.PutUint32(cbBytes[offset:], math.Float32bits(r.pqCodebook.centroids[s][k][d]))
+					offset += 4
+				}
+			}
+		}
+	} else {
+		cbBytes = []byte{0} // untrained
+	}
+
 	batch := r.db.NewWriteBatch()
 	defer batch.Cancel()
 
@@ -92,6 +114,18 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	if err := batch.Set([]byte("sys:mrl:ids"), idsBytes); err != nil {
 		slog.Error("failed to save IDs snapshot", "error", err)
 		return fmt.Errorf("failed to save IDs snapshot: %w", err)
+	}
+
+	// Save pqData snapshot
+	if err := batch.Set([]byte("sys:mrl:pqdata"), pqDataBytes); err != nil {
+		slog.Error("failed to save pqdata snapshot", "error", err)
+		return fmt.Errorf("failed to save pqdata snapshot: %w", err)
+	}
+
+	// Save codebook snapshot
+	if err := batch.Set([]byte("sys:mrl:codebook"), cbBytes); err != nil {
+		slog.Error("failed to save codebook snapshot", "error", err)
+		return fmt.Errorf("failed to save codebook snapshot: %w", err)
 	}
 
 	if err := batch.Flush(); err != nil {
@@ -115,7 +149,7 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 	slog.Info("loading vector snapshot")
 
-	var vectorsBytes, idsBytes []byte
+	var vectorsBytes, idsBytes, pqDataBytes, cbBytes []byte
 
 	err := r.db.View(func(txn *badger.Txn) error {
 		// Load vectors
@@ -148,11 +182,35 @@ func (r *VectorRegistry) LoadSnapshot() error {
 			return fmt.Errorf("failed to load IDs snapshot: %w", err)
 		}
 
-		return item.Value(func(val []byte) error {
+		if err := item.Value(func(val []byte) error {
 			idsBytes = make([]byte, len(val))
 			copy(idsBytes, val)
 			return nil
-		})
+		}); err != nil {
+			return err
+		}
+
+		// Load PQData
+		item, err = txn.Get([]byte("sys:mrl:pqdata"))
+		if err == nil {
+			_ = item.Value(func(val []byte) error {
+				pqDataBytes = make([]byte, len(val))
+				copy(pqDataBytes, val)
+				return nil
+			})
+		}
+
+		// Load Codebook
+		item, err = txn.Get([]byte("sys:mrl:codebook"))
+		if err == nil {
+			_ = item.Value(func(val []byte) error {
+				cbBytes = make([]byte, len(val))
+				copy(cbBytes, val)
+				return nil
+			})
+		}
+
+		return nil
 	})
 
 	if err != nil {
@@ -175,6 +233,29 @@ func (r *VectorRegistry) LoadSnapshot() error {
 	r.revMap = make([]uint64, numVectors)
 	for i := 0; i < numVectors; i++ {
 		r.revMap[i] = binary.BigEndian.Uint64(idsBytes[i*8 : (i+1)*8])
+	}
+
+	// Deserialize pqData
+	if pqDataBytes != nil && len(pqDataBytes) == numVectors*PQCodeSize {
+		r.pqData = pqDataBytes
+	} else {
+		r.pqData = make([]byte, numVectors*PQCodeSize)
+	}
+
+	// Deserialize Codebook
+	r.pqCodebook = NewPQCodebook()
+	if len(cbBytes) > 1 && cbBytes[0] == 1 {
+		offset := 1
+		for s := 0; s < PQNumSubs; s++ {
+			for k := 0; k < PQKClusters; k++ {
+				for d := 0; d < PQSubBytes; d++ {
+					bits := binary.LittleEndian.Uint32(cbBytes[offset:])
+					r.pqCodebook.centroids[s][k][d] = math.Float32frombits(bits)
+					offset += 4
+				}
+			}
+		}
+		r.pqCodebook.Trained = true
 	}
 
 	// Rebuild idMap

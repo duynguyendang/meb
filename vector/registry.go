@@ -3,6 +3,7 @@ package vector
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
@@ -17,6 +18,13 @@ type VectorRegistry struct {
 	// Vector[i] corresponds to data[i*64 : (i+1)*64]
 	// Pre-allocated with large capacity to avoid frequent slice growing.
 	data []int8
+
+	// pqData is a FLAT BUFFER storing all PQ-encoded vectors.
+	// Size = NumVectors * PQCodeSize bytes
+	pqData []byte
+
+	// pqCodebook is the trained PQ codebook used for quantization
+	pqCodebook *PQCodebook
 
 	// idMap maps GraphID -> Internal Index (uint32)
 	idMap map[uint64]uint32
@@ -43,10 +51,12 @@ func NewRegistry(db *badger.DB) *VectorRegistry {
 	capacity := 25 * 1024 * 1024 // 25MB in bytes
 
 	return &VectorRegistry{
-		data:   make([]int8, 0, capacity),
-		idMap:  make(map[uint64]uint32, 100000),
-		revMap: make([]uint64, 0, 100000),
-		db:     db,
+		data:       make([]int8, 0, capacity),
+		pqData:     make([]byte, 0, capacity/8), // 8 bytes per PQ code vs 64 for MRL
+		pqCodebook: NewPQCodebook(),
+		idMap:      make(map[uint64]uint32, 100000),
+		revMap:     make([]uint64, 0, 100000),
+		db:         db,
 	}
 }
 
@@ -69,12 +79,23 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 	// Quantize to int8 for efficient storage
 	quantized := Quantize(mrlVec)
 
+	// Encode to PQ if trained
+	var pqCoded []byte
+	r.mu.RLock()
+	if r.pqCodebook.Trained {
+		pqCoded = r.pqCodebook.Encode(mrlVec)
+	} else {
+		pqCoded = make([]byte, PQCodeSize)
+	}
+	r.mu.RUnlock()
+
 	r.mu.Lock()
 
 	// Check if ID already exists
 	if idx, exists := r.idMap[id]; exists {
 		// Overwrite existing vector in place
 		copy(r.data[idx*MRLDim:(idx+1)*MRLDim], quantized)
+		copy(r.pqData[idx*PQCodeSize:(idx+1)*PQCodeSize], pqCoded)
 		r.mu.Unlock()
 		slog.Debug("vector updated",
 			"id", id,
@@ -86,6 +107,7 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 		r.idMap[id] = idx
 		r.revMap = append(r.revMap, id)
 		r.data = append(r.data, quantized...)
+		r.pqData = append(r.pqData, pqCoded...)
 		r.mu.Unlock()
 		slog.Debug("vector added",
 			"id", id,
@@ -138,11 +160,16 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		srcOffset := int(lastIdx) * MRLDim
 		dstOffset := int(idx) * MRLDim
 		copy(r.data[dstOffset:dstOffset+MRLDim], r.data[srcOffset:srcOffset+MRLDim])
+
+		srcPqOffset := int(lastIdx) * PQCodeSize
+		dstPqOffset := int(idx) * PQCodeSize
+		copy(r.pqData[dstPqOffset:dstPqOffset+PQCodeSize], r.pqData[srcPqOffset:srcPqOffset+PQCodeSize])
 	}
 
 	r.revMap = r.revMap[:lastIdx]
 	delete(r.idMap, id)
 	r.data = r.data[:len(r.data)-MRLDim]
+	r.pqData = r.pqData[:len(r.pqData)-PQCodeSize]
 
 	slog.Debug("vector deleted", "id", id, "remaining", len(r.revMap))
 
@@ -155,4 +182,85 @@ func (r *VectorRegistry) HasVector(id uint64) bool {
 	defer r.mu.RUnlock()
 	_, exists := r.idMap[id]
 	return exists
+}
+
+// TrainPQ trains the PQ codebook using randomly sampled vectors and encodes all existing vectors.
+func (r *VectorRegistry) TrainPQ(sampleSize int) error {
+	r.mu.RLock()
+	numVectors := len(r.revMap)
+	r.mu.RUnlock()
+
+	if numVectors < PQKClusters*10 {
+		return fmt.Errorf("not enough vectors to train PQ (need at least %d, have %d)", PQKClusters*10, numVectors)
+	}
+
+	if sampleSize > numVectors {
+		sampleSize = numVectors
+	}
+	if sampleSize < PQKClusters*10 {
+		sampleSize = PQKClusters*10
+	}
+
+	slog.Info("training PQ codebook", "numVectors", numVectors, "sampleSize", sampleSize)
+
+	r.mu.RLock()
+	// Pick random unique indices
+	indices := rand.Perm(numVectors)
+	if len(indices) > sampleSize {
+		indices = indices[:sampleSize]
+	}
+
+	samples := make([][]float32, 0, len(indices))
+	idsToSample := make([]uint64, len(indices))
+	for i, idx := range indices {
+		idsToSample[i] = r.revMap[idx]
+	}
+	r.mu.RUnlock()
+
+	for _, id := range idsToSample {
+		fullVec, err := r.GetFullVector(id)
+		if err != nil {
+			continue // skip missing
+		}
+		mrlVec := ProcessMRL(fullVec)
+		samples = append(samples, mrlVec)
+	}
+
+	if len(samples) < PQKClusters*10 {
+		return fmt.Errorf("failed to load enough samples for PQ training")
+	}
+
+	// Train external codebook first
+	newCodebook := NewPQCodebook()
+	newCodebook.Train(samples)
+
+	if !newCodebook.Trained {
+		return fmt.Errorf("PQ training failed internally")
+	}
+
+	// Now encode all vectors
+	slog.Info("encoding all vectors with trained PQ codebook")
+	r.mu.RLock()
+	allVectors := make([][]float32, numVectors)
+	for i := 0; i < numVectors; i++ {
+		offset := i * MRLDim
+		allVectors[i] = Dequantize(r.data[offset : offset+MRLDim])
+	}
+	r.mu.RUnlock()
+
+	newPqData := make([]byte, numVectors*PQCodeSize)
+	for i, vec := range allVectors {
+		code := newCodebook.Encode(vec)
+		offset := i * PQCodeSize
+		copy(newPqData[offset:offset+PQCodeSize], code)
+	}
+
+	// Swap in the new codebook and data
+	r.mu.Lock()
+	r.pqCodebook = newCodebook
+	r.pqData = newPqData
+	r.mu.Unlock()
+
+	slog.Info("PQ training complete")
+	return nil
 }

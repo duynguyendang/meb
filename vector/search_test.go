@@ -96,3 +96,112 @@ func TestGetTopK(t *testing.T) {
 		t.Errorf("incorrect top K sorting: %v", top3)
 	}
 }
+
+func TestVectorRegistry_TrainPQ(t *testing.T) {
+	db := setupTestDB(t)
+	reg := NewRegistry(db)
+	defer reg.Close()
+
+	numVectors := PQKClusters*10 + 100 // Need at least PQKClusters*10 = 2560 for training
+	for i := uint64(1); i <= uint64(numVectors); i++ {
+		vec := randomVector(FullDim)
+		err := reg.Add(i, vec)
+		if err != nil {
+			t.Fatalf("failed to add vector: %v", err)
+		}
+	}
+
+	// Wait for async persistence (Add persists full vectors)
+	reg.wg.Wait()
+
+	err := reg.TrainPQ(numVectors)
+	if err != nil {
+		t.Fatalf("failed to train PQ: %v", err)
+	}
+
+	if !reg.pqCodebook.Trained {
+		t.Errorf("expected codebook to be trained")
+	}
+	if len(reg.pqData) != numVectors*PQCodeSize {
+		t.Errorf("expected pqData length %d, got %d", numVectors*PQCodeSize, len(reg.pqData))
+	}
+}
+
+func TestVectorRegistry_PQHybridSearch(t *testing.T) {
+	db := setupTestDB(t)
+	reg := NewRegistry(db)
+	defer reg.Close()
+
+	numVectors := PQKClusters*10 + 100
+	vectors := make(map[uint64][]float32)
+	for i := uint64(1); i <= uint64(numVectors); i++ {
+		vec := randomVector(FullDim)
+		vectors[i] = vec
+		err := reg.Add(i, vec)
+		if err != nil {
+			t.Fatalf("failed to add vector: %v", err)
+		}
+	}
+
+	// Wait for async persistence
+	reg.wg.Wait()
+
+	// Train PQ
+	err := reg.TrainPQ(numVectors)
+	if err != nil {
+		t.Fatalf("failed to train PQ: %v", err)
+	}
+
+	query := vectors[5]
+	k := 10
+	results, err := reg.PQHybridSearch(query, k)
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+
+	if len(results) != k {
+		t.Errorf("expected %d results, got %d", k, len(results))
+	}
+
+	// Exact match check (approximate, so we check if it's in top K)
+	if len(results) > 0 {
+		found := false
+		for _, r := range results {
+			if r.ID == 5 {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected exact match to be in top %d results", k)
+		}
+	}
+}
+
+func TestVectorRegistry_PQHybridSearch_Untrained(t *testing.T) {
+	db := setupTestDB(t)
+	reg := NewRegistry(db)
+	defer reg.Close()
+
+	numVectors := 100
+	vectors := make(map[uint64][]float32)
+	for i := uint64(1); i <= uint64(numVectors); i++ {
+		vec := randomVector(FullDim)
+		vectors[i] = vec
+		err := reg.Add(i, vec)
+		if err != nil {
+			t.Fatalf("failed to add vector: %v", err)
+		}
+	}
+
+	query := vectors[5]
+	k := 10
+	results, err := reg.PQHybridSearch(query, k)
+	if err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+
+	if len(results) != k {
+		t.Errorf("expected %d results, got %d", k, len(results))
+	}
+}
