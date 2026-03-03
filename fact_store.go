@@ -110,14 +110,12 @@ func (m *MEBStore) Add(atom ast.Atom) bool {
 
 // Contains returns true if the given atom is present in the store.
 func (m *MEBStore) Contains(atom ast.Atom) bool {
-	found := false
-	m.GetFacts(atom, func(ast.Atom) error {
-		found = true
-		// Return error to stop iteration
-		return fmt.Errorf("found")
-	})
+	s, p, o, g := extractQuadFromAtom(atom)
 
-	return found
+	for range m.Scan(s, p, o, g) {
+		return true
+	}
+	return false
 }
 
 // ListPredicates lists all predicates available in the store.
