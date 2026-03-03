@@ -45,11 +45,12 @@ type Config struct {
 	NumDictShards int
 
 	// MemTableSize is the size of the memtable in bytes.
-	// Default: 64MB. Lower this to reduce memory usage.
+	// Default: 16MB for Safe-Serving/ReadOnly, 64MB for Ingest-Heavy.
+	// Higher values improve compression and throughput for ingestion.
 	MemTableSize int64
 
 	// NumMemtables is the maximum number of tables to keep in memory which are waiting to be written to disk.
-	// Default: 5. Lower this to reduce memory usage.
+	// Default: 2 for Safe-Serving/ReadOnly, 3 for Ingest-Heavy.
 	NumMemtables int
 
 	// Profile specifies the resource profile ("Ingest-Heavy", "Safe-Serving").
@@ -62,9 +63,19 @@ type Config struct {
 
 // Validate checks if the configuration is valid and returns an error if not.
 func (c *Config) Validate() error {
+	// Validate InMemory + DataDir combination
+	if c.InMemory && c.DataDir != "" {
+		return fmt.Errorf("DataDir must be empty when InMemory is true")
+	}
+
 	// Validate DataDir
 	if c.DataDir == "" && !c.InMemory {
 		return fmt.Errorf("DataDir must be specified when InMemory is false")
+	}
+
+	// Validate DictDir
+	if c.DictDir == "" && !c.InMemory {
+		return fmt.Errorf("DictDir must be specified when InMemory is false")
 	}
 
 	// Validate cache sizes
@@ -78,12 +89,31 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("LRUCacheSize must be non-negative, got %d", c.LRUCacheSize)
 	}
 
+	// Validate MemTableSize
+	if c.MemTableSize > 0 && c.MemTableSize < 1<<20 {
+		return fmt.Errorf("MemTableSize must be at least 1MB, got %d", c.MemTableSize)
+	}
+
+	// Validate NumMemtables
+	if c.NumMemtables < 0 {
+		return fmt.Errorf("NumMemtables must be non-negative, got %d", c.NumMemtables)
+	}
+	if c.NumMemtables > 0 && c.NumMemtables < 2 {
+		return fmt.Errorf("NumMemtables must be at least 2, got %d", c.NumMemtables)
+	}
+
 	// Validate NumDictShards: must be 0 or a power of 2
 	if c.NumDictShards < 0 {
 		return fmt.Errorf("NumDictShards must be non-negative, got %d", c.NumDictShards)
 	}
 	if c.NumDictShards > 0 && (c.NumDictShards&(c.NumDictShards-1)) != 0 {
 		return fmt.Errorf("NumDictShards must be 0 or a power of 2, got %d", c.NumDictShards)
+	}
+
+	// Validate Profile
+	validProfiles := map[string]bool{"Ingest-Heavy": true, "Safe-Serving": true, "ReadOnly": true}
+	if c.Profile != "" && !validProfiles[c.Profile] {
+		return fmt.Errorf("invalid Profile %q, must be one of: Ingest-Heavy, Safe-Serving, ReadOnly", c.Profile)
 	}
 
 	return nil
@@ -184,12 +214,32 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 	// === Write Configuration ===
 	opts.SyncWrites = cfg.SyncWrites
 
-	// === Memory Tuning ===
-	if cfg.MemTableSize > 0 {
-		opts.MemTableSize = cfg.MemTableSize
-	}
-	if cfg.NumMemtables > 0 {
-		opts.NumMemtables = cfg.NumMemtables
+	// === Memory Tuning (Profile-specific defaults) ===
+	// Safe-Serving: Lower memory, faster recovery
+	// Ingest-Heavy: Higher throughput, better compression
+	switch cfg.Profile {
+	case "Safe-Serving", "ReadOnly":
+		if cfg.MemTableSize <= 0 {
+			opts.MemTableSize = 16 << 20 // 16MB
+		} else {
+			opts.MemTableSize = cfg.MemTableSize
+		}
+		if cfg.NumMemtables <= 0 {
+			opts.NumMemtables = 2
+		} else {
+			opts.NumMemtables = cfg.NumMemtables
+		}
+	case "Ingest-Heavy", "":
+		if cfg.MemTableSize <= 0 {
+			opts.MemTableSize = 64 << 20 // 64MB for better compression/throughput
+		} else {
+			opts.MemTableSize = cfg.MemTableSize
+		}
+		if cfg.NumMemtables <= 0 {
+			opts.NumMemtables = 3
+		} else {
+			opts.NumMemtables = cfg.NumMemtables
+		}
 	}
 
 	return opts

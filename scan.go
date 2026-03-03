@@ -312,22 +312,17 @@ func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o, g string
 	}, nil
 }
 
-// ScanZeroCopy performs a zero-copy scan over facts matching the pattern.
-// It returns keys directly from the iterator without allocation, providing
-// better performance for large-scale scans.
-//
-// Unlike Scan() which allocates new memory for each key, this method
-// returns slices that point directly to the iterator's internal buffer.
-// The returned slices are only valid until the next iteration step.
+// ScanWithLookup performs a scan over facts matching the pattern.
+// Currently identical to Scan() but provided for API flexibility.
+// In the future, this could be optimized for zero-copy dictionary lookups.
 //
 // For best performance with large result sets (>100 facts).
-func (m *MEBStore) ScanZeroCopy(s, p, o, g string) iter.Seq2[Fact, error] {
-	return m.ScanZeroCopyContext(context.Background(), s, p, o, g)
+func (m *MEBStore) ScanWithLookup(s, p, o, g string) iter.Seq2[Fact, error] {
+	return m.ScanWithLookupContext(context.Background(), s, p, o, g)
 }
 
-// ScanZeroCopyContext is like ScanZeroCopy but accepts a context for cancellation.
-// Uses the same implementation as ScanContext (the zero-copy optimization is handled internally).
-func (m *MEBStore) ScanZeroCopyContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
+// ScanWithLookupContext is like ScanWithLookup but accepts a context for cancellation.
+func (m *MEBStore) ScanWithLookupContext(ctx context.Context, s, p, o, g string) iter.Seq2[Fact, error] {
 	opts, err := m.prepareScanWithContext(ctx, s, p, o, g)
 	if err != nil {
 		return func(yield func(Fact, error) bool) {

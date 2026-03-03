@@ -83,6 +83,10 @@ type MEBStore struct {
 
 	// Circuit breaker for query timeout protection
 	breaker *circuit.Breaker
+
+	// graphsCache caches the list of graph names to avoid rescanning on every query
+	graphsCache      []string
+	graphsCacheValid bool
 }
 
 // loadStats reads the counter from disk into RAM.

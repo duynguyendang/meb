@@ -122,7 +122,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		}
 
 		// Add to inverse index: OPSG (33 bytes) - Object-Predicate-Subject-Graph
-		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, sID, pID, oID, gID)
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, oID, pID, sID, gID)
 		if err := batch.Set(opsgKey, nil); err != nil {
 			return fmt.Errorf("failed to set OPSG key for fact %d: %w", i, err)
 		}
@@ -140,6 +140,9 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	if err := batch.Flush(); err != nil {
 		return fmt.Errorf("failed to flush batch: %w", err)
 	}
+
+	// Invalidate graphs cache since we may have added new graphs
+	m.graphsCacheValid = false
 
 	return nil
 }
@@ -202,8 +205,8 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 				deleteTxn.Discard()
 				return fmt.Errorf("failed to delete GSPO key: %w", err)
 			}
-			// Update fact count (zero-cost atomic operation)
-			m.numFacts.Add(^uint64(0)) // Atomic decrement
+			// Update fact count (atomic: ^uint64(0) = -1 in two's complement for uint64 subtraction)
+			m.numFacts.Add(^uint64(0))
 		}
 
 		if err := deleteTxn.Commit(); err != nil {
@@ -229,7 +232,7 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 
 		// Generate all three keys
 		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, s, p, o, g)
-		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, s, p, o, g)
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, o, p, s, g)
 
 		keysToDelete = append(keysToDelete, quadKeys{
 			gspo: gspoKey,
@@ -258,6 +261,9 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 		slog.Info("no facts found in graph", "graph", graph)
 		return nil
 	}
+
+	// Invalidate graphs cache since we deleted a graph
+	m.graphsCacheValid = false
 
 	slog.Info("graph deleted successfully", "graph", graph, "factsDeleted", totalDeleted)
 	return nil
@@ -454,10 +460,15 @@ func (m *MEBStore) Query(ctx context.Context, query string) ([]map[string]any, e
 	return finalResults, nil
 }
 
-// getAllGraphs discovers all unique graphs in the store by scanning the GSPO index.
-// Returns a slice of graph names, sorted for consistent ordering.
-// This is an expensive operation and should be cached or used sparingly.
+// getAllGraphs discovers all unique graphs in the store.
+// Returns cached results if available, otherwise scans and caches.
+// This is an expensive operation on first call; subsequent calls use the cache.
 func (m *MEBStore) getAllGraphs() ([]string, error) {
+	// Return cached result if valid
+	if m.graphsCacheValid {
+		return m.graphsCache, nil
+	}
+
 	graphSet := make(map[uint64]struct{})
 
 	txn := m.db.NewTransaction(false)
@@ -486,7 +497,9 @@ func (m *MEBStore) getAllGraphs() ([]string, error) {
 	}
 
 	if len(graphSet) == 0 {
-		return []string{"default"}, nil
+		m.graphsCache = []string{"default"}
+		m.graphsCacheValid = true
+		return m.graphsCache, nil
 	}
 
 	// Convert IDs to strings
@@ -502,8 +515,11 @@ func (m *MEBStore) getAllGraphs() ([]string, error) {
 	}
 
 	// Sort for consistent ordering
-	// (using simple insertion sort for small sets, or could use sort.Strings)
 	sort.Strings(graphs)
+
+	// Cache the result
+	m.graphsCache = graphs
+	m.graphsCacheValid = true
 
 	return graphs, nil
 }
