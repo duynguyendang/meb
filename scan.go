@@ -4,11 +4,32 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"regexp"
+	"strconv"
 
 	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
 )
+
+// PredicateFilterType defines the type of predicate filter
+type PredicateFilterType string
+
+const (
+	PredicateRegex    PredicateFilterType = "regex"
+	PredicateRange    PredicateFilterType = "range"
+	PredicateGT       PredicateFilterType = "gt"
+	PredicateLT       PredicateFilterType = "lt"
+	PredicateGTE      PredicateFilterType = "gte"
+	PredicateLTE      PredicateFilterType = "lte"
+	PredicateContains PredicateFilterType = "contains"
+)
+
+// PredicateFilter represents a filter to apply to scan results
+type PredicateFilter struct {
+	Type  PredicateFilterType
+	Value interface{} // string for regex/contains, [2]float64 for range, float64 for gt/lt/gte/lte
+}
 
 // scanStrategy represents the index selection strategy for Scan operations.
 type scanStrategy struct {
@@ -123,6 +144,68 @@ type scanOptions struct {
 	oBound   bool
 	gBound   bool
 	strategy *scanStrategy
+	filters  []PredicateFilter
+}
+
+// evaluatePredicateFilter evaluates a single predicate filter against an object value
+func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
+	switch filter.Type {
+	case PredicateRegex:
+		pattern, ok := filter.Value.(string)
+		if !ok {
+			return false
+		}
+		matched, err := regexp.MatchString(pattern, objValue)
+		return err == nil && matched
+
+	case PredicateContains:
+		substr, ok := filter.Value.(string)
+		if !ok {
+			return false
+		}
+		return len(objValue) > 0 && len(substr) > 0 &&
+			(len(objValue) >= len(substr)) &&
+			(objValue == substr ||
+				(len(objValue) > len(substr) &&
+					(objValue[:len(substr)] == substr ||
+						objValue[len(objValue)-len(substr):] == substr ||
+						containsAny(objValue, substr))))
+
+	case PredicateGT, PredicateLT, PredicateGTE, PredicateLTE, PredicateRange:
+		objNum, err1 := strconv.ParseFloat(objValue, 64)
+		thresholdNum, ok2 := filter.Value.(float64)
+
+		if err1 != nil || !ok2 {
+			return false
+		}
+
+		switch filter.Type {
+		case PredicateGT:
+			return objNum > thresholdNum
+		case PredicateLT:
+			return objNum < thresholdNum
+		case PredicateGTE:
+			return objNum >= thresholdNum
+		case PredicateLTE:
+			return objNum <= thresholdNum
+		case PredicateRange:
+			rangeVals, ok := filter.Value.([2]float64)
+			if !ok || len(rangeVals) != 2 {
+				return false
+			}
+			return objNum >= rangeVals[0] && objNum <= rangeVals[1]
+		}
+	}
+	return false
+}
+
+func containsAny(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }
 
 // prepareScan prepares the scan by resolving IDs and selecting strategy.
@@ -367,6 +450,100 @@ func (m *MEBStore) ScanWithLookupContext(ctx context.Context, s, p, o, g string)
 			graphStr, err = m.dict.GetString(r.foundGID)
 			if err != nil {
 				return Fact{}, false
+			}
+		}
+
+		return Fact{
+			Subject:   subject,
+			Predicate: predicate,
+			Object:    objectStr,
+			Graph:     graphStr,
+		}, true
+	})
+}
+
+// ScanWithFilters scans facts with additional predicate filters.
+// This enables rich filtering like regex, ranges, and comparisons.
+//
+// Examples:
+//
+//	// Regex filter: find all facts where object matches pattern
+//	store.ScanWithFilters("", "email", "", "", []meb.PredicateFilter{
+//	    {Type: meb.PredicateRegex, Value: "^user-\\d+@example\\.com$"},
+//	})
+//
+//	// Range filter: find facts where age is between 18 and 65
+//	store.ScanWithFilters("", "age", "", "", []meb.PredicateFilter{
+//	    {Type: meb.PredicateRange, Value: [2]float64{18, 65}},
+//	})
+//
+//	// Greater than: find facts where count > 100
+//	store.ScanWithFilters("", "count", "", "", []meb.PredicateFilter{
+//	    {Type: meb.PredicateGT, Value: float64(100)},
+//	})
+//
+//	// Contains: find facts where object contains substring
+//	store.ScanWithFilters("", "name", "", "", []meb.PredicateFilter{
+//	    {Type: meb.PredicateContains, Value: "alice"},
+//	})
+func (m *MEBStore) ScanWithFilters(s, p, o, g string, filters []PredicateFilter) iter.Seq2[Fact, error] {
+	return m.ScanWithFiltersContext(context.Background(), s, p, o, g, filters)
+}
+
+// ScanWithFiltersContext is like ScanWithFilters but accepts a context for cancellation.
+func (m *MEBStore) ScanWithFiltersContext(ctx context.Context, s, p, o, g string, filters []PredicateFilter) iter.Seq2[Fact, error] {
+	opts, err := m.prepareScanWithContext(ctx, s, p, o, g)
+	if err != nil {
+		return func(yield func(Fact, error) bool) {
+			yield(Fact{}, err)
+		}
+	}
+	opts.filters = filters
+
+	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
+		var subject, predicate, objectStr, graphStr string
+		var err error
+
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			subject, err = m.dict.GetString(r.foundSID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			predicate, err = m.dict.GetString(r.foundPID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.oBound {
+			objectStr = opts.o
+		} else {
+			objectStr, err = m.dict.GetString(r.foundOID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.gBound {
+			graphStr = opts.g
+		} else {
+			graphStr, err = m.dict.GetString(r.foundGID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		// Apply predicate filters
+		for _, filter := range opts.filters {
+			if !evaluatePredicateFilter(objectStr, filter) {
+				return Fact{}, false // Filter out this fact
 			}
 		}
 
