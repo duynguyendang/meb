@@ -50,7 +50,7 @@ type Config struct {
 	MemTableSize int64
 
 	// NumMemtables is the maximum number of tables to keep in memory which are waiting to be written to disk.
-	// Default: 2 for Safe-Serving/ReadOnly, 3 for Ingest-Heavy.
+	// Default: 2 for Safe-Serving/ReadOnly, 3 for.
 	NumMemtables int
 
 	// Profile specifies the resource profile ("Ingest-Heavy", "Safe-Serving").
@@ -59,6 +59,18 @@ type Config struct {
 
 	// ReadOnly enables read-only mode.
 	ReadOnly bool
+
+	// EnableAutoGC enables automatic value log garbage collection.
+	// When true, GC runs automatically after certain thresholds are met.
+	EnableAutoGC bool
+
+	// GCRatio is the threshold for garbage collection.
+	// Lower values trigger GC more frequently. Default: 0.5.
+	GCRatio float64
+
+	// ValueLogFileSize sets the size of the value log file.
+	// If 0, uses profile default (64MB for Safe-Serving, 1GB for Ingest-Heavy).
+	ValueLogFileSize int64
 }
 
 // Validate checks if the configuration is valid and returns an error if not.
@@ -116,6 +128,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid Profile %q, must be one of: Ingest-Heavy, Safe-Serving, ReadOnly", c.Profile)
 	}
 
+	// Validate GCRatio
+	if c.GCRatio < 0 || c.GCRatio > 1 {
+		return fmt.Errorf("GCRatio must be between 0 and 1, got %f", c.GCRatio)
+	}
+
 	return nil
 }
 
@@ -123,15 +140,17 @@ func (c *Config) Validate() error {
 func DefaultConfig(dataDir string) *Config {
 	return &Config{
 		DataDir:        dataDir,
-		DictDir:        filepath.Join(dataDir, "dict"), // Separate dictionary directory
+		DictDir:        filepath.Join(dataDir, "dict"),
 		InMemory:       false,
 		BlockCacheSize: 8 << 30, // 8GB
-		IndexCacheSize: 2 << 30, // 2GB (Default for Ingest-Heavy)
+		IndexCacheSize: 2 << 30, // 2GB
 		LRUCacheSize:   100000,
 		Compression:    true,
 		SyncWrites:     false,
-		NumDictShards:  0,              // Use single-threaded encoder by default
-		Profile:        "Ingest-Heavy", // Default profile
+		NumDictShards:  0,
+		Profile:        "Ingest-Heavy",
+		EnableAutoGC:   true, // Enable auto GC by default
+		GCRatio:        0.5,
 	}
 }
 
@@ -169,7 +188,11 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		// Use small ValueLogSize to minimize mmap overhead/locking.
 
 		// Strict small ValueLog to keep IO stable
-		opts.ValueLogFileSize = 64 << 20 // 64MB
+		if cfg.ValueLogFileSize > 0 {
+			opts.ValueLogFileSize = cfg.ValueLogFileSize
+		} else {
+			opts.ValueLogFileSize = 64 << 20 // 64MB
+		}
 
 		// Limit compactors to prevent IO saturation on shared/emulated drives
 		// Badger v4 requires at least 2 compactors.
@@ -196,7 +219,11 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		// Optimized for High Performance / High RAM (Ingestion)
 
 		// Large ValueLog for bulk writes
-		opts.ValueLogFileSize = 1 << 30 // 1GB
+		if cfg.ValueLogFileSize > 0 {
+			opts.ValueLogFileSize = cfg.ValueLogFileSize
+		} else {
+			opts.ValueLogFileSize = 1 << 30 // 1GB
+		}
 
 		// Standard Compactors
 		opts.NumCompactors = 4

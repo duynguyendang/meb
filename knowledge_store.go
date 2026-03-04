@@ -144,6 +144,12 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	// Invalidate graphs cache since we may have added new graphs
 	m.graphsCacheValid = false
 
+	// Auto-GC: Track facts added and run GC if threshold reached
+	if m.config.EnableAutoGC {
+		m.factsSinceGC += uint64(len(facts))
+		m.triggerAutoGC()
+	}
+
 	return nil
 }
 
