@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/duynguyendang/meb/circuit"
 	"github.com/duynguyendang/meb/clustering"
@@ -87,6 +88,10 @@ type MEBStore struct {
 	// graphsCache caches the list of graph names to avoid rescanning on every query
 	graphsCache      []string
 	graphsCacheValid bool
+
+	// GC tracking for auto-compaction
+	lastGCTime   time.Time
+	factsSinceGC uint64
 }
 
 // loadStats reads the counter from disk into RAM.
@@ -255,6 +260,25 @@ func (m *MEBStore) Reset() error {
 // Close closes the store and releases resources.
 func (m *MEBStore) Close() error {
 	slog.Info("closing store", "factCount", m.numFacts.Load())
+
+	// Run GC before closing to compact the database
+	if !m.config.ReadOnly && m.config.EnableAutoGC {
+		gcRatio := m.config.GCRatio
+		if gcRatio <= 0 {
+			gcRatio = 0.5
+		}
+		slog.Info("running GC before shutdown", "ratio", gcRatio)
+
+		// Run GC on facts DB
+		if err := m.db.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
+			slog.Warn("GC failed for facts DB", "error", err)
+		}
+
+		// Run GC on dictionary DB
+		if err := m.dictDB.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
+			slog.Warn("GC failed for dictionary DB", "error", err)
+		}
+	}
 
 	// Save vector snapshot before closing
 	if !m.config.ReadOnly {
@@ -515,4 +539,47 @@ func (m *MEBStore) QueryOptimizer() *query.QueryOptimizer {
 func (m *MEBStore) OptimizeQuery(datalogQuery string) (*query.QueryPlan, error) {
 	optimizer := m.QueryOptimizer()
 	return optimizer.OptimizeDatalogQuery(datalogQuery)
+}
+
+const (
+	autoGCThreshold = 10000            // Run GC after every 10,000 facts
+	minGCInterval   = 60 * time.Second // Minimum interval between GC runs
+)
+
+// triggerAutoGC runs garbage collection if thresholds are met
+func (m *MEBStore) triggerAutoGC() {
+	// Check if auto-GC is enabled
+	if !m.config.EnableAutoGC {
+		return
+	}
+
+	// Check if we've reached the threshold
+	if m.factsSinceGC < autoGCThreshold {
+		return
+	}
+
+	// Check if enough time has passed since last GC
+	now := time.Now()
+	if !m.lastGCTime.IsZero() && now.Sub(m.lastGCTime) < minGCInterval {
+		return
+	}
+
+	// Run GC
+	gcRatio := m.config.GCRatio
+	if gcRatio <= 0 {
+		gcRatio = 0.5
+	}
+
+	slog.Info("triggering auto-GC", "factsSinceGC", m.factsSinceGC, "ratio", gcRatio)
+
+	// Run GC on facts DB
+	if err := m.db.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
+		slog.Warn("auto-GC failed for facts DB", "error", err)
+	} else if err == nil {
+		slog.Debug("auto-GC completed for facts DB")
+	}
+
+	// Reset counters
+	m.factsSinceGC = 0
+	m.lastGCTime = now
 }
