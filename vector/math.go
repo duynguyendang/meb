@@ -6,25 +6,25 @@ import (
 
 const (
 	// FullDim is the dimension of full vectors (OpenAI embedding standard).
-	FullDim = 3072
+	FullDim = 1536
 
-	// MRLDim is the truncated dimension for MRL search.
+	// MRLDim is the default truncated dimension for MRL search.
 	MRLDim = 64
 )
 
-// ProcessMRL truncates a full vector to MRLDim dimensions and L2 normalizes it.
-// This is used to create the compressed 64-dimensional vectors for fast search.
-func ProcessMRL(fullVec []float32) []float32 {
-	if len(fullVec) < MRLDim {
-		// If vector is smaller than MRLDim, pad with zeros
-		result := make([]float32, MRLDim)
+// ProcessMRL truncates a full vector to mrlDim dimensions and L2 normalizes it.
+// This is used to create the compressed vectors for fast search.
+func ProcessMRL(fullVec []float32, mrlDim int) []float32 {
+	if len(fullVec) < mrlDim {
+		// If vector is smaller than mrlDim, pad with zeros
+		result := make([]float32, mrlDim)
 		copy(result, fullVec)
 		return l2Normalize(result)
 	}
 
-	// Truncate to MRLDim
-	result := make([]float32, MRLDim)
-	copy(result, fullVec[:MRLDim])
+	// Truncate to mrlDim
+	result := make([]float32, mrlDim)
+	copy(result, fullVec[:mrlDim])
 
 	// L2 Normalize
 	return l2Normalize(result)
