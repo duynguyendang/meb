@@ -171,6 +171,7 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 
 	// Delete facts in batches while iterating through GSPO index
 	txn := m.db.NewTransaction(false)
+	defer txn.Discard()
 
 	prefix := keys.EncodeQuadGSPOPrefix(gID)
 	opts := badger.DefaultIteratorOptions

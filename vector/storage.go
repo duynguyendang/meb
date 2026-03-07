@@ -9,7 +9,7 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
-// persistFullVector writes the full 1536-d vector to BadgerDB.
+// persistFullVector writes the full vector to BadgerDB.
 // Key format: "vec:full:<BigEndianID>"
 func (r *VectorRegistry) persistFullVector(id uint64, fullVec []float32) error {
 	key := make([]byte, 1+8)
@@ -17,7 +17,8 @@ func (r *VectorRegistry) persistFullVector(id uint64, fullVec []float32) error {
 	binary.BigEndian.PutUint64(key[1:9], id)
 
 	// Serialize vector to bytes (little-endian for performance)
-	value := make([]byte, FullDim*4)
+	fullDim := r.config.FullDim
+	value := make([]byte, fullDim*4)
 	for i, v := range fullVec {
 		binary.LittleEndian.PutUint32(value[i*4:(i+1)*4], math.Float32bits(v))
 	}
@@ -27,13 +28,14 @@ func (r *VectorRegistry) persistFullVector(id uint64, fullVec []float32) error {
 	})
 }
 
-// GetFullVector retrieves the full 1536-d vector from disk.
+// GetFullVector retrieves the full vector from disk.
 func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
 	key := make([]byte, 1+8)
 	key[0] = 0x10 // Prefix for full vectors
 	binary.BigEndian.PutUint64(key[1:9], id)
 
 	var fullVec []float32
+	fullDim := r.config.FullDim
 	err := r.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
 		if err != nil {
@@ -41,8 +43,8 @@ func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
 		}
 
 		return item.Value(func(val []byte) error {
-			fullVec = make([]float32, FullDim)
-			for i := 0; i < FullDim; i++ {
+			fullVec = make([]float32, fullDim)
+			for i := 0; i < fullDim; i++ {
 				bits := binary.LittleEndian.Uint32(val[i*4 : (i+1)*4])
 				fullVec[i] = math.Float32frombits(bits)
 			}
@@ -223,8 +225,9 @@ func (r *VectorRegistry) LoadSnapshot() error {
 	}
 
 	// Deserialize int8 vectors (direct byte copy - very fast)
-	numVectors := len(vectorsBytes) / MRLDim
-	r.data = make([]int8, numVectors*MRLDim)
+	mrlDim := r.config.MRLDim
+	numVectors := len(vectorsBytes) / mrlDim
+	r.data = make([]int8, numVectors*mrlDim)
 	for i, v := range vectorsBytes {
 		r.data[i] = int8(v)
 	}

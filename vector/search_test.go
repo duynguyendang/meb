@@ -27,7 +27,7 @@ func randomVector(dim int) []float32 {
 
 func TestVectorRegistry_Search(t *testing.T) {
 	db := setupTestDB(t)
-	reg := NewRegistry(db)
+	reg := NewRegistry(db, nil)
 	defer reg.Close()
 
 	numVectors := 100
@@ -99,7 +99,7 @@ func TestGetTopK(t *testing.T) {
 
 func TestVectorRegistry_TrainPQ(t *testing.T) {
 	db := setupTestDB(t)
-	reg := NewRegistry(db)
+	reg := NewRegistry(db, nil)
 	defer reg.Close()
 
 	numVectors := PQKClusters*10 + 100 // Need at least PQKClusters*10 = 2560 for training
@@ -129,7 +129,7 @@ func TestVectorRegistry_TrainPQ(t *testing.T) {
 
 func TestVectorRegistry_PQHybridSearch(t *testing.T) {
 	db := setupTestDB(t)
-	reg := NewRegistry(db)
+	reg := NewRegistry(db, nil)
 	defer reg.Close()
 
 	numVectors := PQKClusters*10 + 100
@@ -180,7 +180,7 @@ func TestVectorRegistry_PQHybridSearch(t *testing.T) {
 
 func TestVectorRegistry_PQHybridSearch_Untrained(t *testing.T) {
 	db := setupTestDB(t)
-	reg := NewRegistry(db)
+	reg := NewRegistry(db, nil)
 	defer reg.Close()
 
 	numVectors := 100

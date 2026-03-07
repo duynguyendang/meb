@@ -48,7 +48,6 @@ func (p *TxPool) GetRead() *badger.Txn {
 }
 
 func (p *TxPool) PutRead(txn *badger.Txn) {
-	txn.Discard()
 	select {
 	case p.readPool <- txn:
 	default:
@@ -65,7 +64,6 @@ func (p *TxPool) GetWrite() *badger.Txn {
 }
 
 func (p *TxPool) PutWrite(txn *badger.Txn) {
-	txn.Discard()
 	select {
 	case p.writePool <- txn:
 	default:
@@ -92,15 +90,15 @@ func (p *TxPool) Close() {
 
 // withReadTxn executes a function within a read transaction.
 func (m *MEBStore) withReadTxn(fn func(*badger.Txn) error) error {
-	txn := m.newTxn()
-	defer m.releaseTxn(txn)
+	txn := m.db.NewTransaction(false)
+	defer txn.Discard()
 	return fn(txn)
 }
 
-// withWriteTxn executes a function within a write transaction.
+// withWriteTxn executes a function within a write transaction from the pool.
 func (m *MEBStore) withWriteTxn(fn func(*badger.Txn) error) error {
-	txn := m.db.NewTransaction(true)
-	defer txn.Discard()
+	txn := m.txPool.GetWrite()
+	defer m.txPool.PutWrite(txn)
 	if err := fn(txn); err != nil {
 		return err
 	}

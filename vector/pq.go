@@ -236,13 +236,13 @@ func (r *VectorRegistry) PQHybridSearch(queryVec []float32, k int) ([]SearchResu
 		return r.Search(queryVec, k)
 	}
 
-	// Step 1: Coarse search using MRL (64-d)
+	// Step 1: Coarse search using MRL
 	candidateCount := k * CandidateMultiplier
 	if candidateCount < 100 {
 		candidateCount = 100
 	}
 
-	mrlQuery := ProcessMRL(queryVec)
+	mrlQuery := ProcessMRL(queryVec, r.config.MRLDim)
 	quantizedQuery := Quantize(mrlQuery)
 
 	r.mu.RLock()
@@ -329,11 +329,12 @@ func (r *VectorRegistry) getMRLCandidates(data []int8, query []int8, k int) []sc
 	// Simple linear scan for candidates
 	h := make([]candidate, 0, k)
 
-	numVectors := len(data) / MRLDim
+	mrlDim := r.config.MRLDim
+	numVectors := len(data) / mrlDim
 
 	for idx := 0; idx < numVectors; idx++ {
-		offset := idx * MRLDim
-		score := DotProductInt8(data[offset:offset+MRLDim], query)
+		offset := idx * mrlDim
+		score := DotProductInt8(data[offset:offset+mrlDim], query)
 
 		if len(h) < k {
 			h = append(h, candidate{idx: idx, score: score})

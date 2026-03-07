@@ -9,13 +9,53 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
+type Config struct {
+	FullDim         int
+	MRLDim          int
+	NumWorkers      int
+	VectorCapacity  int
+	InitialCapacity int
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		FullDim:         1536,
+		MRLDim:          64,
+		NumWorkers:      4,
+		VectorCapacity:  25 * 1024 * 1024,
+		InitialCapacity: 100000,
+	}
+}
+
+func (c *Config) Validate() error {
+	if c.FullDim <= 0 {
+		return fmt.Errorf("FullDim must be positive")
+	}
+	if c.MRLDim <= 0 || c.MRLDim > c.FullDim {
+		return fmt.Errorf("MRLDim must be positive and <= FullDim")
+	}
+	if c.NumWorkers <= 0 {
+		return fmt.Errorf("NumWorkers must be positive")
+	}
+	if c.VectorCapacity <= 0 {
+		return fmt.Errorf("VectorCapacity must be positive")
+	}
+	if c.InitialCapacity <= 0 {
+		return fmt.Errorf("InitialCapacity must be positive")
+	}
+	return nil
+}
+
 // VectorRegistry holds compressed MRL vectors in RAM for fast search.
 // Vectors are scalar-quantized to int8 (75% memory reduction vs float32).
 // Full vectors are persisted to BadgerDB for potential retrieval.
 type VectorRegistry struct {
-	// data is a FLAT BUFFER storing all 64-d int8 vectors contiguously.
-	// Size = NumVectors * 64 bytes (4x smaller than float32)
-	// Vector[i] corresponds to data[i*64 : (i+1)*64]
+	// config holds the vector configuration
+	config *Config
+
+	// data is a FLAT BUFFER storing all MRL-dim int8 vectors contiguously.
+	// Size = NumVectors * MRLDim bytes
+	// Vector[i] corresponds to data[i*MRLDim : (i+1)*MRLDim]
 	// Pre-allocated with large capacity to avoid frequent slice growing.
 	data []int8
 
@@ -42,39 +82,42 @@ type VectorRegistry struct {
 	wg sync.WaitGroup
 }
 
-// NewRegistry creates a new VectorRegistry with pre-allocated memory.
-// Allocates 25MB upfront (~1.6M int8 vectors) to avoid frequent reallocations.
-// With int8 quantization, we can store 4x more vectors in the same memory.
-func NewRegistry(db *badger.DB) *VectorRegistry {
-	// Pre-allocate ~25MB for int8 vectors (25 * 1024 * 1024 bytes)
-	// This can hold approximately 409,600 vectors (26,214,400 / 64)
-	capacity := 25 * 1024 * 1024 // 25MB in bytes
+// NewRegistry creates a new VectorRegistry with the given configuration.
+// If cfg is nil, uses DefaultConfig().
+func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+	if err := cfg.Validate(); err != nil {
+		panic(fmt.Sprintf("invalid vector config: %v", err))
+	}
 
 	return &VectorRegistry{
-		data:       make([]int8, 0, capacity),
-		pqData:     make([]byte, 0, capacity/8), // 8 bytes per PQ code vs 64 for MRL
+		config:     cfg,
+		data:       make([]int8, 0, cfg.VectorCapacity),
+		pqData:     make([]byte, 0, cfg.VectorCapacity/8),
 		pqCodebook: NewPQCodebook(),
-		idMap:      make(map[uint64]uint32, 100000),
-		revMap:     make([]uint64, 0, 100000),
+		idMap:      make(map[uint64]uint32, cfg.InitialCapacity),
+		revMap:     make([]uint64, 0, cfg.InitialCapacity),
 		db:         db,
 	}
 }
 
 // Add adds a full vector to the registry.
-// The compressed 64-d version is scalar-quantized to int8 and stored in RAM,
+// The compressed MRL version is scalar-quantized to int8 and stored in RAM,
 // and the full vector is asynchronously persisted to disk.
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
-	if len(fullVec) != FullDim {
+	if len(fullVec) != r.config.FullDim {
 		slog.Error("invalid vector dimension",
 			"id", id,
-			"expected", FullDim,
+			"expected", r.config.FullDim,
 			"got", len(fullVec),
 		)
-		return fmt.Errorf("invalid vector dimension: expected %d, got %d", FullDim, len(fullVec))
+		return fmt.Errorf("invalid vector dimension: expected %d, got %d", r.config.FullDim, len(fullVec))
 	}
 
-	// Process to get 64-d MRL vector (normalized)
-	mrlVec := ProcessMRL(fullVec)
+	// Process to get MRL vector (normalized)
+	mrlVec := ProcessMRL(fullVec, r.config.MRLDim)
 
 	// Quantize to int8 for efficient storage
 	quantized := Quantize(mrlVec)
@@ -94,8 +137,10 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 	// Check if ID already exists
 	if idx, exists := r.idMap[id]; exists {
 		// Overwrite existing vector in place
-		copy(r.data[idx*MRLDim:(idx+1)*MRLDim], quantized)
-		copy(r.pqData[idx*PQCodeSize:(idx+1)*PQCodeSize], pqCoded)
+		mrlDim := r.config.MRLDim
+		idxInt := int(idx)
+		copy(r.data[idxInt*mrlDim:(idxInt+1)*mrlDim], quantized)
+		copy(r.pqData[idxInt*PQCodeSize:(idxInt+1)*PQCodeSize], pqCoded)
 		r.mu.Unlock()
 		slog.Debug("vector updated",
 			"id", id,
@@ -157,9 +202,10 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		r.revMap[idx] = lastID
 		r.idMap[lastID] = idx
 
-		srcOffset := int(lastIdx) * MRLDim
-		dstOffset := int(idx) * MRLDim
-		copy(r.data[dstOffset:dstOffset+MRLDim], r.data[srcOffset:srcOffset+MRLDim])
+		mrlDim := r.config.MRLDim
+		srcOffset := int(lastIdx) * mrlDim
+		dstOffset := int(idx) * mrlDim
+		copy(r.data[dstOffset:dstOffset+mrlDim], r.data[srcOffset:srcOffset+mrlDim])
 
 		srcPqOffset := int(lastIdx) * PQCodeSize
 		dstPqOffset := int(idx) * PQCodeSize
@@ -168,7 +214,7 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 
 	r.revMap = r.revMap[:lastIdx]
 	delete(r.idMap, id)
-	r.data = r.data[:len(r.data)-MRLDim]
+	r.data = r.data[:len(r.data)-r.config.MRLDim]
 	r.pqData = r.pqData[:len(r.pqData)-PQCodeSize]
 
 	slog.Debug("vector deleted", "id", id, "remaining", len(r.revMap))
@@ -198,7 +244,7 @@ func (r *VectorRegistry) TrainPQ(sampleSize int) error {
 		sampleSize = numVectors
 	}
 	if sampleSize < PQKClusters*10 {
-		sampleSize = PQKClusters*10
+		sampleSize = PQKClusters * 10
 	}
 
 	slog.Info("training PQ codebook", "numVectors", numVectors, "sampleSize", sampleSize)
@@ -222,7 +268,7 @@ func (r *VectorRegistry) TrainPQ(sampleSize int) error {
 		if err != nil {
 			continue // skip missing
 		}
-		mrlVec := ProcessMRL(fullVec)
+		mrlVec := ProcessMRL(fullVec, r.config.MRLDim)
 		samples = append(samples, mrlVec)
 	}
 
@@ -241,10 +287,11 @@ func (r *VectorRegistry) TrainPQ(sampleSize int) error {
 	// Now encode all vectors
 	slog.Info("encoding all vectors with trained PQ codebook")
 	r.mu.RLock()
+	mrlDim := r.config.MRLDim
 	allVectors := make([][]float32, numVectors)
 	for i := 0; i < numVectors; i++ {
-		offset := i * MRLDim
-		allVectors[i] = Dequantize(r.data[offset : offset+MRLDim])
+		offset := i * mrlDim
+		allVectors[i] = Dequantize(r.data[offset : offset+mrlDim])
 	}
 	r.mu.RUnlock()
 

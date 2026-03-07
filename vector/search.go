@@ -3,7 +3,6 @@ package vector
 import (
 	"container/heap"
 	"log/slog"
-	"runtime"
 	"sort"
 )
 
@@ -43,11 +42,11 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) ([]SearchResult, erro
 	slog.Debug("vector search started",
 		"vectorCount", r.Count(),
 		"k", k,
-		"numCPUs", runtime.NumCPU(),
+		"numWorkers", r.config.NumWorkers,
 	)
 
-	// Process query to get 64-d MRL vector
-	mrlQuery := ProcessMRL(queryVec)
+	// Process query to get MRL vector
+	mrlQuery := ProcessMRL(queryVec, r.config.MRLDim)
 
 	// Quantize query for int8 dot product
 	quantizedQuery := Quantize(mrlQuery)
@@ -65,8 +64,8 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) ([]SearchResult, erro
 
 	r.mu.RUnlock()
 
-	// Determine number of workers
-	numWorkers := runtime.NumCPU()
+	// Determine number of workers from config
+	numWorkers := r.config.NumWorkers
 	if numWorkers > numVectors {
 		numWorkers = numVectors
 	}
@@ -112,11 +111,12 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) ([]SearchResult, erro
 // scanChunk scans a chunk of vectors and returns local top-k results.
 func (r *VectorRegistry) scanChunk(vectors []float32, query []float32, startIdx, endIdx, k int) []SearchResult {
 	h := make(scoreHeap, 0, k)
+	mrlDim := r.config.MRLDim
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product
-		offset := idx * MRLDim
-		score := DotProduct(query, vectors[offset:offset+MRLDim])
+		offset := idx * mrlDim
+		score := DotProduct(query, vectors[offset:offset+mrlDim])
 
 		// Maintain top-k
 		if len(h) < k {
@@ -150,12 +150,13 @@ func (r *VectorRegistry) scanChunk(vectors []float32, query []float32, startIdx,
 // Zero-allocation per vector scanned (except for the final results).
 func (r *VectorRegistry) scanChunkSIMD(data []float32, query []float32, startIdx, endIdx, k int) []SearchResult {
 	h := make(scoreHeap, 0, k)
+	mrlDim := r.config.MRLDim
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product using SIMD-optimized function
 		// Zero-allocation: just pointer arithmetic into the flat buffer
-		offset := idx * MRLDim
-		score := DotProduct64(data[offset:offset+MRLDim], query)
+		offset := idx * mrlDim
+		score := DotProduct64(data[offset:offset+mrlDim], query)
 
 		// Maintain top-k
 		if len(h) < k {
@@ -189,12 +190,13 @@ func (r *VectorRegistry) scanChunkSIMD(data []float32, query []float32, startIdx
 // Provides ~3x speedup over float32 due to better cache efficiency and faster integer arithmetic.
 func (r *VectorRegistry) scanChunkInt8(data []int8, query []int8, startIdx, endIdx, k int) []SearchResult {
 	h := make(scoreHeap, 0, k)
+	mrlDim := r.config.MRLDim
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		// Calculate dot product using int8 SIMD-optimized function
 		// Zero-allocation: just pointer arithmetic into the flat buffer
-		offset := idx * MRLDim
-		score := DotProductInt8(data[offset:offset+MRLDim], query)
+		offset := idx * mrlDim
+		score := DotProductInt8(data[offset:offset+mrlDim], query)
 
 		// Maintain top-k
 		if len(h) < k {

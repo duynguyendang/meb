@@ -1,0 +1,51 @@
+/* Global styles - most styling is in index.html via Tailwind CDN */
+:root {
+  --bg-main: #0A0E14;
+  --bg-surface: #111827;
+  --bg-elevated: #1f2937;
+  --accent-teal: #2DD4BF;
+  --accent-blue: #3B82F6;
+  --accent-purple: #A855F7;
+  --accent-green: #10B981;
+  --accent-orange: #F59E0B;
+  --accent-red: #EF4444;
+  --border: rgba(255, 255, 255, 0.08);
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background-color: var(--bg-main);
+  color: var(--text-secondary);
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+  width: 100vw;
+}
+
+input, select, button {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.font-mono {
+  font-family: 'Fira Code', monospace;
+}

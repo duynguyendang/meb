@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MEB Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Fira+Code:wght@400;500&display=swap');
+
+      /* Dark Theme (default) */
+      :root {
+        --bg-main: #0A0E14;
+        --bg-surface: #111827;
+        --bg-elevated: #1f2937;
+        --accent-teal: #2DD4BF;
+        --accent-blue: #3B82F6;
+        --accent-purple: #A855F7;
+        --accent-green: #10B981;
+        --accent-orange: #F59E0B;
+        --accent-red: #EF4444;
+        --border: rgba(255, 255, 255, 0.08);
+        --text-primary: #e2e8f0;
+        --text-secondary: #94a3b8;
+        --text-muted: #64748b;
+      }
+
+      /* Light Theme */
+      .light {
+        --bg-main: #F8FAFC;
+        --bg-surface: #FFFFFF;
+        --bg-elevated: #F1F5F9;
+        --accent-teal: #0D9488;
+        --accent-blue: #2563EB;
+        --accent-purple: #9333EA;
+        --accent-green: #16A34A;
+        --accent-orange: #D97706;
+        --accent-red: #DC2626;
+        --border: rgba(0, 0, 0, 0.08);
+        --text-primary: #1e293b;
+        --text-secondary: #475569;
+        --text-muted: #94a3b8;
+      }
+
+      body {
+        font-family: 'Inter', sans-serif;
+        background-color: var(--bg-main);
+        color: var(--text-secondary);
+        margin: 0;
+        overflow: hidden;
+        transition: background-color 0.2s, color 0.2s;
+      }
+
+      .font-mono {
+        font-family: 'Fira Code', monospace;
+      }
+
+      .glass-sidebar {
+        background: var(--bg-surface);
+        border-right: 1px solid var(--border);
+      }
+
+      .custom-scrollbar::-webkit-scrollbar {
+        width: 4px;
+        height: 4px;
+      }
+
+      .custom-scrollbar::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      .custom-scrollbar::-webkit-scrollbar-thumb {
+        background: rgba(128, 128, 128, 0.2);
+        border-radius: 10px;
+      }
+
+      .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+        background: rgba(45, 212, 191, 0.4);
+      }
+
+      .glass-panel {
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid var(--border);
+      }
+
+      /* Input styles for light theme */
+      .light input, .light select {
+        background: var(--bg-elevated) !important;
+        border-color: var(--border) !important;
+        color: var(--text-primary) !important;
+      }
+
+      .light .glass-sidebar {
+        box-shadow: 2px 0 8px rgba(0,0,0,0.05);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Apply saved theme on load
+      const savedTheme = localStorage.getItem('meb-theme') || 'dark';
+      if (savedTheme === 'light') {
+        document.documentElement.classList.add('light');
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -33,3 +33,5 @@ go.work.sum
 .claude/
 stress_data/
 badger/
+node_modules/
+dist/

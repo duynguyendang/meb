@@ -192,7 +192,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		dict:       dictEncoder,
 		predicates: make(map[ast.PredicateSym]*predicates.PredicateTable),
 		config:     cfg,
-		vectors:    vector.NewRegistry(db),
+		vectors:    vector.NewRegistry(db, nil),
 		breaker:    circuit.NewBreaker(nil),
 		txPool:     NewTxPool(db, 16),
 	}
