@@ -475,6 +475,12 @@ func (m *MEBStore) ExecuteLFTJQuery(ctx context.Context, q query.LFTJQuery) iter
 	return engine.Execute(ctx, q)
 }
 
+// QueryDatalog executes a high-level Datalog query string and returns string results using the LFTJ Engine.
+func (m *MEBStore) QueryDatalog(ctx context.Context, datalogQuery string) ([]map[string]string, error) {
+	executor := query.NewExecutor(m.QueryOptimizer(), m.LFTJEngine(), m.dict)
+	return executor.ExecuteDatalog(ctx, datalogQuery)
+}
+
 // CommunityDetector returns a new community detector for graph clustering.
 func (m *MEBStore) CommunityDetector() *clustering.CommunityDetector {
 	return clustering.NewCommunityDetector(m.db)
