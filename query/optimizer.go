@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 	"github.com/google/mangle/ast"
 )
@@ -98,9 +99,10 @@ func (qo *QueryOptimizer) RefreshCardinality() error {
 }
 
 type QueryPlan struct {
-	Atoms []AtomPlan
-	Order []int
-	Cost  float64
+	Atoms        []AtomPlan
+	OriginalASTs []ast.Atom
+	Order        []int
+	Cost         float64
 }
 
 type AtomPlan struct {
@@ -149,9 +151,10 @@ func (qo *QueryOptimizer) CreatePlan(atoms []ast.Atom) (*QueryPlan, error) {
 	order := qo.greedyJoinOrder(atomPlans)
 
 	return &QueryPlan{
-		Atoms: atomPlans,
-		Order: order,
-		Cost:  qo.calculatePlanCost(atomPlans, order),
+		Atoms:        atomPlans,
+		OriginalASTs: atoms,
+		Order:        order,
+		Cost:         qo.calculatePlanCost(atomPlans, order),
 	}, nil
 }
 
@@ -495,4 +498,71 @@ func (qo *QueryOptimizer) ExplainPlan(plan *QueryPlan) string {
 	explanation.WriteString(fmt.Sprintf("Total Plan Cost: %.2f\n", plan.Cost))
 
 	return explanation.String()
+}
+
+// CompileToLFTJ compiles an optimized QueryPlan into an executable LFTJQuery.
+func (qo *QueryOptimizer) CompileToLFTJ(plan *QueryPlan, dictionary dict.Dictionary) (LFTJQuery, error) {
+	query := LFTJQuery{
+		Relations: make([]RelationPattern, len(plan.Order)),
+		BoundVars: make(map[string]uint64),
+	}
+
+	resultVars := make([]string, 0)
+	seenVars := make(map[string]bool)
+
+	for i, idx := range plan.Order {
+		originalAtom := plan.OriginalASTs[idx]
+
+		rel := RelationPattern{
+			Prefix:            keys.QuadSPOGPrefix, // Default, we could optimize to specific indexes based on bound positions
+			BoundPositions:    make(map[int]uint64),
+			VariablePositions: make(map[int]string),
+		}
+
+		// Process predicate
+		predID, err := dictionary.GetOrCreateID(originalAtom.Predicate.Symbol)
+		if err != nil {
+			return LFTJQuery{}, fmt.Errorf("failed to encode predicate %s: %w", originalAtom.Predicate.Symbol, err)
+		}
+		rel.BoundPositions[1] = predID
+
+		// Process subject/object arguments
+		for pos, arg := range originalAtom.Args {
+			targetPos := pos
+			if pos > 0 {
+				targetPos = pos + 1 // Shift object to pos 2 (Subject:0, Pred:1, Object:2)
+			}
+
+			if c, ok := arg.(ast.Constant); ok {
+				if strings.HasPrefix(c.Symbol, "?") || strings.HasPrefix(c.Symbol, "_") {
+					// Variable
+					varName := c.Symbol
+					rel.VariablePositions[targetPos] = varName
+					if !seenVars[varName] {
+						seenVars[varName] = true
+						if !strings.HasPrefix(varName, "_") {
+							resultVars = append(resultVars, varName)
+						}
+					}
+				} else {
+					// Constant literal
+					valStr := c.Symbol
+					if strings.HasPrefix(valStr, "\"") && strings.HasSuffix(valStr, "\"") {
+						valStr = valStr[1 : len(valStr)-1] // Strip quotes
+					}
+
+					valID, err := dictionary.GetOrCreateID(valStr)
+					if err != nil {
+						return LFTJQuery{}, fmt.Errorf("failed to encode value %s: %w", valStr, err)
+					}
+					rel.BoundPositions[targetPos] = valID
+				}
+			}
+		}
+
+		query.Relations[i] = rel
+	}
+
+	query.ResultVars = resultVars
+	return query, nil
 }
