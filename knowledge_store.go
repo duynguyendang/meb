@@ -128,7 +128,8 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		}
 
 		// Add to graph index: GSPO (33 bytes) - Graph-Subject-Predicate-Object
-		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, sID, pID, oID, gID)
+		// Format: [prefix(1) | graph(8) | subject(8) | predicate(8) | object(8)]
+		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, gID, sID, pID, oID)
 		if err := batch.Set(gspoKey, nil); err != nil {
 			return fmt.Errorf("failed to set GSPO key for fact %d: %w", i, err)
 		}

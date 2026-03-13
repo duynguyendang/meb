@@ -28,6 +28,14 @@ type TrieIterator struct {
 
 	// exhausted tracks if iterator has reached end
 	exhausted bool
+
+	// depthPrefixes tracks the required prefix at each trie level
+	// This ensures Next() and Seek() stay within the current branch
+	depthPrefixes [][]byte
+
+	// advancedByChild tracks if the iterator was advanced by a child-level operation
+	// This prevents skipping sibling quads during join execution
+	advancedByChild bool
 }
 
 // NewTrieIterator creates a new TrieIterator for a given prefix and column order.
@@ -40,13 +48,14 @@ func NewTrieIterator(txn *badger.Txn, prefix []byte, columnOrder []int) *TrieIte
 	it := txn.NewIterator(opts)
 
 	return &TrieIterator{
-		txn:         txn,
-		it:          it,
-		prefix:      prefix,
-		depth:       0,
-		columnOrder: columnOrder,
-		keySize:     keys.QuadKeySize,
-		exhausted:   false,
+		txn:           txn,
+		it:            it,
+		prefix:        prefix,
+		depth:         0,
+		columnOrder:   columnOrder,
+		keySize:       keys.QuadKeySize,
+		exhausted:     false,
+		depthPrefixes: make([][]byte, 4), // Support up to 4 levels
 	}
 }
 
@@ -55,6 +64,12 @@ func NewTrieIterator(txn *badger.Txn, prefix []byte, columnOrder []int) *TrieIte
 func (ti *TrieIterator) Open() error {
 	if ti.it == nil {
 		return fmt.Errorf("iterator not initialized")
+	}
+
+	// Initialize depthPrefixes with the base prefix
+	if len(ti.depthPrefixes) > 0 {
+		ti.depthPrefixes[0] = make([]byte, len(ti.prefix))
+		copy(ti.depthPrefixes[0], ti.prefix)
 	}
 
 	ti.it.Seek(ti.prefix)
@@ -73,19 +88,34 @@ func (ti *TrieIterator) Close() {
 }
 
 // Up moves up to the parent level in the trie (decreases depth).
+// Resets exhausted flag to allow continued exploration at higher levels.
 func (ti *TrieIterator) Up() {
 	if ti.depth > 0 {
 		ti.depth--
+		ti.exhausted = false
+		ti.advancedByChild = false
 	}
 }
 
 // Down moves down to a child level in the trie (increases depth).
+// Tracks depth prefixes for proper branch isolation.
 func (ti *TrieIterator) Down() {
+	// Save current position as prefix for child level
+	if ti.depth < len(ti.depthPrefixes)-1 && ti.it.Valid() {
+		key := ti.it.Item().Key()
+		prefixLen := len(ti.prefix) + (ti.depth+1)*8
+		if len(key) >= prefixLen {
+			ti.depthPrefixes[ti.depth+1] = make([]byte, prefixLen)
+			copy(ti.depthPrefixes[ti.depth+1], key[:prefixLen])
+		}
+	}
 	ti.depth++
+	ti.advancedByChild = true
 }
 
 // Seek seeks to the specified key at the current depth.
 // Returns true if found, false if not found or exhausted.
+// Uses depthPrefixes to ensure we stay within the current trie branch.
 func (ti *TrieIterator) Seek(target uint64) bool {
 	if ti.exhausted {
 		return false
@@ -95,7 +125,7 @@ func (ti *TrieIterator) Seek(target uint64) bool {
 	seekPrefix := make([]byte, len(ti.prefix)+ti.depth*8+8)
 	copy(seekPrefix, ti.prefix)
 
-	// Copy existing depth components
+	// Copy existing depth components from current key if valid
 	if ti.depth > 0 && ti.it.Valid() {
 		key := ti.it.Item().Key()
 		if len(key) >= len(ti.prefix)+ti.depth*8 {
@@ -115,10 +145,31 @@ func (ti *TrieIterator) Seek(target uint64) bool {
 
 	ti.it.Seek(seekPrefix)
 
-	// Check if we're still within the prefix
+	// Check if we're still within the base prefix
 	if !ti.it.ValidForPrefix(ti.prefix) {
 		ti.exhausted = true
 		return false
+	}
+
+	// Check if we're still within the depth-specific prefix for branch isolation
+	if ti.depth < len(ti.depthPrefixes) && ti.depthPrefixes[ti.depth] != nil {
+		if ti.it.Valid() {
+			key := ti.it.Item().Key()
+			expectedPrefix := ti.depthPrefixes[ti.depth]
+			if len(key) >= len(expectedPrefix) {
+				valid := true
+				for i, b := range expectedPrefix {
+					if key[i] != b {
+						valid = false
+						break
+					}
+				}
+				if !valid {
+					ti.exhausted = true
+					return false
+				}
+			}
+		}
 	}
 
 	// Get current key and check if we're at or after target
@@ -133,16 +184,62 @@ func (ti *TrieIterator) Seek(target uint64) bool {
 
 // Next moves to the next sibling at the current depth.
 // Returns true if successful, false if exhausted.
+// Uses depthPrefixes to ensure we stay within the current trie branch.
 func (ti *TrieIterator) Next() bool {
 	if ti.exhausted {
 		return false
 	}
 
+	// If we were advanced by a child operation, check if we're still within branch
+	if ti.advancedByChild && ti.depth < len(ti.depthPrefixes) && ti.depthPrefixes[ti.depth] != nil {
+		// Check if current key is still within the expected prefix for this depth
+		if ti.it.Valid() {
+			key := ti.it.Item().Key()
+			expectedPrefix := ti.depthPrefixes[ti.depth]
+			if len(key) >= len(expectedPrefix) {
+				valid := true
+				for i, b := range expectedPrefix {
+					if key[i] != b {
+						valid = false
+						break
+					}
+				}
+				if !valid {
+					ti.exhausted = true
+					return false
+				}
+			}
+		}
+		ti.advancedByChild = false
+	}
+
 	ti.it.Next()
 
+	// Check if still within base prefix
 	if !ti.it.ValidForPrefix(ti.prefix) {
 		ti.exhausted = true
 		return false
+	}
+
+	// Check if still within depth-specific prefix
+	if ti.depth < len(ti.depthPrefixes) && ti.depthPrefixes[ti.depth] != nil {
+		if ti.it.Valid() {
+			key := ti.it.Item().Key()
+			expectedPrefix := ti.depthPrefixes[ti.depth]
+			if len(key) >= len(expectedPrefix) {
+				valid := true
+				for i, b := range expectedPrefix {
+					if key[i] != b {
+						valid = false
+						break
+					}
+				}
+				if !valid {
+					ti.exhausted = true
+					return false
+				}
+			}
+		}
 	}
 
 	return true
@@ -264,9 +361,9 @@ func leapfrogRecursive(iterators []*TrieIterator, currentTuple []uint64, yield f
 			// Match found! Recurse to next level
 			matchKey := infos[0].key
 
-			// Move all iterators down
+			// Move all iterators down (use pointer from original slice, not copy)
 			for _, info := range infos {
-				info.iter.Down()
+				iterators[info.index].Down()
 			}
 
 			// Recurse with the match
@@ -278,11 +375,11 @@ func leapfrogRecursive(iterators []*TrieIterator, currentTuple []uint64, yield f
 				return err
 			}
 
-			// Move all iterators back up and advance
+			// Move all iterators back up and advance (use pointer from original slice)
 			for _, info := range infos {
-				info.iter.Up()
-				info.iter.Next()
-				if info.iter.AtEnd() {
+				iterators[info.index].Up()
+				iterators[info.index].Next()
+				if iterators[info.index].AtEnd() {
 					return nil // One iterator exhausted, done
 				}
 			}
@@ -310,13 +407,13 @@ func leapfrogRecursive(iterators []*TrieIterator, currentTuple []uint64, yield f
 
 		// Seek the iterator with minimum key to max_key
 		minInfo := &infos[0]
-		if !minInfo.iter.Seek(maxKey) {
+		if !iterators[minInfo.index].Seek(maxKey) {
 			// Seek failed, iterator exhausted
 			return nil
 		}
 
 		// Update the key after seek
-		minInfo.key = minInfo.iter.Key()
+		minInfo.key = iterators[minInfo.index].Key()
 
 		// If we advanced past max_key, update max_key
 		if minInfo.key > maxKey {

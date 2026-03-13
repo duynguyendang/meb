@@ -514,12 +514,16 @@ func (qo *QueryOptimizer) CompileToLFTJ(plan *QueryPlan, dictionary dict.Diction
 		originalAtom := plan.OriginalASTs[idx]
 
 		rel := RelationPattern{
-			Prefix:            keys.QuadSPOGPrefix, // Default, we could optimize to specific indexes based on bound positions
+			Prefix:            keys.QuadSPOGPrefix, // Will be optimized below
 			BoundPositions:    make(map[int]uint64),
 			VariablePositions: make(map[int]string),
 		}
 
-		// Process predicate
+		// Track which positions are bound for index optimization
+		subjectBound := false
+		objectBound := false
+
+		// Process predicate - always bound in our current model
 		predID, err := dictionary.GetOrCreateID(originalAtom.Predicate.Symbol)
 		if err != nil {
 			return LFTJQuery{}, fmt.Errorf("failed to encode predicate %s: %w", originalAtom.Predicate.Symbol, err)
@@ -545,7 +549,7 @@ func (qo *QueryOptimizer) CompileToLFTJ(plan *QueryPlan, dictionary dict.Diction
 						}
 					}
 				} else {
-					// Constant literal
+					// Constant literal - resolve to ID at compile time
 					valStr := c.Symbol
 					if strings.HasPrefix(valStr, "\"") && strings.HasSuffix(valStr, "\"") {
 						valStr = valStr[1 : len(valStr)-1] // Strip quotes
@@ -556,8 +560,41 @@ func (qo *QueryOptimizer) CompileToLFTJ(plan *QueryPlan, dictionary dict.Diction
 						return LFTJQuery{}, fmt.Errorf("failed to encode value %s: %w", valStr, err)
 					}
 					rel.BoundPositions[targetPos] = valID
+
+					// Track bound positions for index selection
+					if targetPos == 0 {
+						subjectBound = true
+					} else if targetPos == 2 {
+						objectBound = true
+					}
 				}
 			}
+		}
+
+		// Select optimal index based on bound positions
+		// Priority: Subject > Object > Default
+		if subjectBound && !objectBound {
+			// Subject is bound - SPOG is most efficient
+			rel.Prefix = keys.QuadSPOGPrefix
+		} else if objectBound && !subjectBound {
+			// Object is bound - OPSG is most efficient
+			// Remap BoundPositions for OPSG key order: [Object, Predicate, Subject, Graph]
+			rel.Prefix = keys.QuadOPSGPrefix
+			// Remap: logical pos 2 (Object) -> key pos 0, logical pos 1 (Predicate) -> key pos 1
+			newBound := make(map[int]uint64)
+			if boundObj, ok := rel.BoundPositions[2]; ok {
+				newBound[0] = boundObj // Object at key position 0
+			}
+			if boundPred, ok := rel.BoundPositions[1]; ok {
+				newBound[1] = boundPred // Predicate at key position 1
+			}
+			rel.BoundPositions = newBound
+		} else if subjectBound && objectBound {
+			// Both bound - prefer SPOG for subject lookups
+			rel.Prefix = keys.QuadSPOGPrefix
+		} else {
+			// Neither bound - use default SPOG
+			rel.Prefix = keys.QuadSPOGPrefix
 		}
 
 		query.Relations[i] = rel

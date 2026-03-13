@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"log/slog"
+	"strings"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
@@ -20,6 +22,9 @@ type LFTJQuery struct {
 
 	// ResultVars defines the order of variables in the result
 	ResultVars []string
+
+	// ColumnOrders stores the column order for each relation (used for result mapping)
+	ColumnOrders [][]int
 }
 
 // RelationPattern defines a single relation to join
@@ -56,12 +61,14 @@ func (e *LFTJEngine) Execute(ctx context.Context, query LFTJQuery) iter.Seq2[map
 
 		// Build iterators for each relation
 		iterators := make([]*TrieIterator, 0, len(query.Relations))
+		columnOrders := make([][]int, len(query.Relations))
 		for i, rel := range query.Relations {
 			// Build prefix for this relation
 			prefix := e.buildPrefix(rel)
 
 			// Determine column order based on prefix type
 			columnOrder := e.getColumnOrder(rel.Prefix)
+			columnOrders[i] = columnOrder
 
 			// Create iterator
 			it := NewTrieIterator(txn, prefix, columnOrder)
@@ -94,8 +101,8 @@ func (e *LFTJEngine) Execute(ctx context.Context, query LFTJQuery) iter.Seq2[map
 			default:
 			}
 
-			// Build result map from tuple
-			result := e.buildResult(query, tuple)
+			// Build result map from tuple using column orders for proper mapping
+			result := e.buildResult(query, tuple, columnOrders)
 			if !yield(result, nil) {
 				return
 			}
@@ -150,24 +157,47 @@ func (e *LFTJEngine) getColumnOrder(prefix byte) []int {
 	}
 }
 
-// buildResult creates a result map from a joined tuple
-func (e *LFTJEngine) buildResult(query LFTJQuery, tuple []uint64) map[string]uint64 {
+// buildResult creates a result map from a joined tuple.
+// Uses columnOrders to map tuple positions to logical positions (Subject, Predicate, Object, Graph),
+// then uses VariablePositions to assign values to result variables.
+func (e *LFTJEngine) buildResult(query LFTJQuery, tuple []uint64, columnOrders [][]int) map[string]uint64 {
 	result := make(map[string]uint64)
+
+	// Trace: Log tuple and column orders in development mode
+	slog.Debug("buildResult: input tuple", "tuple", tuple, "numRelations", len(query.Relations))
 
 	// Add bound variables
 	for varName, val := range query.BoundVars {
 		result[varName] = val
 	}
 
-	// Map tuple values to result variables
-	// This is a simplified mapping - in practice you'd track which tuple positions
-	// correspond to which variables based on the query structure
-	for i, val := range tuple {
-		if i < len(query.ResultVars) {
-			result[query.ResultVars[i]] = val
+	// Map tuple values to result variables using column orders
+	// columnOrders[i][j] = logical position (0=Subject, 1=Predicate, 2=Object, 3=Graph) at tuple position j
+	tuplePos := 0
+	for relIdx, rel := range query.Relations {
+		columnOrder := columnOrders[relIdx]
+
+		slog.Debug("buildResult: processing relation", "relIdx", relIdx, "columnOrder", columnOrder, "varPositions", rel.VariablePositions)
+
+		// Process each position in the tuple for this relation
+		for _, logicalPos := range columnOrder {
+			if tuplePos >= len(tuple) {
+				break
+			}
+
+			// Check if this logical position has a variable
+			if varName, isVar := rel.VariablePositions[logicalPos]; isVar {
+				// Skip underscore variables
+				if varName != "_" && !strings.HasPrefix(varName, "_") {
+					result[varName] = tuple[tuplePos]
+					slog.Debug("buildResult: assigned variable", "varName", varName, "value", tuple[tuplePos], "logicalPos", logicalPos)
+				}
+			}
+			tuplePos++
 		}
 	}
 
+	slog.Debug("buildResult: result", "result", result)
 	return result
 }
 
