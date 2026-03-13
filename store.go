@@ -51,8 +51,9 @@ import (
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
 
+	"codeberg.org/TauCeti/mangle-go/ast"
+	"codeberg.org/TauCeti/mangle-go/factstore"
 	"github.com/dgraph-io/badger/v4"
-	"github.com/google/mangle/ast"
 )
 
 // MEBStore implements both factstore.FactStore and store.KnowledgeStore interfaces.
@@ -92,6 +93,9 @@ type MEBStore struct {
 	// GC tracking for auto-compaction
 	lastGCTime   time.Time
 	factsSinceGC uint64
+
+	// Temporal store for time-based facts (DatalogMTL support)
+	temporalStore *MEBTemporalStore
 }
 
 // loadStats reads the counter from disk into RAM.
@@ -588,4 +592,202 @@ func (m *MEBStore) triggerAutoGC() {
 	// Reset counters
 	m.factsSinceGC = 0
 	m.lastGCTime = now
+}
+
+// === Temporal Facts API (DatalogMTL Support) ===
+
+// EnableTemporal creates and initializes the temporal store for time-based facts.
+// This must be called before using temporal fact methods.
+func (m *MEBStore) EnableTemporal() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.temporalStore == nil {
+		m.temporalStore = NewMEBTemporalStore()
+	}
+}
+
+// IsTemporalEnabled returns true if temporal store is enabled.
+func (m *MEBStore) IsTemporalEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.temporalStore != nil
+}
+
+// AddTemporalFact adds a fact that is valid during the specified time interval.
+// This enables temporal queries like "who accessed doc_X in the last 30 days?"
+func (m *MEBStore) AddTemporalFact(predicate, subject, object, graph string, validFrom, validTo time.Time) error {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return fmt.Errorf("temporal store not enabled. Call EnableTemporal() first")
+	}
+
+	// Convert to ast.Atom
+	atom := ast.NewAtom(predicate,
+		ast.Constant{Type: ast.StringType, Symbol: subject},
+		ast.Constant{Type: ast.StringType, Symbol: object},
+	)
+	if graph != "" {
+		atom = ast.NewAtom("triples",
+			ast.Constant{Type: ast.StringType, Symbol: subject},
+			ast.Constant{Type: ast.StringType, Symbol: predicate},
+			ast.Constant{Type: ast.StringType, Symbol: object},
+			ast.Constant{Type: ast.StringType, Symbol: graph},
+		)
+	}
+
+	interval := ast.TimeInterval(validFrom, validTo)
+	_, err := ts.Add(atom, interval)
+	return err
+}
+
+// AddTemporalFactAt adds a fact that is valid at a specific point in time.
+func (m *MEBStore) AddTemporalFactAt(predicate, subject, object, graph string, at time.Time) error {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return fmt.Errorf("temporal store not enabled. Call EnableTemporal() first")
+	}
+
+	atom := ast.NewAtom(predicate,
+		ast.Constant{Type: ast.StringType, Symbol: subject},
+		ast.Constant{Type: ast.StringType, Symbol: object},
+	)
+	if graph != "" {
+		atom = ast.NewAtom("triples",
+			ast.Constant{Type: ast.StringType, Symbol: subject},
+			ast.Constant{Type: ast.StringType, Symbol: predicate},
+			ast.Constant{Type: ast.StringType, Symbol: object},
+			ast.Constant{Type: ast.StringType, Symbol: graph},
+		)
+	}
+
+	interval := ast.NewPointInterval(at)
+	_, err := ts.Add(atom, interval)
+	return err
+}
+
+// AddEternalFact adds a fact that is valid for all time.
+func (m *MEBStore) AddEternalFact(predicate, subject, object, graph string) error {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return fmt.Errorf("temporal store not enabled. Call EnableTemporal() first")
+	}
+
+	atom := ast.NewAtom(predicate,
+		ast.Constant{Type: ast.StringType, Symbol: subject},
+		ast.Constant{Type: ast.StringType, Symbol: object},
+	)
+	if graph != "" {
+		atom = ast.NewAtom("triples",
+			ast.Constant{Type: ast.StringType, Symbol: subject},
+			ast.Constant{Type: ast.StringType, Symbol: predicate},
+			ast.Constant{Type: ast.StringType, Symbol: object},
+			ast.Constant{Type: ast.StringType, Symbol: graph},
+		)
+	}
+
+	_, err := ts.AddEternal(atom)
+	return err
+}
+
+// ContainsTemporalAt checks if a fact is valid at the specified time.
+func (m *MEBStore) ContainsTemporalAt(predicate, subject, object, graph string, t time.Time) bool {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return false
+	}
+
+	atom := ast.NewAtom(predicate,
+		ast.Constant{Type: ast.StringType, Symbol: subject},
+		ast.Constant{Type: ast.StringType, Symbol: object},
+	)
+	if graph != "" {
+		atom = ast.NewAtom("triples",
+			ast.Constant{Type: ast.StringType, Symbol: subject},
+			ast.Constant{Type: ast.StringType, Symbol: predicate},
+			ast.Constant{Type: ast.StringType, Symbol: object},
+			ast.Constant{Type: ast.StringType, Symbol: graph},
+		)
+	}
+
+	return ts.ContainsAt(atom, t)
+}
+
+// GetTemporalFactsAt returns all facts valid at a specific time.
+func (m *MEBStore) GetTemporalFactsAt(predicate string, t time.Time) ([]TemporalFact, error) {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return nil, fmt.Errorf("temporal store not enabled. Call EnableTemporal() first")
+	}
+
+	query := ast.NewQuery(ast.PredicateSym{Symbol: predicate})
+	var results []TemporalFact
+
+	err := ts.GetFactsAt(query, t, func(tf factstore.TemporalFact) error {
+		results = append(results, TemporalFact{
+			Fact: Fact{
+				Subject:   tf.Atom.Args[0].String(),
+				Predicate: tf.Atom.Predicate.Symbol,
+				Object:    tf.Atom.Args[1].String(),
+			},
+			ValidFrom: tf.Interval.Start.Time(),
+			ValidTo:   tf.Interval.End.Time(),
+		})
+		return nil
+	})
+
+	return results, err
+}
+
+// GetTemporalFactsDuring returns all facts valid during a time interval.
+func (m *MEBStore) GetTemporalFactsDuring(predicate string, start, end time.Time) ([]TemporalFact, error) {
+	m.mu.RLock()
+	ts := m.temporalStore
+	m.mu.RUnlock()
+
+	if ts == nil {
+		return nil, fmt.Errorf("temporal store not enabled. Call EnableTemporal() first")
+	}
+
+	query := ast.NewQuery(ast.PredicateSym{Symbol: predicate})
+	interval := ast.TimeInterval(start, end)
+	var results []TemporalFact
+
+	err := ts.GetFactsDuring(query, interval, func(tf factstore.TemporalFact) error {
+		results = append(results, TemporalFact{
+			Fact: Fact{
+				Subject:   tf.Atom.Args[0].String(),
+				Predicate: tf.Atom.Predicate.Symbol,
+				Object:    tf.Atom.Args[1].String(),
+			},
+			ValidFrom: tf.Interval.Start.Time(),
+			ValidTo:   tf.Interval.End.Time(),
+		})
+		return nil
+	})
+
+	return results, err
+}
+
+// GetTemporalStore returns the underlying temporal store for advanced usage.
+// Returns nil if temporal is not enabled.
+func (m *MEBStore) GetTemporalStore() *MEBTemporalStore {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.temporalStore
 }

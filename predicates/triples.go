@@ -4,10 +4,10 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"codeberg.org/TauCeti/mangle-go/ast"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
-	"github.com/google/mangle/ast"
 )
 
 // PredicateTable implements streaming queries for a specific predicate.

@@ -3,8 +3,8 @@ package meb
 import (
 	"fmt"
 
-	"github.com/google/mangle/ast"
-	"github.com/google/mangle/factstore"
+	"codeberg.org/TauCeti/mangle-go/ast"
+	"codeberg.org/TauCeti/mangle-go/factstore"
 )
 
 // extractQuadFromAtom extracts subject, predicate, object, and graph from an atom.

@@ -3,8 +3,8 @@ module github.com/duynguyendang/meb
 go 1.23
 
 require (
+	codeberg.org/TauCeti/mangle-go v0.5.0
 	github.com/dgraph-io/badger/v4 v4.3.0
-	github.com/google/mangle v0.4.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/klauspost/compress v1.18.2
 )
@@ -25,3 +25,6 @@ require (
 	golang.org/x/sys v0.24.0 // indirect
 	google.golang.org/protobuf v1.34.0 // indirect
 )
+
+// Use the temporal fork of Mangle
+replace github.com/google/mangle => codeberg.org/TauCeti/mangle-go v0.5.0

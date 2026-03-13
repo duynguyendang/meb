@@ -88,18 +88,24 @@ func (p *TxPool) Close() {
 	p.initialized = false
 }
 
-// withReadTxn executes a function within a read transaction.
+// withReadTxn executes a read transaction.
+// Creates a fresh transaction each time to avoid pooling issues.
 func (m *MEBStore) withReadTxn(fn func(*badger.Txn) error) error {
 	txn := m.db.NewTransaction(false)
-	defer txn.Discard()
-	return fn(txn)
+	if err := fn(txn); err != nil {
+		txn.Discard()
+		return err
+	}
+	txn.Discard()
+	return nil
 }
 
-// withWriteTxn executes a function within a write transaction from the pool.
+// withWriteTxn executes a function within a write transaction.
+// Creates a fresh transaction each time to avoid pooling issues.
 func (m *MEBStore) withWriteTxn(fn func(*badger.Txn) error) error {
-	txn := m.txPool.GetWrite()
-	defer m.txPool.PutWrite(txn)
+	txn := m.db.NewTransaction(true)
 	if err := fn(txn); err != nil {
+		txn.Discard()
 		return err
 	}
 	return txn.Commit()
