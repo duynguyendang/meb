@@ -1,9 +1,9 @@
 package adapter
 
 import (
+	"codeberg.org/TauCeti/mangle-go/ast"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
-	"github.com/google/mangle/ast"
 )
 
 // Iterator defines the interface for streaming facts from the EDB layer.
