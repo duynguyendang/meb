@@ -122,14 +122,15 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		}
 
 		// Add to inverse index: OPSG (33 bytes) - Object-Predicate-Subject-Graph
-		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, oID, pID, sID, gID)
+		// EncodeQuadKey handles the physical reordering internally based on prefix
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, sID, pID, oID, gID)
 		if err := batch.Set(opsgKey, nil); err != nil {
 			return fmt.Errorf("failed to set OPSG key for fact %d: %w", i, err)
 		}
 
 		// Add to graph index: GSPO (33 bytes) - Graph-Subject-Predicate-Object
-		// Format: [prefix(1) | graph(8) | subject(8) | predicate(8) | object(8)]
-		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, gID, sID, pID, oID)
+		// EncodeQuadKey handles the physical reordering internally based on prefix
+		gspoKey := keys.EncodeQuadKey(keys.QuadGSPOPrefix, sID, pID, oID, gID)
 		if err := batch.Set(gspoKey, nil); err != nil {
 			return fmt.Errorf("failed to set GSPO key for fact %d: %w", i, err)
 		}
@@ -240,7 +241,7 @@ func (m *MEBStore) DeleteGraph(graph string) error {
 
 		// Generate all three keys
 		spogKey := keys.EncodeQuadKey(keys.QuadSPOGPrefix, s, p, o, g)
-		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, o, p, s, g)
+		opsgKey := keys.EncodeQuadKey(keys.QuadOPSGPrefix, s, p, o, g)
 
 		keysToDelete = append(keysToDelete, quadKeys{
 			gspo: gspoKey,
