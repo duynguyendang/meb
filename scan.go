@@ -98,18 +98,21 @@ type scanResult struct {
 }
 
 type scanOptions struct {
-	ctx      context.Context
-	s        string
-	p        string
-	o        string
-	sID      uint64
-	pID      uint64
-	oID      uint64
-	sBound   bool
-	pBound   bool
-	oBound   bool
-	strategy *scanStrategy
-	filters  []PredicateFilter
+	ctx             context.Context
+	s               string
+	p               string
+	o               string
+	sID             uint64
+	pID             uint64
+	oID             uint64
+	sBound          bool
+	pBound          bool
+	oBound          bool
+	strategy        *scanStrategy
+	filters         []PredicateFilter
+	topicID         uint32 // 0 = use current store topic; non-zero = scan specific topic
+	pruneEntityType uint16 // 0 = no pruning; non-zero = prune by entity type
+	prunePublic     bool   // if true, only yield triples with IsPublic flag
 }
 
 func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
@@ -205,7 +208,11 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 			scanCtx = context.Background()
 		}
 
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		itOpts := badger.DefaultIteratorOptions
+		if opts.pruneEntityType > 0 || opts.prunePublic {
+			itOpts.PrefetchValues = true // Need values for semantic hints pruning
+		}
+		it := txn.NewIterator(itOpts)
 		defer it.Close()
 
 		for it.Seek(opts.strategy.prefix); it.ValidForPrefix(opts.strategy.prefix); it.Next() {
@@ -234,6 +241,18 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 			}
 			if opts.oBound && result.foundOID != opts.oID {
 				continue
+			}
+
+			// Semantic hints pruning: skip triples that don't match entity type or flags
+			if opts.pruneEntityType > 0 || opts.prunePublic {
+				var pruned bool
+				_ = item.Value(func(val []byte) error {
+					pruned = ShouldPruneTriple(val, opts.pruneEntityType, opts.prunePublic)
+					return nil
+				})
+				if pruned {
+					continue
+				}
 			}
 
 			result.key = key
@@ -369,6 +388,155 @@ func (m *MEBStore) ScanWithFiltersContext(ctx context.Context, s, p, o string, f
 
 		for _, filter := range opts.filters {
 			if !evaluatePredicateFilter(objectStr, filter) {
+				return Fact{}, false
+			}
+		}
+
+		return Fact{
+			Subject:   subject,
+			Predicate: predicate,
+			Object:    objectStr,
+		}, true
+	})
+}
+
+// ScanInTopic scans facts within a specific topic.
+// The TopicID is packed into the ID structure for data locality.
+// This enables scanning only the prefix range belonging to the requested topic.
+func (m *MEBStore) ScanInTopic(topicID uint32, s, p, o string) iter.Seq2[Fact, error] {
+	return m.scanInTopicImpl(context.Background(), topicID, s, p, o, nil)
+}
+
+// ScanInTopicContext scans facts within a specific topic with context.
+func (m *MEBStore) ScanInTopicContext(ctx context.Context, topicID uint32, s, p, o string) iter.Seq2[Fact, error] {
+	return m.scanInTopicImpl(ctx, topicID, s, p, o, nil)
+}
+
+func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o string, filters []PredicateFilter) iter.Seq2[Fact, error] {
+	sID, pID, oID, sBound, pBound, oBound, err := m.resolveScanIDs(s, p, o)
+	if err != nil {
+		return func(yield func(Fact, error) bool) {
+			yield(Fact{}, err)
+		}
+	}
+
+	// Pack IDs with the specified topic for symmetric lookup
+	if sBound {
+		sID = keys.PackID(topicID, keys.UnpackLocalID(sID))
+	}
+	if oBound {
+		oID = keys.PackID(topicID, keys.UnpackLocalID(oID))
+	}
+
+	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
+
+	// If no bound args, use topic-specific prefix scan
+	if !sBound && !oBound && !pBound {
+		strategy.prefix = keys.EncodeSPOByTopic(topicID)
+		strategy.index = keys.TripleSPOPrefix
+	}
+
+	opts := &scanOptions{
+		ctx:      ctx,
+		s:        s,
+		p:        p,
+		o:        o,
+		sID:      sID,
+		pID:      pID,
+		oID:      oID,
+		sBound:   sBound,
+		pBound:   pBound,
+		oBound:   oBound,
+		strategy: strategy,
+		filters:  filters,
+		topicID:  topicID,
+	}
+
+	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
+		var subject, predicate, objectStr string
+		var err error
+
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			subject, err = m.dict.GetString(r.foundSID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			predicate, err = m.dict.GetString(r.foundPID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.oBound {
+			objectStr = opts.o
+		} else {
+			objectStr, err = m.dict.GetString(r.foundOID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		for _, filter := range opts.filters {
+			if !evaluatePredicateFilter(objectStr, filter) {
+				return Fact{}, false
+			}
+		}
+
+		return Fact{
+			Subject:   subject,
+			Predicate: predicate,
+			Object:    objectStr,
+		}, true
+	})
+}
+
+// ScanWithPruning scans facts with semantic hints pruning.
+// entityType: only yield triples matching this entity type (0 = no pruning).
+// wantPublic: if true, only yield triples with IsPublic flag.
+func (m *MEBStore) ScanWithPruning(s, p, o string, entityType uint16, wantPublic bool) iter.Seq2[Fact, error] {
+	opts, err := m.prepareScanWithContext(context.Background(), s, p, o)
+	if err != nil {
+		return func(yield func(Fact, error) bool) {
+			yield(Fact{}, err)
+		}
+	}
+	opts.pruneEntityType = entityType
+	opts.prunePublic = wantPublic
+
+	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
+		var subject, predicate, objectStr string
+		var err error
+
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			subject, err = m.dict.GetString(r.foundSID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			predicate, err = m.dict.GetString(r.foundPID)
+			if err != nil {
+				return Fact{}, false
+			}
+		}
+
+		if opts.oBound {
+			objectStr = opts.o
+		} else {
+			objectStr, err = m.dict.GetString(r.foundOID)
+			if err != nil {
 				return Fact{}, false
 			}
 		}

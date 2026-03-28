@@ -31,6 +31,7 @@ type Builder struct {
 	filters             []QueryFilter
 	limit               int
 	candidateMultiplier int
+	topicID             uint32 // 0 = use default; non-zero = restrict to topic
 }
 
 func NewBuilder(store Store) *Builder {
@@ -70,6 +71,13 @@ func (b *Builder) CandidateMultiplier(multiplier int) *Builder {
 	return b
 }
 
+// InTopic restricts the search to a specific topic.
+// The TopicID is used for topic-aware vector search and scan operations.
+func (b *Builder) InTopic(topicID uint32) *Builder {
+	b.topicID = topicID
+	return b
+}
+
 func (b *Builder) Execute() ([]Result, error) {
 	if len(b.vectorQuery) == 0 {
 		return nil, fmt.Errorf("query must include SimilarTo() vector search")
@@ -80,14 +88,21 @@ func (b *Builder) Execute() ([]Result, error) {
 		candidateK = 100
 	}
 
-	vectorResults, err := b.store.Vectors().Search(b.vectorQuery, candidateK)
-	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
+	// Use topic-aware search if topicID is set — streaming via iter.Seq2
+	var vecIter iter.Seq2[vector.SearchResult, error]
+	if b.topicID > 0 {
+		vecIter = b.store.Vectors().SearchInTopic(b.topicID, b.vectorQuery, candidateK)
+	} else {
+		vecIter = b.store.Vectors().Search(b.vectorQuery, candidateK)
 	}
 
 	results := make([]Result, 0, b.limit)
 
-	for _, vecResult := range vectorResults {
+	for vecResult, err := range vecIter {
+		if err != nil {
+			return nil, fmt.Errorf("vector search failed: %w", err)
+		}
+
 		if b.threshold > 0 && vecResult.Score < b.threshold {
 			continue
 		}

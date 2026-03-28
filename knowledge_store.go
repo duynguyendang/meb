@@ -12,11 +12,42 @@ import (
 
 const TripleValueSize = 16
 
+// encodeTripleValue encodes a triple value with vector ID and content offset.
+// The upper 16 bits of contentOffset can carry semantic hints.
 func encodeTripleValue(vectorID, contentOffset uint64) []byte {
 	val := make([]byte, TripleValueSize)
 	binary.BigEndian.PutUint64(val[0:8], vectorID)
 	binary.BigEndian.PutUint64(val[8:16], contentOffset)
 	return val
+}
+
+// encodeTripleValueWithHints encodes a triple value with semantic hints packed into
+// the upper 16 bits of contentOffset. Lower 48 bits hold the actual offset.
+func encodeTripleValueWithHints(vectorID uint64, contentOffset uint64, hints uint16) []byte {
+	packed := (uint64(hints) << 48) | (contentOffset & ((1 << 48) - 1))
+	val := make([]byte, TripleValueSize)
+	binary.BigEndian.PutUint64(val[0:8], vectorID)
+	binary.BigEndian.PutUint64(val[8:16], packed)
+	return val
+}
+
+// ShouldPruneTriple reads semantic hints from a 16-byte triple value and returns true
+// if the triple should be pruned based on the requested entity type and public flag.
+func ShouldPruneTriple(value []byte, wantEntityType uint16, wantPublic bool) bool {
+	if len(value) < 16 {
+		return false
+	}
+	packed := binary.BigEndian.Uint64(value[8:16])
+	hints := uint16(packed >> 48)
+	entityType, _, flags := keys.DecodeSemanticHints(hints)
+
+	if wantEntityType > 0 && entityType != wantEntityType {
+		return true
+	}
+	if wantPublic && (flags&keys.FlagIsPublic) == 0 {
+		return true
+	}
+	return false
 }
 
 func (m *MEBStore) AddFact(fact Fact) error {
@@ -83,7 +114,14 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			}
 		}
 
-		value := encodeTripleValue(0, 0)
+		// Symmetric TopicID packing: both sID and oID use the same structure.
+		// This ensures SPO and OPS indices both achieve data locality per topic.
+		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+
+		// Encode semantic hints for the subject entity
+		hints := keys.EncodeSemanticHints(m.defaultEntityType, uint16(keys.HashSemanticName(fact.Subject)), m.defaultFlags)
+		value := encodeTripleValueWithHints(0, 0, hints)
 
 		spoKey := keys.EncodeTripleKey(keys.TripleSPOPrefix, sID, pID, oID)
 		if err := batch.Set(spoKey, value); err != nil {
@@ -121,9 +159,13 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 		return nil
 	}
 
+	// Pack with current topic for symmetric lookup
+	sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+
 	txn := m.db.NewTransaction(false)
 	defer txn.Discard()
 
+	// Use SPO prefix with full subject ID (all 3 args)
 	prefix := keys.EncodeTripleSPOPrefix(sID, 0, 0)
 	opts := badger.DefaultIteratorOptions
 	opts.PrefetchValues = false

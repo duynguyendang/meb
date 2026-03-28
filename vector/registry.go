@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
@@ -17,6 +19,7 @@ type Config struct {
 	NumWorkers      int
 	VectorCapacity  int
 	InitialCapacity int
+	MmapPath        string // Path for mmap file; empty = use in-memory
 }
 
 func DefaultConfig() *Config {
@@ -59,15 +62,18 @@ func (c *Config) TQConfig() *TurboQuantConfig {
 	}
 }
 
-// VectorRegistry holds TurboQuant compressed vectors in RAM for fast search.
-// Vectors are compressed to 4-bit or 8-bit blockwise quantization with full 1536 dimensions.
-// Full float32 vectors are persisted to BadgerDB for accurate retrieval.
+// VectorRegistry holds TurboQuant compressed vectors for fast search.
+// Uses memory-mapped file for data buffer when MmapPath is set,
+// letting the OS manage page eviction under memory pressure.
 type VectorRegistry struct {
 	config     *Config
 	tqConfig   *TurboQuantConfig
 	vectorSize int
 
-	data   []byte
+	data    []byte    // Points into mmap region or heap-allocated
+	dataLen int       // Current number of bytes used
+	mmap    *mmapFile // nil if using heap allocation
+
 	idMap  map[uint64]uint32
 	revMap []uint64
 
@@ -86,16 +92,60 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 
 	tqCfg := cfg.TQConfig()
 	vSize := TQVectorSize(cfg.FullDim, tqCfg)
+	capacity := cfg.VectorCapacity / vSize * vSize
+	if capacity < vSize {
+		capacity = vSize
+	}
 
-	return &VectorRegistry{
+	r := &VectorRegistry{
 		config:     cfg,
 		tqConfig:   tqCfg,
 		vectorSize: vSize,
-		data:       make([]byte, 0, cfg.VectorCapacity/vSize*vSize),
 		idMap:      make(map[uint64]uint32, cfg.InitialCapacity),
 		revMap:     make([]uint64, 0, cfg.InitialCapacity),
 		db:         db,
 	}
+
+	if cfg.MmapPath != "" {
+		os.MkdirAll(filepath.Dir(cfg.MmapPath), 0755)
+		mf, err := newMmapFile(cfg.MmapPath, capacity)
+		if err != nil {
+			slog.Warn("failed to create mmap, falling back to heap", "error", err)
+			r.data = make([]byte, 0, capacity)
+		} else {
+			r.mmap = mf
+			r.data = mf.data[:0] // Empty slice pointing into mmap region
+		}
+	} else {
+		r.data = make([]byte, 0, capacity)
+	}
+
+	return r
+}
+
+func (r *VectorRegistry) ensureCapacity(needed int) error {
+	currentCap := cap(r.data)
+	if r.dataLen+needed <= currentCap {
+		return nil
+	}
+
+	newCap := currentCap * 2
+	for newCap < r.dataLen+needed {
+		newCap *= 2
+	}
+
+	if r.mmap != nil {
+		if err := r.mmap.grow(newCap); err != nil {
+			return fmt.Errorf("failed to grow mmap: %w", err)
+		}
+		r.data = r.mmap.data[:r.dataLen]
+	} else {
+		newData := make([]byte, r.dataLen, newCap)
+		copy(newData, r.data[:r.dataLen])
+		r.data = newData
+	}
+
+	return nil
 }
 
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
@@ -111,10 +161,16 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 		copy(r.data[dstOffset:dstOffset+r.vectorSize], tqData)
 		r.mu.Unlock()
 	} else {
+		if err := r.ensureCapacity(r.vectorSize); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+
 		idx := uint32(len(r.revMap))
 		r.idMap[id] = idx
 		r.revMap = append(r.revMap, id)
-		r.data = append(r.data, tqData...)
+		r.data = append(r.data[:r.dataLen], tqData...)
+		r.dataLen += r.vectorSize
 		r.mu.Unlock()
 	}
 
@@ -144,6 +200,9 @@ func (r *VectorRegistry) Count() int {
 
 func (r *VectorRegistry) Close() error {
 	r.wg.Wait()
+	if r.mmap != nil {
+		return r.mmap.close()
+	}
 	return nil
 }
 
@@ -170,7 +229,7 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 
 	r.revMap = r.revMap[:lastIdx]
 	delete(r.idMap, id)
-	r.data = r.data[:len(r.data)-r.vectorSize]
+	r.dataLen -= r.vectorSize
 
 	return true
 }
@@ -231,8 +290,14 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	numVectors := len(r.revMap)
 	slog.Info("saving TQ vector snapshot",
 		"vectorCount", numVectors,
-		"dataSizeBytes", len(r.data),
+		"dataSizeBytes", r.dataLen,
 	)
+
+	if r.mmap != nil {
+		if err := r.mmap.sync(); err != nil {
+			slog.Warn("mmap sync failed", "error", err)
+		}
+	}
 
 	idsBytes := make([]byte, len(r.revMap)*8)
 	for i, id := range r.revMap {
@@ -242,7 +307,7 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	batch := r.db.NewWriteBatch()
 	defer batch.Cancel()
 
-	if err := batch.Set([]byte("sys:tq:vectors"), r.data); err != nil {
+	if err := batch.Set([]byte("sys:tq:vectors"), r.data[:r.dataLen]); err != nil {
 		return fmt.Errorf("failed to save TQ vectors: %w", err)
 	}
 	if err := batch.Set([]byte("sys:tq:ids"), idsBytes); err != nil {
@@ -309,7 +374,14 @@ func (r *VectorRegistry) LoadSnapshot() error {
 	}
 
 	numVectors := len(vectorsBytes) / r.vectorSize
-	r.data = vectorsBytes
+
+	// Ensure mmap has enough capacity
+	if err := r.ensureCapacity(len(vectorsBytes)); err != nil {
+		return fmt.Errorf("failed to ensure capacity for snapshot: %w", err)
+	}
+
+	copy(r.data[:len(vectorsBytes)], vectorsBytes)
+	r.dataLen = len(vectorsBytes)
 
 	r.revMap = make([]uint64, numVectors)
 	for i := 0; i < numVectors; i++ {

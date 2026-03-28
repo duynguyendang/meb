@@ -31,6 +31,13 @@ type MEBStore struct {
 	vectors *vector.VectorRegistry
 	breaker *circuit.Breaker
 
+	// TopicID for symmetric bit-packing (24-bit, supports 16M topics)
+	topicID uint32
+
+	// Default semantic hints applied to facts (can be overridden per fact)
+	defaultEntityType uint16
+	defaultFlags      uint16
+
 	lastGCTime   time.Time
 	factsSinceGC uint64
 }
@@ -103,12 +110,14 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	}
 
 	m := &MEBStore{
-		db:      db,
-		dictDB:  dictDB,
-		dict:    dictEncoder,
-		config:  cfg,
-		vectors: vector.NewRegistry(db, nil),
-		breaker: circuit.NewBreaker(nil),
+		db:                db,
+		dictDB:            dictDB,
+		dict:              dictEncoder,
+		config:            cfg,
+		vectors:           vector.NewRegistry(db, nil),
+		breaker:           circuit.NewBreaker(nil),
+		topicID:           1, // default topic
+		defaultEntityType: keys.EntityUnknown,
 	}
 
 	if err := m.vectors.LoadSnapshot(); err != nil {
@@ -246,6 +255,30 @@ func (m *MEBStore) Vectors() *vector.VectorRegistry {
 
 func (m *MEBStore) Find() *Builder {
 	return NewBuilder(m)
+}
+
+// SetTopicID sets the 24-bit topic ID for symmetric bit-packing.
+// All facts added after this call will use the new topic ID.
+// Supports up to 16M isolated namespaces (topics).
+func (m *MEBStore) SetTopicID(topicID uint32) {
+	m.topicID = topicID & 0xFFFFFF // clamp to 24 bits
+}
+
+// TopicID returns the current topic ID.
+func (m *MEBStore) TopicID() uint32 {
+	return m.topicID
+}
+
+// SetDefaultEntityType sets the default entity type for semantic hints.
+// Use keys.EntityFunc, EntityVar, EntityClass, etc.
+func (m *MEBStore) SetDefaultEntityType(entityType uint16) {
+	m.defaultEntityType = entityType & 0xF
+}
+
+// SetDefaultFlags sets the default flags for semantic hints.
+// Use keys.FlagIsPublic, FlagIsDeprecated, FlagIsTest, FlagIsGenerated.
+func (m *MEBStore) SetDefaultFlags(flags uint16) {
+	m.defaultFlags = flags & 0xF
 }
 
 func (m *MEBStore) RunValueLogGC(ratio float64) error {
