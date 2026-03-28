@@ -1,9 +1,10 @@
 package vector
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
@@ -11,7 +12,8 @@ import (
 
 type Config struct {
 	FullDim         int
-	MRLDim          int
+	TQBitWidth      int
+	TQBlockSize     int
 	NumWorkers      int
 	VectorCapacity  int
 	InitialCapacity int
@@ -20,7 +22,8 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		FullDim:         1536,
-		MRLDim:          64,
+		TQBitWidth:      8,
+		TQBlockSize:     32,
 		NumWorkers:      4,
 		VectorCapacity:  25 * 1024 * 1024,
 		InitialCapacity: 100000,
@@ -31,8 +34,11 @@ func (c *Config) Validate() error {
 	if c.FullDim <= 0 {
 		return fmt.Errorf("FullDim must be positive")
 	}
-	if c.MRLDim <= 0 || c.MRLDim > c.FullDim {
-		return fmt.Errorf("MRLDim must be positive and <= FullDim")
+	if c.TQBitWidth != 4 && c.TQBitWidth != 8 {
+		return fmt.Errorf("TQBitWidth must be 4 or 8")
+	}
+	if c.TQBlockSize <= 0 || c.TQBlockSize%8 != 0 {
+		return fmt.Errorf("TQBlockSize must be positive and divisible by 8")
 	}
 	if c.NumWorkers <= 0 {
 		return fmt.Errorf("NumWorkers must be positive")
@@ -46,44 +52,30 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// VectorRegistry holds compressed MRL vectors in RAM for fast search.
-// Vectors are scalar-quantized to int8 (75% memory reduction vs float32).
-// Full vectors are persisted to BadgerDB for potential retrieval.
+func (c *Config) TQConfig() *TurboQuantConfig {
+	return &TurboQuantConfig{
+		BitWidth:  c.TQBitWidth,
+		BlockSize: c.TQBlockSize,
+	}
+}
+
+// VectorRegistry holds TurboQuant compressed vectors in RAM for fast search.
+// Vectors are compressed to 4-bit or 8-bit blockwise quantization with full 1536 dimensions.
+// Full float32 vectors are persisted to BadgerDB for accurate retrieval.
 type VectorRegistry struct {
-	// config holds the vector configuration
-	config *Config
+	config     *Config
+	tqConfig   *TurboQuantConfig
+	vectorSize int
 
-	// data is a FLAT BUFFER storing all MRL-dim int8 vectors contiguously.
-	// Size = NumVectors * MRLDim bytes
-	// Vector[i] corresponds to data[i*MRLDim : (i+1)*MRLDim]
-	// Pre-allocated with large capacity to avoid frequent slice growing.
-	data []int8
-
-	// pqData is a FLAT BUFFER storing all PQ-encoded vectors.
-	// Size = NumVectors * PQCodeSize bytes
-	pqData []byte
-
-	// pqCodebook is the trained PQ codebook used for quantization
-	pqCodebook *PQCodebook
-
-	// idMap maps GraphID -> Internal Index (uint32)
-	idMap map[uint64]uint32
-
-	// revMap maps Internal Index -> GraphID
+	data   []byte
+	idMap  map[uint64]uint32
 	revMap []uint64
 
-	// db is the BadgerDB instance for persistence
 	db *badger.DB
-
-	// mu protects concurrent access to the registry
 	mu sync.RWMutex
-
-	// wg tracks async disk write operations
 	wg sync.WaitGroup
 }
 
-// NewRegistry creates a new VectorRegistry with the given configuration.
-// If cfg is nil, uses DefaultConfig().
 func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -92,100 +84,69 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 		panic(fmt.Sprintf("invalid vector config: %v", err))
 	}
 
+	tqCfg := cfg.TQConfig()
+	vSize := TQVectorSize(cfg.FullDim, tqCfg)
+
 	return &VectorRegistry{
 		config:     cfg,
-		data:       make([]int8, 0, cfg.VectorCapacity),
-		pqData:     make([]byte, 0, cfg.VectorCapacity/8),
-		pqCodebook: NewPQCodebook(),
+		tqConfig:   tqCfg,
+		vectorSize: vSize,
+		data:       make([]byte, 0, cfg.VectorCapacity/vSize*vSize),
 		idMap:      make(map[uint64]uint32, cfg.InitialCapacity),
 		revMap:     make([]uint64, 0, cfg.InitialCapacity),
 		db:         db,
 	}
 }
 
-// Add adds a full vector to the registry.
-// The compressed MRL version is scalar-quantized to int8 and stored in RAM,
-// and the full vector is asynchronously persisted to disk.
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 	if len(fullVec) != r.config.FullDim {
-		slog.Error("invalid vector dimension",
-			"id", id,
-			"expected", r.config.FullDim,
-			"got", len(fullVec),
-		)
 		return fmt.Errorf("invalid vector dimension: expected %d, got %d", r.config.FullDim, len(fullVec))
 	}
 
-	// Process to get MRL vector (normalized)
-	mrlVec := ProcessMRL(fullVec, r.config.MRLDim)
-
-	// Quantize to int8 for efficient storage
-	quantized := Quantize(mrlVec)
-
-	// Encode to PQ if trained
-	var pqCoded []byte
-	r.mu.RLock()
-	if r.pqCodebook.Trained {
-		pqCoded = r.pqCodebook.Encode(mrlVec)
-	} else {
-		pqCoded = make([]byte, PQCodeSize)
-	}
-	r.mu.RUnlock()
+	tqData := QuantizeTurboQuant(fullVec, r.tqConfig)
 
 	r.mu.Lock()
-
-	// Check if ID already exists
 	if idx, exists := r.idMap[id]; exists {
-		// Overwrite existing vector in place
-		mrlDim := r.config.MRLDim
-		idxInt := int(idx)
-		copy(r.data[idxInt*mrlDim:(idxInt+1)*mrlDim], quantized)
-		copy(r.pqData[idxInt*PQCodeSize:(idxInt+1)*PQCodeSize], pqCoded)
+		dstOffset := int(idx) * r.vectorSize
+		copy(r.data[dstOffset:dstOffset+r.vectorSize], tqData)
 		r.mu.Unlock()
-		slog.Debug("vector updated",
-			"id", id,
-			"index", idx,
-		)
 	} else {
-		// Append new vector
 		idx := uint32(len(r.revMap))
 		r.idMap[id] = idx
 		r.revMap = append(r.revMap, id)
-		r.data = append(r.data, quantized...)
-		r.pqData = append(r.pqData, pqCoded...)
+		r.data = append(r.data, tqData...)
 		r.mu.Unlock()
-		slog.Debug("vector added",
-			"id", id,
-			"index", idx,
-			"totalVectors", len(r.revMap),
-		)
 	}
 
-	// Async disk write for full vector
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.persistFullVector(id, fullVec)
+		key := make([]byte, 1+8)
+		key[0] = 0x10
+		binary.BigEndian.PutUint64(key[1:9], id)
+		value := make([]byte, r.config.FullDim*4)
+		for i, v := range fullVec {
+			binary.LittleEndian.PutUint32(value[i*4:(i+1)*4], math.Float32bits(v))
+		}
+		_ = r.db.Update(func(txn *badger.Txn) error {
+			return txn.Set(key, value)
+		})
 	}()
 
 	return nil
 }
 
-// Count returns the number of vectors in the registry.
 func (r *VectorRegistry) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.revMap)
 }
 
-// Close waits for all async operations to complete.
 func (r *VectorRegistry) Close() error {
 	r.wg.Wait()
 	return nil
 }
 
-// Delete removes a vector from the registry by ID.
-// Returns true if the vector was found and deleted, false if not found.
 func (r *VectorRegistry) Delete(id uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -202,27 +163,18 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		r.revMap[idx] = lastID
 		r.idMap[lastID] = idx
 
-		mrlDim := r.config.MRLDim
-		srcOffset := int(lastIdx) * mrlDim
-		dstOffset := int(idx) * mrlDim
-		copy(r.data[dstOffset:dstOffset+mrlDim], r.data[srcOffset:srcOffset+mrlDim])
-
-		srcPqOffset := int(lastIdx) * PQCodeSize
-		dstPqOffset := int(idx) * PQCodeSize
-		copy(r.pqData[dstPqOffset:dstPqOffset+PQCodeSize], r.pqData[srcPqOffset:srcPqOffset+PQCodeSize])
+		srcOffset := int(lastIdx) * r.vectorSize
+		dstOffset := int(idx) * r.vectorSize
+		copy(r.data[dstOffset:dstOffset+r.vectorSize], r.data[srcOffset:srcOffset+r.vectorSize])
 	}
 
 	r.revMap = r.revMap[:lastIdx]
 	delete(r.idMap, id)
-	r.data = r.data[:len(r.data)-r.config.MRLDim]
-	r.pqData = r.pqData[:len(r.pqData)-PQCodeSize]
-
-	slog.Debug("vector deleted", "id", id, "remaining", len(r.revMap))
+	r.data = r.data[:len(r.data)-r.vectorSize]
 
 	return true
 }
 
-// HasVector checks if a vector exists for the given ID.
 func (r *VectorRegistry) HasVector(id uint64) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -230,84 +182,149 @@ func (r *VectorRegistry) HasVector(id uint64) bool {
 	return exists
 }
 
-// TrainPQ trains the PQ codebook using randomly sampled vectors and encodes all existing vectors.
-func (r *VectorRegistry) TrainPQ(sampleSize int) error {
-	r.mu.RLock()
-	numVectors := len(r.revMap)
-	r.mu.RUnlock()
-
-	if numVectors < PQKClusters*10 {
-		return fmt.Errorf("not enough vectors to train PQ (need at least %d, have %d)", PQKClusters*10, numVectors)
+func (r *VectorRegistry) GetTQVector(idx int) []byte {
+	if idx < 0 || idx >= len(r.revMap) {
+		return nil
 	}
+	offset := idx * r.vectorSize
+	return r.data[offset : offset+r.vectorSize]
+}
 
-	if sampleSize > numVectors {
-		sampleSize = numVectors
-	}
-	if sampleSize < PQKClusters*10 {
-		sampleSize = PQKClusters * 10
-	}
+func (r *VectorRegistry) TQConfig() *TurboQuantConfig {
+	return r.tqConfig
+}
 
-	slog.Info("training PQ codebook", "numVectors", numVectors, "sampleSize", sampleSize)
+func (r *VectorRegistry) VectorSize() int {
+	return r.vectorSize
+}
 
-	r.mu.RLock()
-	// Pick random unique indices
-	indices := rand.Perm(numVectors)
-	if len(indices) > sampleSize {
-		indices = indices[:sampleSize]
-	}
+func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
+	key := make([]byte, 1+8)
+	key[0] = 0x10
+	binary.BigEndian.PutUint64(key[1:9], id)
 
-	samples := make([][]float32, 0, len(indices))
-	idsToSample := make([]uint64, len(indices))
-	for i, idx := range indices {
-		idsToSample[i] = r.revMap[idx]
-	}
-	r.mu.RUnlock()
-
-	for _, id := range idsToSample {
-		fullVec, err := r.GetFullVector(id)
+	var fullVec []float32
+	fullDim := r.config.FullDim
+	err := r.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
 		if err != nil {
-			continue // skip missing
+			return err
 		}
-		mrlVec := ProcessMRL(fullVec, r.config.MRLDim)
-		samples = append(samples, mrlVec)
-	}
+		return item.Value(func(val []byte) error {
+			fullVec = make([]float32, fullDim)
+			for i := 0; i < fullDim; i++ {
+				bits := binary.LittleEndian.Uint32(val[i*4 : (i+1)*4])
+				fullVec[i] = math.Float32frombits(bits)
+			}
+			return nil
+		})
+	})
 
-	if len(samples) < PQKClusters*10 {
-		return fmt.Errorf("failed to load enough samples for PQ training")
-	}
+	return fullVec, err
+}
 
-	// Train external codebook first
-	newCodebook := NewPQCodebook()
-	newCodebook.Train(samples)
-
-	if !newCodebook.Trained {
-		return fmt.Errorf("PQ training failed internally")
-	}
-
-	// Now encode all vectors
-	slog.Info("encoding all vectors with trained PQ codebook")
-	r.mu.RLock()
-	mrlDim := r.config.MRLDim
-	allVectors := make([][]float32, numVectors)
-	for i := 0; i < numVectors; i++ {
-		offset := i * mrlDim
-		allVectors[i] = Dequantize(r.data[offset : offset+mrlDim])
-	}
-	r.mu.RUnlock()
-
-	newPqData := make([]byte, numVectors*PQCodeSize)
-	for i, vec := range allVectors {
-		code := newCodebook.Encode(vec)
-		offset := i * PQCodeSize
-		copy(newPqData[offset:offset+PQCodeSize], code)
-	}
-
-	// Swap in the new codebook and data
+func (r *VectorRegistry) SaveSnapshot() error {
+	r.wg.Wait()
 	r.mu.Lock()
-	r.pqCodebook = newCodebook
-	r.pqData = newPqData
-	r.mu.Unlock()
+	defer r.mu.Unlock()
 
-	slog.Info("PQ training complete")
+	numVectors := len(r.revMap)
+	slog.Info("saving TQ vector snapshot",
+		"vectorCount", numVectors,
+		"dataSizeBytes", len(r.data),
+	)
+
+	idsBytes := make([]byte, len(r.revMap)*8)
+	for i, id := range r.revMap {
+		binary.BigEndian.PutUint64(idsBytes[i*8:(i+1)*8], id)
+	}
+
+	batch := r.db.NewWriteBatch()
+	defer batch.Cancel()
+
+	if err := batch.Set([]byte("sys:tq:vectors"), r.data); err != nil {
+		return fmt.Errorf("failed to save TQ vectors: %w", err)
+	}
+	if err := batch.Set([]byte("sys:tq:ids"), idsBytes); err != nil {
+		return fmt.Errorf("failed to save TQ ids: %w", err)
+	}
+
+	if err := batch.Flush(); err != nil {
+		return err
+	}
+
+	slog.Info("TQ vector snapshot saved", "vectorCount", numVectors)
+	return nil
+}
+
+func (r *VectorRegistry) LoadSnapshot() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slog.Info("loading TQ vector snapshot")
+
+	var vectorsBytes, idsBytes []byte
+
+	err := r.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte("sys:tq:vectors"))
+		if err != nil {
+			if err == badger.ErrKeyNotFound {
+				slog.Info("no existing TQ vector snapshot found")
+				return nil
+			}
+			return fmt.Errorf("failed to load TQ vectors: %w", err)
+		}
+		if err := item.Value(func(val []byte) error {
+			vectorsBytes = make([]byte, len(val))
+			copy(vectorsBytes, val)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		item, err = txn.Get([]byte("sys:tq:ids"))
+		if err != nil {
+			if err == badger.ErrKeyNotFound {
+				return nil
+			}
+			return fmt.Errorf("failed to load TQ ids: %w", err)
+		}
+		if err := item.Value(func(val []byte) error {
+			idsBytes = make([]byte, len(val))
+			copy(idsBytes, val)
+			return nil
+		}); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if vectorsBytes == nil || idsBytes == nil {
+		return nil
+	}
+
+	numVectors := len(vectorsBytes) / r.vectorSize
+	r.data = vectorsBytes
+
+	r.revMap = make([]uint64, numVectors)
+	for i := 0; i < numVectors; i++ {
+		r.revMap[i] = binary.BigEndian.Uint64(idsBytes[i*8 : (i+1)*8])
+	}
+
+	r.idMap = make(map[uint64]uint32, numVectors)
+	for idx, id := range r.revMap {
+		r.idMap[id] = uint32(idx)
+	}
+
+	slog.Info("TQ vector snapshot loaded",
+		"vectorCount", numVectors,
+		"vectorSize", r.vectorSize,
+	)
+
 	return nil
 }

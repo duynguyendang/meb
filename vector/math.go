@@ -4,25 +4,9 @@ import (
 	"math"
 )
 
-const (
-	FullDim = 1536
-	MRLDim  = 64
-)
+const FullDim = 1536
 
-func ProcessMRL(fullVec []float32, mrlDim int) []float32 {
-	if len(fullVec) < mrlDim {
-		result := make([]float32, mrlDim)
-		copy(result, fullVec)
-		return l2Normalize(result)
-	}
-
-	result := make([]float32, mrlDim)
-	copy(result, fullVec[:mrlDim])
-
-	return l2Normalize(result)
-}
-
-func l2Normalize(vec []float32) []float32 {
+func L2Normalize(vec []float32) []float32 {
 	var sumSquares float32
 	for _, v := range vec {
 		sumSquares += v * v
