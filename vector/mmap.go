@@ -16,7 +16,9 @@ type mmapSegment struct {
 
 // newMmapSegment creates a new mmap segment file of the given size.
 func newMmapSegment(dir string, index int, size int) (*mmapSegment, error) {
-	os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create segment directory: %w", err)
+	}
 
 	path := filepath.Join(dir, fmt.Sprintf("vectors.%d.tq", index))
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)

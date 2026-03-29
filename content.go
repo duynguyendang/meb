@@ -131,7 +131,7 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 	}
 
 	// Pack TopicID into subject ID — facts are stored with packed IDs
-	packedID := keys.PackID(m.topicID, keys.UnpackLocalID(id))
+	packedID := keys.PackID(m.topicID.Load(), keys.UnpackLocalID(id))
 	metadataPrefix := keys.EncodeTripleSPOPrefix(packedID, 0, 0)
 
 	var deletedCount uint64
@@ -196,7 +196,7 @@ func (m *MEBStore) HasDocument(docKey string) (bool, error) {
 		return true, nil
 	}
 
-	metadataPrefix := keys.EncodeTripleSPOPrefix(keys.PackID(m.topicID, keys.UnpackLocalID(id)), 0, 0)
+	metadataPrefix := keys.EncodeTripleSPOPrefix(keys.PackID(m.topicID.Load(), keys.UnpackLocalID(id)), 0, 0)
 	var hasMetadata bool
 	if err := m.withReadTxn(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)

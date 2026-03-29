@@ -188,9 +188,11 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		for i, v := range fullVec {
 			binary.LittleEndian.PutUint32(value[i*4:(i+1)*4], math.Float32bits(v))
 		}
-		_ = r.db.Update(func(txn *badger.Txn) error {
+		if err := r.db.Update(func(txn *badger.Txn) error {
 			return txn.Set(key, value)
-		})
+		}); err != nil {
+			slog.Error("failed to persist full vector to BadgerDB", "id", id, "error", err)
+		}
 	}()
 
 	return nil
@@ -292,6 +294,10 @@ func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
 	return fullVec, err
 }
 
+// snapshotChunkSize is the maximum number of vectors per snapshot chunk key.
+// This avoids allocating one giant contiguous buffer for all vectors.
+const snapshotChunkSize = 10000
+
 func (r *VectorRegistry) SaveSnapshot() error {
 	r.wg.Wait()
 	r.mu.Lock()
@@ -310,27 +316,49 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		}
 	}
 
-	// Serialize all vectors from segments into a contiguous byte slice
-	totalBytes := r.totalVectors * r.vectorSize
-	vectorsBytes := make([]byte, totalBytes)
-	for i := 0; i < r.totalVectors; i++ {
-		slot := r.getVectorSlice(i)
-		copy(vectorsBytes[i*r.vectorSize:(i+1)*r.vectorSize], slot)
-	}
-
-	idsBytes := make([]byte, len(r.revMap)*8)
-	for i, id := range r.revMap {
-		binary.BigEndian.PutUint64(idsBytes[i*8:(i+1)*8], id)
-	}
-
 	batch := r.db.NewWriteBatch()
 	defer batch.Cancel()
 
-	if err := batch.Set([]byte("sys:tq:vectors"), vectorsBytes); err != nil {
-		return fmt.Errorf("failed to save TQ vectors: %w", err)
+	// Save vectors in chunked keys to avoid a single giant allocation
+	for start := 0; start < numVectors; start += snapshotChunkSize {
+		end := start + snapshotChunkSize
+		if end > numVectors {
+			end = numVectors
+		}
+		chunkBytes := (end - start) * r.vectorSize
+		buf := make([]byte, chunkBytes)
+		for i := start; i < end; i++ {
+			slot := r.getVectorSlice(i)
+			off := (i - start) * r.vectorSize
+			copy(buf[off:off+r.vectorSize], slot)
+		}
+		key := fmt.Appendf(nil, "sys:tq:vectors:%d", start/snapshotChunkSize)
+		if err := batch.Set(key, buf); err != nil {
+			return fmt.Errorf("failed to save TQ vector chunk %d: %w", start/snapshotChunkSize, err)
+		}
 	}
-	if err := batch.Set([]byte("sys:tq:ids"), idsBytes); err != nil {
-		return fmt.Errorf("failed to save TQ ids: %w", err)
+
+	// Save IDs in chunked keys
+	for start := 0; start < numVectors; start += snapshotChunkSize {
+		end := start + snapshotChunkSize
+		if end > numVectors {
+			end = numVectors
+		}
+		idsBytes := make([]byte, (end-start)*8)
+		for i := start; i < end; i++ {
+			binary.BigEndian.PutUint64(idsBytes[(i-start)*8:(i-start+1)*8], r.revMap[i])
+		}
+		key := fmt.Appendf(nil, "sys:tq:ids:%d", start/snapshotChunkSize)
+		if err := batch.Set(key, idsBytes); err != nil {
+			return fmt.Errorf("failed to save TQ id chunk %d: %w", start/snapshotChunkSize, err)
+		}
+	}
+
+	// Save metadata: total count
+	metaBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(metaBuf, uint64(numVectors))
+	if err := batch.Set([]byte("sys:tq:meta"), metaBuf); err != nil {
+		return fmt.Errorf("failed to save TQ snapshot meta: %w", err)
 	}
 
 	if err := batch.Flush(); err != nil {
@@ -347,44 +375,144 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 	slog.Info("loading TQ vector snapshot")
 
-	var vectorsBytes, idsBytes []byte
+	// Try chunked format first, fall back to legacy single-key format
+	var numVectors int
 
 	err := r.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte("sys:tq:vectors"))
-		if err != nil {
-			if err == badger.ErrKeyNotFound {
-				slog.Info("no existing TQ vector snapshot found")
-				return nil
-			}
-			return fmt.Errorf("failed to load TQ vectors: %w", err)
+		// Check for new chunked format metadata
+		metaItem, err := txn.Get([]byte("sys:tq:meta"))
+		if err == nil {
+			// New chunked format
+			return r.loadChunkedSnapshot(txn, metaItem)
 		}
-		if err := item.Value(func(val []byte) error {
-			vectorsBytes = make([]byte, len(val))
-			copy(vectorsBytes, val)
-			return nil
-		}); err != nil {
-			return err
+		if err != badger.ErrKeyNotFound {
+			return fmt.Errorf("failed to load TQ snapshot meta: %w", err)
 		}
 
-		item, err = txn.Get([]byte("sys:tq:ids"))
-		if err != nil {
-			if err == badger.ErrKeyNotFound {
-				return nil
-			}
-			return fmt.Errorf("failed to load TQ ids: %w", err)
-		}
-		if err := item.Value(func(val []byte) error {
-			idsBytes = make([]byte, len(val))
-			copy(idsBytes, val)
-			return nil
-		}); err != nil {
-			return err
-		}
-
-		return nil
+		// Legacy single-key format
+		return r.loadLegacySnapshot(txn)
 	})
 
 	if err != nil {
+		return err
+	}
+
+	if numVectors > 0 {
+		slog.Info("TQ vector snapshot loaded",
+			"vectorCount", numVectors,
+			"vectorSize", r.vectorSize,
+		)
+	}
+
+	return nil
+}
+
+func (r *VectorRegistry) loadChunkedSnapshot(txn *badger.Txn, metaItem *badger.Item) error {
+	var numTotal uint64
+	if err := metaItem.Value(func(val []byte) error {
+		numTotal = binary.BigEndian.Uint64(val)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to read snapshot meta: %w", err)
+	}
+
+	numVectors := int(numTotal)
+	if numVectors == 0 {
+		return nil
+	}
+
+	if err := r.ensureCapacity(numVectors); err != nil {
+		return fmt.Errorf("failed to ensure capacity for snapshot: %w", err)
+	}
+
+	// Load vector data chunks
+	vecIdx := 0
+	for chunkIdx := 0; ; chunkIdx++ {
+		key := fmt.Appendf(nil, "sys:tq:vectors:%d", chunkIdx)
+		item, err := txn.Get(key)
+		if err == badger.ErrKeyNotFound {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to load TQ vector chunk %d: %w", chunkIdx, err)
+		}
+		if err := item.Value(func(val []byte) error {
+			chunkVecs := len(val) / r.vectorSize
+			for i := 0; i < chunkVecs; i++ {
+				slot := r.getVectorSlice(vecIdx)
+				copy(slot, val[i*r.vectorSize:(i+1)*r.vectorSize])
+				vecIdx++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	r.totalVectors = numVectors
+
+	// Load ID chunks
+	r.revMap = make([]uint64, numVectors)
+	idIdx := 0
+	for chunkIdx := 0; ; chunkIdx++ {
+		key := fmt.Appendf(nil, "sys:tq:ids:%d", chunkIdx)
+		item, err := txn.Get(key)
+		if err == badger.ErrKeyNotFound {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to load TQ id chunk %d: %w", chunkIdx, err)
+		}
+		if err := item.Value(func(val []byte) error {
+			chunkIDs := len(val) / 8
+			for i := 0; i < chunkIDs; i++ {
+				r.revMap[idIdx] = binary.BigEndian.Uint64(val[i*8 : (i+1)*8])
+				idIdx++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	r.idMap = make(map[uint64]uint32, numVectors)
+	for idx, id := range r.revMap {
+		r.idMap[id] = uint32(idx)
+	}
+
+	return nil
+}
+
+func (r *VectorRegistry) loadLegacySnapshot(txn *badger.Txn) error {
+	var vectorsBytes, idsBytes []byte
+
+	item, err := txn.Get([]byte("sys:tq:vectors"))
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			slog.Info("no existing TQ vector snapshot found")
+			return nil
+		}
+		return fmt.Errorf("failed to load TQ vectors: %w", err)
+	}
+	if err := item.Value(func(val []byte) error {
+		vectorsBytes = make([]byte, len(val))
+		copy(vectorsBytes, val)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	item, err = txn.Get([]byte("sys:tq:ids"))
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		return fmt.Errorf("failed to load TQ ids: %w", err)
+	}
+	if err := item.Value(func(val []byte) error {
+		idsBytes = make([]byte, len(val))
+		copy(idsBytes, val)
+		return nil
+	}); err != nil {
 		return err
 	}
 
@@ -394,12 +522,10 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 	numVectors := len(vectorsBytes) / r.vectorSize
 
-	// Allocate enough segments to hold all vectors
 	if err := r.ensureCapacity(numVectors); err != nil {
 		return fmt.Errorf("failed to ensure capacity for snapshot: %w", err)
 	}
 
-	// Copy snapshot data into segments
 	for i := 0; i < numVectors; i++ {
 		slot := r.getVectorSlice(i)
 		copy(slot, vectorsBytes[i*r.vectorSize:(i+1)*r.vectorSize])
@@ -416,7 +542,7 @@ func (r *VectorRegistry) LoadSnapshot() error {
 		r.idMap[id] = uint32(idx)
 	}
 
-	slog.Info("TQ vector snapshot loaded",
+	slog.Info("TQ vector snapshot loaded (legacy format)",
 		"vectorCount", numVectors,
 		"vectorSize", r.vectorSize,
 	)

@@ -165,10 +165,10 @@ func DequantizeTurboQuant(data []byte, dim int, cfg *TurboQuantConfig) []float32
 			offset += blockSize - (end - start)
 		case 4:
 			for i := start; i < end; i += 2 {
-				b := data[offset]
-				vec[i] = float32(b>>4)*scale + zero
+				packed := data[offset]
+				vec[i] = float32(packed>>4)*scale + zero
 				if i+1 < end {
-					vec[i+1] = float32(b&0x0F)*scale + zero
+					vec[i+1] = float32(packed&0x0F)*scale + zero
 				}
 				offset++
 			}
@@ -179,8 +179,9 @@ func DequantizeTurboQuant(data []byte, dim int, cfg *TurboQuantConfig) []float32
 	return vec
 }
 
-// DotProductTurboQuant computes cosine similarity between two TQ-compressed vectors
+// DotProductTurboQuant computes the dot product between two TQ-compressed vectors
 // using blockwise dot product without full dequantization.
+// For cosine similarity, vectors must be L2-normalized before quantization.
 func DotProductTurboQuant(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
 	if cfg == nil {
 		cfg = DefaultTurboQuantConfig()

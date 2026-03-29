@@ -25,9 +25,42 @@ const (
 	PredicateContains PredicateFilterType = "contains"
 )
 
+// NumericRange represents a closed [Min, Max] numeric range for PredicateRange filters.
+type NumericRange struct {
+	Min float64
+	Max float64
+}
+
 type PredicateFilter struct {
-	Type  PredicateFilterType
-	Value interface{}
+	Type      PredicateFilterType
+	Value     interface{} // string for regex/contains; float64 for gt/lt/gte/lte; NumericRange for range
+	compiled  *regexp.Regexp
+}
+
+// NewPredicateFilter creates a PredicateFilter, pre-compiling regex patterns.
+func NewPredicateFilter(filterType PredicateFilterType, value interface{}) (*PredicateFilter, error) {
+	f := &PredicateFilter{Type: filterType, Value: value}
+	if filterType == PredicateRegex {
+		pattern, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("regex filter value must be a string")
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid regex pattern %q: %w", pattern, err)
+		}
+		f.compiled = re
+	}
+	return f, nil
+}
+
+// MustPredicateFilter creates a PredicateFilter, panicking on invalid input.
+func MustPredicateFilter(filterType PredicateFilterType, value interface{}) *PredicateFilter {
+	f, err := NewPredicateFilter(filterType, value)
+	if err != nil {
+		panic(err)
+	}
+	return f
 }
 
 type scanStrategy struct {
@@ -120,12 +153,10 @@ type scanOptions struct {
 func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
 	switch filter.Type {
 	case PredicateRegex:
-		pattern, ok := filter.Value.(string)
-		if !ok {
-			return false
+		if filter.compiled != nil {
+			return filter.compiled.MatchString(objValue)
 		}
-		matched, err := regexp.MatchString(pattern, objValue)
-		return err == nil && matched
+		return false
 
 	case PredicateContains:
 		substr, ok := filter.Value.(string)
@@ -159,11 +190,11 @@ func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
 		if err != nil {
 			return false
 		}
-		rangeVals, ok := filter.Value.([2]float64)
-		if !ok || len(rangeVals) != 2 {
+		rangeVals, ok := filter.Value.(NumericRange)
+		if !ok {
 			return false
 		}
-		return objNum >= rangeVals[0] && objNum <= rangeVals[1]
+		return objNum >= rangeVals.Min && objNum <= rangeVals.Max
 	}
 	return false
 }
@@ -177,10 +208,10 @@ func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o string) (
 	// Pack sID and oID with current topicID for symmetric key lookup.
 	// Keys in BadgerDB are stored with topic-packed IDs.
 	if sBound {
-		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
 	}
 	if oBound {
-		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+		oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
 	}
 
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)

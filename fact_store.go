@@ -98,10 +98,10 @@ func (m *MEBStore) Exists(s, p, o string) bool {
 
 	// Pack IDs with current topic for symmetric lookup
 	if sBound {
-		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
 	}
 	if oBound {
-		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+		oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
 	}
 
 	prefix := keys.EncodeTripleSPOPrefix(sID, pID, oID)

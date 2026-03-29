@@ -151,14 +151,15 @@ func (e *LFTJEngine) leapfrogRecursive(
 	firstOcc := occs[0]
 	it := iterators[firstOcc.relIdx]
 
-	// Apply current bindings to iterator
+	// Apply current bindings to all iterators involved in this variable's occurrences.
+	// For each occurrence's relation, find positions whose variable names are bound
+	// and set those position bindings on the corresponding iterator.
 	for _, occ := range occs {
 		rel := relations[occ.relIdx]
-		for pos, val := range bindings {
-			for varPos, varName2 := range rel.VariablePositions {
-				if varName2 == pos {
-					it.SetBinding(varPos, val)
-				}
+		occIt := iterators[occ.relIdx]
+		for varPos, varName2 := range rel.VariablePositions {
+			if val, ok := bindings[varName2]; ok {
+				occIt.SetBinding(varPos, val)
 			}
 		}
 	}

@@ -33,13 +33,13 @@ type MEBStore struct {
 	breaker *circuit.Breaker
 
 	// TopicID for symmetric bit-packing (24-bit, supports 16M topics)
-	topicID uint32
+	topicID atomic.Uint32
 
 	// Default semantic hints applied to facts (can be overridden per fact)
 	defaultEntityType uint16
 	defaultFlags      uint16
 
-	lastGCTime time.Time
+	lastGCTimeNano atomic.Int64
 }
 
 func (m *MEBStore) loadStats() error {
@@ -116,9 +116,9 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		config:            cfg,
 		vectors:           vector.NewRegistry(db, nil),
 		breaker:           circuit.NewBreaker(nil),
-		topicID:           1, // default topic
 		defaultEntityType: keys.EntityUnknown,
 	}
+	m.topicID.Store(1) // default topic
 
 	if err := m.vectors.LoadSnapshot(); err != nil {
 		db.Close()
@@ -266,12 +266,12 @@ func (m *MEBStore) SetTopicID(topicID uint32) {
 	if topicID == 0 {
 		panic("SetTopicID: topicID must be non-zero")
 	}
-	m.topicID = topicID
+	m.topicID.Store(topicID)
 }
 
 // TopicID returns the current topic ID.
 func (m *MEBStore) TopicID() uint32 {
-	return m.topicID
+	return m.topicID.Load()
 }
 
 // SetDefaultEntityType sets the default entity type for semantic hints.
@@ -348,7 +348,8 @@ func (m *MEBStore) triggerAutoGC() {
 	}
 
 	now := time.Now()
-	if !m.lastGCTime.IsZero() && now.Sub(m.lastGCTime) < minGCInterval {
+	lastNano := m.lastGCTimeNano.Load()
+	if lastNano != 0 && now.Sub(time.Unix(0, lastNano)) < minGCInterval {
 		return
 	}
 
@@ -366,5 +367,5 @@ func (m *MEBStore) triggerAutoGC() {
 	}
 
 	m.factsSinceGC.Store(0)
-	m.lastGCTime = now
+	m.lastGCTimeNano.Store(now.UnixNano())
 }

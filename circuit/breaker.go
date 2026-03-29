@@ -105,17 +105,25 @@ func (b *Breaker) ExecuteContext(ctx context.Context, fn func() error) error {
 	}
 
 	errChan := make(chan error, 1)
+	done := make(chan struct{})
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				errChan <- fmt.Errorf("panic in circuit breaker: %v", r)
+				select {
+				case errChan <- fmt.Errorf("panic in circuit breaker: %v", r):
+				case <-done:
+				}
 			}
 		}()
-		errChan <- fn()
+		select {
+		case errChan <- fn():
+		case <-done:
+		}
 	}()
 
 	select {
 	case <-ctx.Done():
+		close(done) // signal goroutine to stop
 		if ctx.Err() == context.DeadlineExceeded {
 			b.recordFailure(ErrQueryTimeout)
 			return ErrQueryTimeout
@@ -151,18 +159,26 @@ func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func() (interface{},
 		err  error
 	}
 	resultChan := make(chan result, 1)
+	done := make(chan struct{})
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				resultChan <- result{nil, fmt.Errorf("panic in circuit breaker: %v", r)}
+				select {
+				case resultChan <- result{nil, fmt.Errorf("panic in circuit breaker: %v", r)}:
+				case <-done:
+				}
 			}
 		}()
 		data, err := fn()
-		resultChan <- result{data, err}
+		select {
+		case resultChan <- result{data, err}:
+		case <-done:
+		}
 	}()
 
 	select {
 	case <-ctx.Done():
+		close(done) // signal goroutine to stop
 		if ctx.Err() == context.DeadlineExceeded {
 			b.recordFailure(ErrQueryTimeout)
 			return nil, ErrQueryTimeout

@@ -119,9 +119,9 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		// Symmetric TopicID packing: both sID and oID use the same structure.
 		// This ensures SPO and OPS indices both achieve data locality per topic.
 		// Inline IDs skip packing — the inline flag is in bit 39, not in the topic bits.
-		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
 		if !isInline {
-			oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+			oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
 		}
 
 		// Encode semantic hints for the subject entity
@@ -165,7 +165,7 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 	}
 
 	// Pack with current topic for symmetric lookup
-	sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+	sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
 
 	txn := m.db.NewTransaction(false)
 	defer txn.Discard()
