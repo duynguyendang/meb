@@ -59,6 +59,21 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 		return fmt.Errorf("failed to get document ID: %w", err)
 	}
 
+	// Add metadata facts first — if this fails, nothing else is written
+	if len(metadata) > 0 {
+		facts := make([]Fact, 0, len(metadata))
+		for key, value := range metadata {
+			facts = append(facts, Fact{
+				Subject:   docKey,
+				Predicate: key,
+				Object:    value,
+			})
+		}
+		if err := m.AddFactBatch(facts); err != nil {
+			return fmt.Errorf("failed to add metadata facts: %w", err)
+		}
+	}
+
 	if len(vec) > 0 {
 		if err := m.vectors.Add(id, vec); err != nil {
 			return fmt.Errorf("failed to add vector: %w", err)
@@ -68,19 +83,6 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 	if len(content) > 0 {
 		if err := m.SetContent(id, content); err != nil {
 			return fmt.Errorf("failed to store content: %w", err)
-		}
-	}
-
-	if len(metadata) > 0 {
-		for key, value := range metadata {
-			fact := Fact{
-				Subject:   docKey,
-				Predicate: key,
-				Object:    value,
-			}
-			if err := m.AddFact(fact); err != nil {
-				return fmt.Errorf("failed to add metadata fact for %s: %w", key, err)
-			}
 		}
 	}
 
@@ -128,8 +130,11 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 		slog.Debug("vector not found for deletion", "key", docKey, "id", id)
 	}
 
-	metadataPrefix := keys.EncodeTripleSPOPrefix(id, 0, 0)
+	// Pack TopicID into subject ID — facts are stored with packed IDs
+	packedID := keys.PackID(m.topicID, keys.UnpackLocalID(id))
+	metadataPrefix := keys.EncodeTripleSPOPrefix(packedID, 0, 0)
 
+	var deletedCount uint64
 	if err := m.withWriteTxn(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer it.Close()
@@ -145,10 +150,15 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 			if err := txn.Delete(opsKey); err != nil {
 				return err
 			}
+			deletedCount++
 		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to delete metadata facts: %w", err)
+	}
+
+	if deletedCount > 0 {
+		m.numFacts.Add(^uint64(deletedCount - 1))
 	}
 
 	return nil
@@ -186,7 +196,7 @@ func (m *MEBStore) HasDocument(docKey string) (bool, error) {
 		return true, nil
 	}
 
-	metadataPrefix := keys.EncodeTripleSPOPrefix(id, 0, 0)
+	metadataPrefix := keys.EncodeTripleSPOPrefix(keys.PackID(m.topicID, keys.UnpackLocalID(id)), 0, 0)
 	var hasMetadata bool
 	if err := m.withReadTxn(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.DefaultIteratorOptions)

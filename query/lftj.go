@@ -1,7 +1,10 @@
 package query
 
 import (
+	"context"
+	"errors"
 	"iter"
+	"sync/atomic"
 
 	"github.com/duynguyendang/meb/keys"
 
@@ -18,6 +21,31 @@ type RelationPattern struct {
 	VariablePositions map[int]string
 }
 
+// ErrTooManyVisits is returned when the LFTJ join exceeds the configured
+// node visit limit. This protects against OOM during broad scans.
+var ErrTooManyVisits = errors.New("query exceeded maximum node visits")
+
+// visitCounterKey is the context key for the shared visit counter.
+type visitCounterKey struct{}
+
+// WithVisitCounter stores a shared visit counter and max in context.
+func WithVisitCounter(ctx context.Context, counter *atomic.Int64, maxVisits int64) context.Context {
+	ctx = context.WithValue(ctx, visitCounterKey{}, counter)
+	ctx = context.WithValue(ctx, visitMaxKey{}, maxVisits)
+	return ctx
+}
+
+type visitMaxKey struct{}
+
+func visitCounterFromCtx(ctx context.Context) (*atomic.Int64, int64) {
+	if v := ctx.Value(visitCounterKey{}); v != nil {
+		counter := v.(*atomic.Int64)
+		max := ctx.Value(visitMaxKey{}).(int64)
+		return counter, max
+	}
+	return nil, 0
+}
+
 // LFTJEngine provides worst-case optimal multi-way joins with constant memory.
 // Unlike nested-loop joins that materialize intermediate results,
 // LFTJ traverses all relations simultaneously via trie iterators,
@@ -30,10 +58,10 @@ func NewLFTJEngine(db *badger.DB) *LFTJEngine {
 	return &LFTJEngine{db: db}
 }
 
-// Execute runs a multi-way join query seeded with candidate TopicIDs.
-// Results are streamed via iter.Seq2 — no intermediate slice allocation.
-// Memory: O(depth × key_size) = O(1) per binding level.
+// Execute runs a multi-way join query. A shared *atomic.Int64 in ctx limits
+// total BadgerDB operations (protects against runaway joins).
 func (e *LFTJEngine) Execute(
+	ctx context.Context,
 	relations []RelationPattern,
 	boundVars map[string]uint64,
 	resultVars []string,
@@ -46,24 +74,11 @@ func (e *LFTJEngine) Execute(
 		txn := e.db.NewTransaction(false)
 		defer txn.Discard()
 
+		vc, maxVisits := visitCounterFromCtx(ctx)
+
 		iterators := make([]*TrieIterator, len(relations))
 		for i, rel := range relations {
 			iterators[i] = NewTrieIterator(txn, rel.Prefix, rel.BoundPositions)
-		}
-
-		// Build column orders for result mapping
-		columnOrders := make([][]int, len(relations))
-		for i, rel := range relations {
-			order := make([]int, 0, 3)
-			for pos := 0; pos < 3; pos++ {
-				if _, isBound := rel.BoundPositions[pos]; isBound {
-					continue
-				}
-				if _, isVar := rel.VariablePositions[pos]; isVar {
-					order = append(order, pos)
-				}
-			}
-			columnOrders[i] = order
 		}
 
 		// Collect all unbound variable positions across relations
@@ -95,7 +110,7 @@ func (e *LFTJEngine) Execute(
 		}
 
 		// Leapfrog recursive join
-		e.leapfrogRecursive(iterators, relations, allVarPositions, joinVars, 0, bindings, resultVars, yield)
+		e.leapfrogRecursive(iterators, relations, allVarPositions, joinVars, 0, bindings, resultVars, vc, maxVisits, yield)
 	}
 }
 
@@ -112,10 +127,11 @@ func (e *LFTJEngine) leapfrogRecursive(
 	depth int,
 	bindings map[string]uint64,
 	resultVars []string,
+	vc *atomic.Int64,
+	maxVisits int64,
 	yield func(map[string]uint64, error) bool,
 ) bool {
 	if depth >= len(joinVars) {
-		// All variables bound — yield result
 		result := make(map[string]uint64, len(resultVars))
 		for _, v := range resultVars {
 			if val, ok := bindings[v]; ok {
@@ -129,10 +145,9 @@ func (e *LFTJEngine) leapfrogRecursive(
 	occs := varPositions[varName]
 
 	if len(occs) == 0 {
-		return e.leapfrogRecursive(iterators, relations, varPositions, joinVars, depth+1, bindings, resultVars, yield)
+		return e.leapfrogRecursive(iterators, relations, varPositions, joinVars, depth+1, bindings, resultVars, vc, maxVisits, yield)
 	}
 
-	// Use first occurrence to iterate possible values
 	firstOcc := occs[0]
 	it := iterators[firstOcc.relIdx]
 
@@ -157,6 +172,14 @@ func (e *LFTJEngine) leapfrogRecursive(
 			break
 		}
 
+		// Check visit limit
+		if vc != nil && maxVisits > 0 {
+			if vc.Add(1) > maxVisits {
+				yield(nil, ErrTooManyVisits)
+				return false
+			}
+		}
+
 		value := it.Key()
 
 		// Check consistency across all occurrences
@@ -172,7 +195,7 @@ func (e *LFTJEngine) leapfrogRecursive(
 
 		if consistent {
 			bindings[varName] = value
-			if !e.leapfrogRecursive(iterators, relations, varPositions, joinVars, depth+1, bindings, resultVars, yield) {
+			if !e.leapfrogRecursive(iterators, relations, varPositions, joinVars, depth+1, bindings, resultVars, vc, maxVisits, yield) {
 				return false
 			}
 		}
@@ -212,10 +235,6 @@ type TrieIterator struct {
 }
 
 func NewTrieIterator(txn *badger.Txn, prefix byte, bound map[int]uint64) *TrieIterator {
-	opts := badger.DefaultIteratorOptions
-	opts.PrefetchValues = false
-	opts.PrefetchSize = 100
-
 	return &TrieIterator{
 		txn:    txn,
 		prefix: prefix,
@@ -267,15 +286,14 @@ func (ti *TrieIterator) Seek(target uint64) {
 		return
 	}
 
-	// Rebuild prefix with target
 	boundWithTarget := make(map[int]uint64)
 	for k, v := range ti.bound {
 		boundWithTarget[k] = v
 	}
-	boundWithTarget[2] = target // O position
+	boundWithTarget[2] = target
 
 	ti.keyBuf = keys.EncodeTripleKey(ti.prefix, boundWithTarget[0], boundWithTarget[1], boundWithTarget[2])
-	ti.it.Seek(ti.keyBuf[:ti.prefixLen()+8]) // prefix + 1 more ID
+	ti.it.Seek(ti.keyBuf[:ti.prefixLen()+8])
 	ti.validatePosition()
 }
 
@@ -285,10 +303,37 @@ func (ti *TrieIterator) Next() {
 	}
 	ti.it.Next()
 	ti.validatePosition()
+
+	if !ti.atEnd && len(ti.bound) == 0 {
+		ti.leapfrogTopicID()
+	}
+}
+
+func (ti *TrieIterator) leapfrogTopicID() {
+	if ti.it == nil || !ti.it.Valid() {
+		return
+	}
+
+	key := ti.it.Item().Key()
+	if len(key) < keys.TripleKeySize {
+		return
+	}
+
+	s, _, _ := keys.DecodeTripleKey(key)
+	currentTopic := keys.UnpackTopicID(s)
+	expectedTopic := keys.UnpackTopicID(ti.bound[0])
+
+	if currentTopic == expectedTopic {
+		return
+	}
+
+	nextTopicID := keys.NextTopicID(s)
+	seekKey := keys.EncodeTripleKey(ti.prefix, nextTopicID, 0, 0)
+	ti.it.Seek(seekKey)
+	ti.validatePosition()
 }
 
 func (ti *TrieIterator) prefixLen() int {
-	// prefix(1) + bound fields(8 each)
 	return 1 + len(ti.bound)*8
 }
 
@@ -318,7 +363,6 @@ func (ti *TrieIterator) validatePosition() {
 			continue
 		}
 
-		// Check prefix match
 		match := true
 		for i := 0; i < pLen && i < len(key); i++ {
 			if key[i] != ti.keyBuf[i] {

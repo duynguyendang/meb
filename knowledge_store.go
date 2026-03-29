@@ -105,6 +105,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		pID := ids[factStringRefs[i][1].index]
 
 		var oID uint64
+		var isInline bool
 		if len(factStringRefs[i]) > 2 && factStringRefs[i][2].isObj {
 			oID = ids[factStringRefs[i][2].index]
 		} else {
@@ -112,12 +113,16 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			if err != nil {
 				return fmt.Errorf("failed to encode object for fact %d: %w", i, err)
 			}
+			isInline = keys.IsInline(oID)
 		}
 
 		// Symmetric TopicID packing: both sID and oID use the same structure.
 		// This ensures SPO and OPS indices both achieve data locality per topic.
+		// Inline IDs skip packing — the inline flag is in bit 39, not in the topic bits.
 		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
-		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+		if !isInline {
+			oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+		}
 
 		// Encode semantic hints for the subject entity
 		hints := keys.EncodeSemanticHints(m.defaultEntityType, uint16(keys.HashSemanticName(fact.Subject)), m.defaultFlags)
@@ -143,7 +148,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	m.persistStatsIfNeeded(uint64(len(facts)))
 
 	if m.config.EnableAutoGC {
-		m.factsSinceGC += uint64(len(facts))
+		m.factsSinceGC.Add(uint64(len(facts)))
 		m.triggerAutoGC()
 	}
 
@@ -186,6 +191,7 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 			return nil
 		}
 
+		batchSize := len(keysToDelete)
 		deleteTxn := m.db.NewTransaction(true)
 		for _, k := range keysToDelete {
 			if err := deleteTxn.Delete(k.spo); err != nil {
@@ -196,14 +202,14 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 				deleteTxn.Discard()
 				return fmt.Errorf("failed to delete OPS key: %w", err)
 			}
-			m.numFacts.Add(^uint64(0))
 		}
 
 		if err := deleteTxn.Commit(); err != nil {
 			return fmt.Errorf("failed to commit delete batch: %w", err)
 		}
 
-		totalDeleted += len(keysToDelete)
+		m.numFacts.Add(^uint64(batchSize - 1))
+		totalDeleted += batchSize
 		keysToDelete = keysToDelete[:0]
 		return nil
 	}

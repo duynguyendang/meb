@@ -13,7 +13,7 @@ type QueryResult struct {
 }
 
 // ExecuteWithSeeds runs an LFTJ join seeded with candidate IDs from vector search.
-// This is the Neuro-First pipeline: TurboQuant seeds → LFTJ join → results.
+// This is the Neuro-First pipeline: TurboQuant seeds -> LFTJ join -> results.
 // The seeds are streamed via iter.Seq2 — no intermediate slice allocation.
 func (e *LFTJEngine) ExecuteWithSeeds(
 	ctx context.Context,
@@ -38,7 +38,7 @@ func (e *LFTJEngine) ExecuteWithSeeds(
 
 			boundVars := map[string]uint64{seedVar: seedID}
 
-			for result, err := range e.Execute(relations, boundVars, resultVars) {
+			for result, err := range e.Execute(ctx, relations, boundVars, resultVars) {
 				if err != nil {
 					yield(nil, err)
 					return
@@ -53,17 +53,19 @@ func (e *LFTJEngine) ExecuteWithSeeds(
 
 // RunQuery is a convenience method for running a query with bound variables.
 func RunQuery(
+	ctx context.Context,
 	db *badger.DB,
 	relations []RelationPattern,
 	boundVars map[string]uint64,
 	resultVars []string,
 ) iter.Seq2[map[string]uint64, error] {
 	engine := NewLFTJEngine(db)
-	return engine.Execute(relations, boundVars, resultVars)
+	return engine.Execute(ctx, relations, boundVars, resultVars)
 }
 
 // RunQueryWithSeeds is a convenience method for running a seeded query.
 func RunQueryWithSeeds(
+	ctx context.Context,
 	db *badger.DB,
 	relations []RelationPattern,
 	seedVar string,
@@ -71,5 +73,5 @@ func RunQueryWithSeeds(
 	resultVars []string,
 ) iter.Seq2[map[string]uint64, error] {
 	engine := NewLFTJEngine(db)
-	return engine.ExecuteWithSeeds(context.Background(), relations, seedVar, seeds, resultVars)
+	return engine.ExecuteWithSeeds(ctx, relations, seedVar, seeds, resultVars)
 }

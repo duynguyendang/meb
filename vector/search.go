@@ -34,9 +34,12 @@ func (h *scoreHeap) Pop() any {
 const TopicIDMask = uint64(0xFFFFFF) << 40
 
 // Search returns an iterator of top-k most similar vectors.
-// Uses TurboQuant blockwise dot product on full 1536-dim compressed vectors.
-// Results are streamed via iter.Seq2 — no intermediate slice allocation.
 func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+	return r.SearchWithFilter(queryVec, k, 0)
+}
+
+// SearchWithFilter returns an iterator of top-k most similar vectors matching a semantic hash.
+func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
 			return
@@ -51,15 +54,16 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResul
 		tqQuery := QuantizeTurboQuant(queryVec, r.tqConfig)
 
 		r.mu.RLock()
-		numVectors := len(r.revMap)
+		numVectors := r.totalVectors
 		if numVectors == 0 {
 			r.mu.RUnlock()
 			return
 		}
-
-		data := r.data
 		vectorSize := r.vectorSize
-		revMap := r.revMap
+		revMap := make([]uint64, len(r.revMap))
+		copy(revMap, r.revMap)
+		// Capture function to access vector slots (safe: segments won't shrink)
+		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
 		r.mu.RUnlock()
 
 		numWorkers := r.config.NumWorkers
@@ -86,7 +90,7 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResul
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := r.scanChunkTQ(data, tqQuery, start, end, k, vectorSize, revMap)
+				topK := scanChunkTQ(getSlot, tqQuery, start, end, k, vectorSize, revMap, filterHash, r.config.FullDim, r.tqConfig)
 				select {
 				case resultCh <- topK:
 				case <-done:
@@ -111,7 +115,6 @@ func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResul
 }
 
 // SearchInTopic returns an iterator of top-k most similar vectors within a specific topic.
-// Only vectors whose packed ID matches the requested TopicID are scanned.
 func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
@@ -127,15 +130,15 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 		tqQuery := QuantizeTurboQuant(queryVec, r.tqConfig)
 
 		r.mu.RLock()
-		numVectors := len(r.revMap)
+		numVectors := r.totalVectors
 		if numVectors == 0 {
 			r.mu.RUnlock()
 			return
 		}
-
-		data := r.data
 		vectorSize := r.vectorSize
-		revMap := r.revMap
+		revMap := make([]uint64, len(r.revMap))
+		copy(revMap, r.revMap)
+		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
 		r.mu.RUnlock()
 
 		packedTopicPrefix := uint64(topicID) << 40
@@ -183,7 +186,7 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := r.scanChunkTQ(data, tqQuery, start, end, k, vectorSize, revMap)
+				topK := scanChunkTQ(getSlot, tqQuery, start, end, k, vectorSize, revMap, 0, r.config.FullDim, r.tqConfig)
 				select {
 				case resultCh <- topK:
 				case <-done:
@@ -207,19 +210,21 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 	}
 }
 
-// scanChunkTQ scans a chunk of TQ vectors and returns local top-k results.
-func (r *VectorRegistry) scanChunkTQ(data []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64) []SearchResult {
+// scanChunkTQ scans a chunk of TQ vectors using a slot accessor function.
+func scanChunkTQ(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, filterHash uint8, fullDim int, tqCfg *TurboQuantConfig) []SearchResult {
 	h := make(scoreHeap, 0, k)
-	dim := r.config.FullDim
-	tqCfg := r.tqConfig
 
 	for idx := startIdx; idx < endIdx; idx++ {
-		offset := idx * vectorSize
-		if offset+vectorSize > len(data) {
-			break
+		slot := getSlot(idx)
+
+		// Semantic hash filter
+		hashByte := slot[0]
+		if filterHash != 0 && hashByte != filterHash {
+			continue
 		}
-		vecData := data[offset : offset+vectorSize]
-		score := DotProductTurboQuant(vecData, query, dim, tqCfg)
+
+		vecData := slot[hashSize:vectorSize]
+		score := DotProductTurboQuant(vecData, query, fullDim, tqCfg)
 
 		if len(h) < k {
 			h = append(h, scoreIndex{score: score, idx: idx})

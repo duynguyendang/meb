@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"os"
-	"path/filepath"
 	"sync"
+
+	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -19,7 +19,8 @@ type Config struct {
 	NumWorkers      int
 	VectorCapacity  int
 	InitialCapacity int
-	MmapPath        string // Path for mmap file; empty = use in-memory
+	SegmentDir      string // Directory for mmap segment files
+	SegmentSize     int    // Max bytes per segment (default: 64MB)
 }
 
 func DefaultConfig() *Config {
@@ -30,6 +31,7 @@ func DefaultConfig() *Config {
 		NumWorkers:      4,
 		VectorCapacity:  25 * 1024 * 1024,
 		InitialCapacity: 100000,
+		SegmentSize:     64 << 20, // 64MB per segment
 	}
 }
 
@@ -63,16 +65,17 @@ func (c *Config) TQConfig() *TurboQuantConfig {
 }
 
 // VectorRegistry holds TurboQuant compressed vectors for fast search.
-// Uses memory-mapped file for data buffer when MmapPath is set,
-// letting the OS manage page eviction under memory pressure.
+// Data is stored in segmented mmap files. New segments are appended
+// during growth — existing segments remain mapped, so concurrent
+// readers on older segments are never disturbed.
 type VectorRegistry struct {
 	config     *Config
 	tqConfig   *TurboQuantConfig
 	vectorSize int
 
-	data    []byte    // Points into mmap region or heap-allocated
-	dataLen int       // Current number of bytes used
-	mmap    *mmapFile // nil if using heap allocation
+	segments          []*mmapSegment
+	vectorsPerSegment int
+	totalVectors      int // Total number of vectors stored
 
 	idMap  map[uint64]uint32
 	revMap []uint64
@@ -81,6 +84,8 @@ type VectorRegistry struct {
 	mu sync.RWMutex
 	wg sync.WaitGroup
 }
+
+const hashSize = 1 // 1 byte for semantic hash filter per vector entry
 
 func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	if cfg == nil {
@@ -91,95 +96,94 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	}
 
 	tqCfg := cfg.TQConfig()
-	vSize := TQVectorSize(cfg.FullDim, tqCfg)
-	capacity := cfg.VectorCapacity / vSize * vSize
-	if capacity < vSize {
-		capacity = vSize
+	vSize := TQVectorSize(cfg.FullDim, tqCfg) + hashSize
+
+	segSize := cfg.SegmentSize
+	if segSize <= 0 {
+		segSize = 64 << 20
+	}
+	vectorsPerSeg := segSize / vSize
+	if vectorsPerSeg < 1 {
+		vectorsPerSeg = 1
 	}
 
 	r := &VectorRegistry{
-		config:     cfg,
-		tqConfig:   tqCfg,
-		vectorSize: vSize,
-		idMap:      make(map[uint64]uint32, cfg.InitialCapacity),
-		revMap:     make([]uint64, 0, cfg.InitialCapacity),
-		db:         db,
-	}
-
-	if cfg.MmapPath != "" {
-		os.MkdirAll(filepath.Dir(cfg.MmapPath), 0755)
-		mf, err := newMmapFile(cfg.MmapPath, capacity)
-		if err != nil {
-			slog.Warn("failed to create mmap, falling back to heap", "error", err)
-			r.data = make([]byte, 0, capacity)
-		} else {
-			r.mmap = mf
-			r.data = mf.data[:0] // Empty slice pointing into mmap region
-		}
-	} else {
-		r.data = make([]byte, 0, capacity)
+		config:            cfg,
+		tqConfig:          tqCfg,
+		vectorSize:        vSize,
+		vectorsPerSegment: vectorsPerSeg,
+		idMap:             make(map[uint64]uint32, cfg.InitialCapacity),
+		revMap:            make([]uint64, 0, cfg.InitialCapacity),
+		db:                db,
 	}
 
 	return r
 }
 
-func (r *VectorRegistry) ensureCapacity(needed int) error {
-	currentCap := cap(r.data)
-	if r.dataLen+needed <= currentCap {
-		return nil
-	}
-
-	newCap := currentCap * 2
-	for newCap < r.dataLen+needed {
-		newCap *= 2
-	}
-
-	if r.mmap != nil {
-		if err := r.mmap.grow(newCap); err != nil {
-			return fmt.Errorf("failed to grow mmap: %w", err)
+// ensureCapacity grows the segment list if needed to hold the required number of vectors.
+func (r *VectorRegistry) ensureCapacity(totalVectors int) error {
+	requiredSegs := (totalVectors + r.vectorsPerSegment - 1) / r.vectorsPerSegment
+	for len(r.segments) < requiredSegs {
+		segIdx := len(r.segments)
+		segBytes := r.vectorsPerSegment * r.vectorSize
+		seg, err := newMmapSegment(r.config.SegmentDir, segIdx, segBytes)
+		if err != nil {
+			return fmt.Errorf("failed to create segment %d: %w", segIdx, err)
 		}
-		r.data = r.mmap.data[:r.dataLen]
-	} else {
-		newData := make([]byte, r.dataLen, newCap)
-		copy(newData, r.data[:r.dataLen])
-		r.data = newData
+		r.segments = append(r.segments, seg)
 	}
-
 	return nil
 }
 
+// getVectorSlice returns a writable slice for the vector at the given index.
+func (r *VectorRegistry) getVectorSlice(idx int) []byte {
+	segIdx := idx / r.vectorsPerSegment
+	offset := (idx % r.vectorsPerSegment) * r.vectorSize
+	return r.segments[segIdx].data[offset : offset+r.vectorSize]
+}
+
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
+	return r.AddWithHash(id, fullVec, 0)
+}
+
+// AddWithHash adds a vector with a semantic hash byte for early filtering during search.
+func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash uint8) error {
 	if len(fullVec) != r.config.FullDim {
 		return fmt.Errorf("invalid vector dimension: expected %d, got %d", r.config.FullDim, len(fullVec))
 	}
 
 	tqData := QuantizeTurboQuant(fullVec, r.tqConfig)
+	tqSize := len(tqData)
 
 	r.mu.Lock()
 	if idx, exists := r.idMap[id]; exists {
-		dstOffset := int(idx) * r.vectorSize
-		copy(r.data[dstOffset:dstOffset+r.vectorSize], tqData)
+		slot := r.getVectorSlice(int(idx))
+		slot[0] = semanticHash
+		copy(slot[hashSize:hashSize+tqSize], tqData)
 		r.mu.Unlock()
 	} else {
-		if err := r.ensureCapacity(r.vectorSize); err != nil {
+		newTotal := r.totalVectors + 1
+		if err := r.ensureCapacity(newTotal); err != nil {
 			r.mu.Unlock()
 			return err
 		}
 
-		idx := uint32(len(r.revMap))
+		idx := uint32(r.totalVectors)
 		r.idMap[id] = idx
 		r.revMap = append(r.revMap, id)
-		r.data = append(r.data[:r.dataLen], tqData...)
-		r.dataLen += r.vectorSize
+
+		slot := r.getVectorSlice(int(idx))
+		slot[0] = semanticHash
+		copy(slot[hashSize:hashSize+tqSize], tqData)
+
+		r.totalVectors = newTotal
 		r.mu.Unlock()
 	}
 
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		key := make([]byte, 1+8)
-		key[0] = 0x10
-		binary.BigEndian.PutUint64(key[1:9], id)
+		key := keys.EncodeVectorFullKey(id)
 		value := make([]byte, r.config.FullDim*4)
 		for i, v := range fullVec {
 			binary.LittleEndian.PutUint32(value[i*4:(i+1)*4], math.Float32bits(v))
@@ -200,10 +204,17 @@ func (r *VectorRegistry) Count() int {
 
 func (r *VectorRegistry) Close() error {
 	r.wg.Wait()
-	if r.mmap != nil {
-		return r.mmap.close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var lastErr error
+	for _, seg := range r.segments {
+		if err := seg.close(); err != nil {
+			lastErr = err
+		}
 	}
-	return nil
+	r.segments = nil
+	return lastErr
 }
 
 func (r *VectorRegistry) Delete(id uint64) bool {
@@ -215,21 +226,21 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		return false
 	}
 
-	lastIdx := uint32(len(r.revMap) - 1)
+	lastIdx := uint32(r.totalVectors - 1)
 	lastID := r.revMap[lastIdx]
 
 	if idx != lastIdx {
 		r.revMap[idx] = lastID
 		r.idMap[lastID] = idx
 
-		srcOffset := int(lastIdx) * r.vectorSize
-		dstOffset := int(idx) * r.vectorSize
-		copy(r.data[dstOffset:dstOffset+r.vectorSize], r.data[srcOffset:srcOffset+r.vectorSize])
+		srcSlot := r.getVectorSlice(int(lastIdx))
+		dstSlot := r.getVectorSlice(int(idx))
+		copy(dstSlot, srcSlot)
 	}
 
 	r.revMap = r.revMap[:lastIdx]
 	delete(r.idMap, id)
-	r.dataLen -= r.vectorSize
+	r.totalVectors--
 
 	return true
 }
@@ -241,12 +252,13 @@ func (r *VectorRegistry) HasVector(id uint64) bool {
 	return exists
 }
 
+// GetTQVector returns the TQ-compressed vector data at the given index (skipping hash byte).
 func (r *VectorRegistry) GetTQVector(idx int) []byte {
-	if idx < 0 || idx >= len(r.revMap) {
+	if idx < 0 || idx >= r.totalVectors {
 		return nil
 	}
-	offset := idx * r.vectorSize
-	return r.data[offset : offset+r.vectorSize]
+	slot := r.getVectorSlice(idx)
+	return slot[hashSize:]
 }
 
 func (r *VectorRegistry) TQConfig() *TurboQuantConfig {
@@ -258,9 +270,7 @@ func (r *VectorRegistry) VectorSize() int {
 }
 
 func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
-	key := make([]byte, 1+8)
-	key[0] = 0x10
-	binary.BigEndian.PutUint64(key[1:9], id)
+	key := keys.EncodeVectorFullKey(id)
 
 	var fullVec []float32
 	fullDim := r.config.FullDim
@@ -290,13 +300,22 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	numVectors := len(r.revMap)
 	slog.Info("saving TQ vector snapshot",
 		"vectorCount", numVectors,
-		"dataSizeBytes", r.dataLen,
+		"segments", len(r.segments),
 	)
 
-	if r.mmap != nil {
-		if err := r.mmap.sync(); err != nil {
-			slog.Warn("mmap sync failed", "error", err)
+	// Sync all mmap segments to disk
+	for _, seg := range r.segments {
+		if err := seg.sync(); err != nil {
+			slog.Warn("segment sync failed", "error", err)
 		}
+	}
+
+	// Serialize all vectors from segments into a contiguous byte slice
+	totalBytes := r.totalVectors * r.vectorSize
+	vectorsBytes := make([]byte, totalBytes)
+	for i := 0; i < r.totalVectors; i++ {
+		slot := r.getVectorSlice(i)
+		copy(vectorsBytes[i*r.vectorSize:(i+1)*r.vectorSize], slot)
 	}
 
 	idsBytes := make([]byte, len(r.revMap)*8)
@@ -307,7 +326,7 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	batch := r.db.NewWriteBatch()
 	defer batch.Cancel()
 
-	if err := batch.Set([]byte("sys:tq:vectors"), r.data[:r.dataLen]); err != nil {
+	if err := batch.Set([]byte("sys:tq:vectors"), vectorsBytes); err != nil {
 		return fmt.Errorf("failed to save TQ vectors: %w", err)
 	}
 	if err := batch.Set([]byte("sys:tq:ids"), idsBytes); err != nil {
@@ -375,13 +394,17 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 	numVectors := len(vectorsBytes) / r.vectorSize
 
-	// Ensure mmap has enough capacity
-	if err := r.ensureCapacity(len(vectorsBytes)); err != nil {
+	// Allocate enough segments to hold all vectors
+	if err := r.ensureCapacity(numVectors); err != nil {
 		return fmt.Errorf("failed to ensure capacity for snapshot: %w", err)
 	}
 
-	copy(r.data[:len(vectorsBytes)], vectorsBytes)
-	r.dataLen = len(vectorsBytes)
+	// Copy snapshot data into segments
+	for i := 0; i < numVectors; i++ {
+		slot := r.getVectorSlice(i)
+		copy(slot, vectorsBytes[i*r.vectorSize:(i+1)*r.vectorSize])
+	}
+	r.totalVectors = numVectors
 
 	r.revMap = make([]uint64, numVectors)
 	for i := 0; i < numVectors; i++ {

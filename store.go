@@ -27,6 +27,7 @@ type MEBStore struct {
 
 	numFacts              atomic.Uint64
 	factsSinceLastPersist atomic.Uint64
+	factsSinceGC          atomic.Uint64
 
 	vectors *vector.VectorRegistry
 	breaker *circuit.Breaker
@@ -38,8 +39,7 @@ type MEBStore struct {
 	defaultEntityType uint16
 	defaultFlags      uint16
 
-	lastGCTime   time.Time
-	factsSinceGC uint64
+	lastGCTime time.Time
 }
 
 func (m *MEBStore) loadStats() error {
@@ -260,8 +260,13 @@ func (m *MEBStore) Find() *Builder {
 // SetTopicID sets the 24-bit topic ID for symmetric bit-packing.
 // All facts added after this call will use the new topic ID.
 // Supports up to 16M isolated namespaces (topics).
+// Panics if topicID is 0 (reserved as invalid).
 func (m *MEBStore) SetTopicID(topicID uint32) {
-	m.topicID = topicID & 0xFFFFFF // clamp to 24 bits
+	topicID = topicID & 0xFFFFFF // clamp to 24 bits
+	if topicID == 0 {
+		panic("SetTopicID: topicID must be non-zero")
+	}
+	m.topicID = topicID
 }
 
 // TopicID returns the current topic ID.
@@ -338,7 +343,7 @@ func (m *MEBStore) triggerAutoGC() {
 		return
 	}
 
-	if m.factsSinceGC < autoGCThreshold {
+	if m.factsSinceGC.Load() < autoGCThreshold {
 		return
 	}
 
@@ -352,7 +357,7 @@ func (m *MEBStore) triggerAutoGC() {
 		gcRatio = 0.5
 	}
 
-	slog.Info("triggering auto-GC", "factsSinceGC", m.factsSinceGC, "ratio", gcRatio)
+	slog.Info("triggering auto-GC", "factsSinceGC", m.factsSinceGC.Load(), "ratio", gcRatio)
 
 	if err := m.db.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
 		slog.Warn("auto-GC failed for facts DB", "error", err)
@@ -360,6 +365,6 @@ func (m *MEBStore) triggerAutoGC() {
 		slog.Debug("auto-GC completed for facts DB")
 	}
 
-	m.factsSinceGC = 0
+	m.factsSinceGC.Store(0)
 	m.lastGCTime = now
 }

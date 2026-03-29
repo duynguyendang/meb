@@ -3,14 +3,16 @@ package keys
 import (
 	"encoding/binary"
 	"hash/fnv"
+	"math"
 )
 
 const (
 	TripleSPOPrefix byte = 0x20
 	TripleOPSPrefix byte = 0x21
 
-	ChunkPrefix  byte = 0x10
-	SystemPrefix byte = 0xFF
+	ChunkPrefix      byte = 0x10
+	VectorFullPrefix byte = 0x11
+	SystemPrefix     byte = 0xFF
 )
 
 const (
@@ -63,6 +65,68 @@ const (
 )
 
 var KeyFactCount = []byte{SystemPrefix, 0x01}
+
+// Inline ID encoding: store primitive values directly in the 64-bit object ID.
+//
+// Bit layout:
+//
+//	bit 39     = 1  (inline flag)
+//	bit 38     = type (0=bool, 1=number)
+//	bits 37-0  = payload (38 bits — fits zigzag int32 [38 bits] or IEEE float32 [32 bits])
+//
+// For number type, payload[37] distinguishes: 0=int32(zigzag), 1=float32
+const (
+	InlineBit      = uint64(1) << 39
+	InlineIsBool   = uint64(0) << 38       // bit 38 = 0: bool, bit 0 = value
+	InlineIsNum    = uint64(1) << 38       // bit 38 = 1: number, bit 37 = 0: int32, 1: float32
+	InlineNumI32   = uint64(0) << 37       // bit 37 = 0: int32 zigzag in bits 36-0
+	InlineNumF32   = uint64(1) << 37       // bit 37 = 1: float32 IEEE in bits 31-0
+	InlinePayload  = (uint64(1) << 37) - 1 // bits 36-0 for int32 zigzag
+	InlineFPayload = (uint64(1) << 32) - 1 // bits 31-0 for float32
+)
+
+// IsInline returns true if the ID encodes an inline primitive value.
+func IsInline(id uint64) bool {
+	return (id & InlineBit) != 0
+}
+
+// PackInlineBool encodes a bool as an inline ID.
+func PackInlineBool(v bool) uint64 {
+	payload := uint64(0)
+	if v {
+		payload = 1
+	}
+	return InlineBit | InlineIsBool | payload
+}
+
+// PackInlineInt32 encodes an int32 as an inline ID.
+// Uses offset encoding (add 2^31 to map [-2^31, 2^31-1] to [0, 2^32-1]).
+func PackInlineInt32(v int32) uint64 {
+	offset := uint64(uint32(v)) // reinterpret bits as unsigned (same as adding 2^31)
+	return InlineBit | InlineIsNum | InlineNumI32 | (offset & InlinePayload)
+}
+
+// PackInlineFloat32 encodes a float32 as an inline ID.
+func PackInlineFloat32(v float32) uint64 {
+	bits := uint64(math.Float32bits(v))
+	return InlineBit | InlineIsNum | InlineNumF32 | (bits & InlineFPayload)
+}
+
+// UnpackInlineBool decodes a bool from an inline ID.
+func UnpackInlineBool(id uint64) bool {
+	return (id & 1) != 0
+}
+
+// UnpackInlineInt32 decodes an int32 from an inline ID.
+func UnpackInlineInt32(id uint64) int32 {
+	return int32(id & InlinePayload)
+}
+
+// UnpackInlineFloat32 decodes a float32 from an inline ID.
+func UnpackInlineFloat32(id uint64) float32 {
+	bits := uint32(id & InlineFPayload)
+	return math.Float32frombits(bits)
+}
 
 // PackID combines a 24-bit TopicID and 40-bit LocalID into a single 64-bit ID.
 // ID = (TopicID << 40) | LocalID
@@ -151,6 +215,8 @@ func DecodeTripleKey(key []byte) (s, p, o uint64) {
 		o = binary.BigEndian.Uint64(key[1:9])
 		p = binary.BigEndian.Uint64(key[9:17])
 		s = binary.BigEndian.Uint64(key[17:25])
+	default:
+		return 0, 0, 0
 	}
 
 	return
@@ -201,6 +267,13 @@ func EncodeOPSByTopic(topicID uint32) []byte {
 func EncodeChunkKey(id uint64) []byte {
 	k := make([]byte, ChunkKeySize)
 	k[0] = ChunkPrefix
+	binary.BigEndian.PutUint64(k[1:], id)
+	return k
+}
+
+func EncodeVectorFullKey(id uint64) []byte {
+	k := make([]byte, ChunkKeySize)
+	k[0] = VectorFullPrefix
 	binary.BigEndian.PutUint64(k[1:], id)
 	return k
 }

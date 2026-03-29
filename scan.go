@@ -6,6 +6,7 @@ import (
 	"iter"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/duynguyendang/meb/keys"
 
@@ -95,6 +96,7 @@ type scanResult struct {
 	foundPID uint64
 	foundOID uint64
 	key      []byte
+	value    []byte // Triple value bytes (needed for inline object decoding)
 }
 
 type scanOptions struct {
@@ -131,14 +133,9 @@ func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
 			return false
 		}
 		return len(objValue) > 0 && len(substr) > 0 &&
-			(len(objValue) >= len(substr)) &&
-			(objValue == substr ||
-				(len(objValue) > len(substr) &&
-					(objValue[:len(substr)] == substr ||
-						objValue[len(objValue)-len(substr):] == substr ||
-						containsAny(objValue, substr))))
+			strings.Contains(objValue, substr)
 
-	case PredicateGT, PredicateLT, PredicateGTE, PredicateLTE, PredicateRange:
+	case PredicateGT, PredicateLT, PredicateGTE, PredicateLTE:
 		objNum, err1 := strconv.ParseFloat(objValue, 64)
 		thresholdNum, ok2 := filter.Value.(float64)
 
@@ -155,36 +152,41 @@ func evaluatePredicateFilter(objValue string, filter PredicateFilter) bool {
 			return objNum >= thresholdNum
 		case PredicateLTE:
 			return objNum <= thresholdNum
-		case PredicateRange:
-			rangeVals, ok := filter.Value.([2]float64)
-			if !ok || len(rangeVals) != 2 {
-				return false
-			}
-			return objNum >= rangeVals[0] && objNum <= rangeVals[1]
 		}
+
+	case PredicateRange:
+		objNum, err := strconv.ParseFloat(objValue, 64)
+		if err != nil {
+			return false
+		}
+		rangeVals, ok := filter.Value.([2]float64)
+		if !ok || len(rangeVals) != 2 {
+			return false
+		}
+		return objNum >= rangeVals[0] && objNum <= rangeVals[1]
 	}
 	return false
 }
 
-func containsAny(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *MEBStore) prepareScan(s, p, o string) (*scanOptions, error) {
+func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o string) (*scanOptions, error) {
 	sID, pID, oID, sBound, pBound, oBound, err := m.resolveScanIDs(s, p, o)
 	if err != nil {
 		return nil, err
 	}
 
+	// Pack sID and oID with current topicID for symmetric key lookup.
+	// Keys in BadgerDB are stored with topic-packed IDs.
+	if sBound {
+		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+	}
+	if oBound {
+		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+	}
+
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
 
 	return &scanOptions{
-		ctx:      context.Background(),
+		ctx:      ctx,
 		s:        s,
 		p:        p,
 		o:        o,
@@ -198,7 +200,65 @@ func (m *MEBStore) prepareScan(s, p, o string) (*scanOptions, error) {
 	}, nil
 }
 
-func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact, bool)) iter.Seq2[Fact, error] {
+// resolveFactStrings resolves scan result IDs back to strings using the dictionary.
+// For inline IDs (bit 39 set), decodes the primitive value directly from the ID.
+func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, error) {
+	var subject, predicate string
+	var object any
+	var err error
+
+	if opts.sBound {
+		subject = opts.s
+	} else {
+		subject, err = m.dict.GetString(keys.UnpackLocalID(r.foundSID))
+		if err != nil {
+			return Fact{}, fmt.Errorf("failed to resolve subject ID %d: %w", r.foundSID, err)
+		}
+	}
+
+	if opts.pBound {
+		predicate = opts.p
+	} else {
+		predicate, err = m.dict.GetString(r.foundPID)
+		if err != nil {
+			return Fact{}, fmt.Errorf("failed to resolve predicate ID %d: %w", r.foundPID, err)
+		}
+	}
+
+	if opts.oBound {
+		object = opts.o
+	} else if keys.IsInline(r.foundOID) {
+		// Inline ID: decode primitive value directly from the ID bits
+		object = decodeInlineID(r.foundOID)
+	} else {
+		objectStr, err := m.dict.GetString(keys.UnpackLocalID(r.foundOID))
+		if err != nil {
+			return Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", r.foundOID, err)
+		}
+		object = objectStr
+	}
+
+	return Fact{
+		Subject:   subject,
+		Predicate: predicate,
+		Object:    object,
+	}, nil
+}
+
+// decodeInlineID converts an inline ID back to its Go primitive value.
+func decodeInlineID(id uint64) any {
+	if id&keys.InlineIsNum != 0 {
+		// Number type
+		if id&keys.InlineNumF32 != 0 {
+			return keys.UnpackInlineFloat32(id)
+		}
+		return keys.UnpackInlineInt32(id)
+	}
+	// Bool type
+	return keys.UnpackInlineBool(id)
+}
+
+func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact, error)) iter.Seq2[Fact, error] {
 	return func(yield func(Fact, error) bool) {
 		txn := m.db.NewTransaction(false)
 		defer txn.Discard()
@@ -209,9 +269,7 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 		}
 
 		itOpts := badger.DefaultIteratorOptions
-		if opts.pruneEntityType > 0 || opts.prunePublic {
-			itOpts.PrefetchValues = true // Need values for semantic hints pruning
-		}
+		itOpts.PrefetchValues = true // Always fetch values (needed for inline object decoding)
 		it := txn.NewIterator(itOpts)
 		defer it.Close()
 
@@ -256,8 +314,15 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 			}
 
 			result.key = key
-			fact, ok := processFn(&result)
-			if !ok {
+			// Capture value bytes for inline object decoding
+			_ = item.Value(func(val []byte) error {
+				result.value = make([]byte, len(val))
+				copy(result.value, val)
+				return nil
+			})
+			fact, err := processFn(&result)
+			if err != nil {
+				yield(Fact{}, err)
 				return
 			}
 
@@ -280,66 +345,9 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o string) iter.Seq2[Fa
 		}
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
-		var subject, predicate, objectStr string
-		var err error
-
-		if opts.sBound {
-			subject = opts.s
-		} else {
-			subject, err = m.dict.GetString(r.foundSID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.pBound {
-			predicate = opts.p
-		} else {
-			predicate, err = m.dict.GetString(r.foundPID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.oBound {
-			objectStr = opts.o
-		} else {
-			objectStr, err = m.dict.GetString(r.foundOID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		return Fact{
-			Subject:   subject,
-			Predicate: predicate,
-			Object:    objectStr,
-		}, true
+	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+		return m.resolveFactStrings(opts, r)
 	})
-}
-
-func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o string) (*scanOptions, error) {
-	sID, pID, oID, sBound, pBound, oBound, err := m.resolveScanIDs(s, p, o)
-	if err != nil {
-		return nil, err
-	}
-
-	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
-
-	return &scanOptions{
-		ctx:      ctx,
-		s:        s,
-		p:        p,
-		o:        o,
-		sID:      sID,
-		pID:      pID,
-		oID:      oID,
-		sBound:   sBound,
-		pBound:   pBound,
-		oBound:   oBound,
-		strategy: strategy,
-	}, nil
 }
 
 func (m *MEBStore) ScanWithFilters(s, p, o string, filters []PredicateFilter) iter.Seq2[Fact, error] {
@@ -355,48 +363,21 @@ func (m *MEBStore) ScanWithFiltersContext(ctx context.Context, s, p, o string, f
 	}
 	opts.filters = filters
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
-		var subject, predicate, objectStr string
-		var err error
-
-		if opts.sBound {
-			subject = opts.s
-		} else {
-			subject, err = m.dict.GetString(r.foundSID)
-			if err != nil {
-				return Fact{}, false
-			}
+	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+		fact, err := m.resolveFactStrings(opts, r)
+		if err != nil {
+			return Fact{}, err
 		}
 
-		if opts.pBound {
-			predicate = opts.p
-		} else {
-			predicate, err = m.dict.GetString(r.foundPID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.oBound {
-			objectStr = opts.o
-		} else {
-			objectStr, err = m.dict.GetString(r.foundOID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
+		objectStr := fmt.Sprintf("%v", fact.Object)
 
 		for _, filter := range opts.filters {
 			if !evaluatePredicateFilter(objectStr, filter) {
-				return Fact{}, false
+				return Fact{}, nil
 			}
 		}
 
-		return Fact{
-			Subject:   subject,
-			Predicate: predicate,
-			Object:    objectStr,
-		}, true
+		return fact, nil
 	})
 }
 
@@ -452,48 +433,22 @@ func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o 
 		topicID:  topicID,
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
-		var subject, predicate, objectStr string
-		var err error
+	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+		fact, err := m.resolveFactStrings(opts, r)
+		if err != nil {
+			return Fact{}, err
+		}
 
-		if opts.sBound {
-			subject = opts.s
-		} else {
-			subject, err = m.dict.GetString(r.foundSID)
-			if err != nil {
-				return Fact{}, false
+		if len(opts.filters) > 0 {
+			objectStr := fmt.Sprintf("%v", fact.Object)
+			for _, filter := range opts.filters {
+				if !evaluatePredicateFilter(objectStr, filter) {
+					return Fact{}, nil
+				}
 			}
 		}
 
-		if opts.pBound {
-			predicate = opts.p
-		} else {
-			predicate, err = m.dict.GetString(r.foundPID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.oBound {
-			objectStr = opts.o
-		} else {
-			objectStr, err = m.dict.GetString(r.foundOID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		for _, filter := range opts.filters {
-			if !evaluatePredicateFilter(objectStr, filter) {
-				return Fact{}, false
-			}
-		}
-
-		return Fact{
-			Subject:   subject,
-			Predicate: predicate,
-			Object:    objectStr,
-		}, true
+		return fact, nil
 	})
 }
 
@@ -510,41 +465,7 @@ func (m *MEBStore) ScanWithPruning(s, p, o string, entityType uint16, wantPublic
 	opts.pruneEntityType = entityType
 	opts.prunePublic = wantPublic
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, bool) {
-		var subject, predicate, objectStr string
-		var err error
-
-		if opts.sBound {
-			subject = opts.s
-		} else {
-			subject, err = m.dict.GetString(r.foundSID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.pBound {
-			predicate = opts.p
-		} else {
-			predicate, err = m.dict.GetString(r.foundPID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		if opts.oBound {
-			objectStr = opts.o
-		} else {
-			objectStr, err = m.dict.GetString(r.foundOID)
-			if err != nil {
-				return Fact{}, false
-			}
-		}
-
-		return Fact{
-			Subject:   subject,
-			Predicate: predicate,
-			Object:    objectStr,
-		}, true
+	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+		return m.resolveFactStrings(opts, r)
 	})
 }

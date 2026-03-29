@@ -3,6 +3,10 @@ package meb
 import (
 	"fmt"
 
+	"github.com/duynguyendang/meb/keys"
+
+	"github.com/dgraph-io/badger/v4"
+
 	"codeberg.org/TauCeti/mangle-go/ast"
 	"codeberg.org/TauCeti/mangle-go/factstore"
 )
@@ -85,13 +89,58 @@ func (m *MEBStore) Add(atom ast.Atom) bool {
 	return true
 }
 
+// Exists performs an efficient key-only existence check without decoding strings.
+func (m *MEBStore) Exists(s, p, o string) bool {
+	sID, pID, oID, sBound, pBound, oBound, err := m.resolveScanIDs(s, p, o)
+	if err != nil {
+		return false
+	}
+
+	// Pack IDs with current topic for symmetric lookup
+	if sBound {
+		sID = keys.PackID(m.topicID, keys.UnpackLocalID(sID))
+	}
+	if oBound {
+		oID = keys.PackID(m.topicID, keys.UnpackLocalID(oID))
+	}
+
+	prefix := keys.EncodeTripleSPOPrefix(sID, pID, oID)
+
+	found := false
+	err = m.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.PrefetchSize = 1
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Item().Key()
+			if len(key) != keys.TripleKeySize {
+				continue
+			}
+			fs, fp, fo := keys.DecodeTripleKey(key)
+			if sBound && fs != sID {
+				continue
+			}
+			if pBound && fp != pID {
+				continue
+			}
+			if oBound && fo != oID {
+				continue
+			}
+			found = true
+			return nil
+		}
+		return nil
+	})
+
+	return err == nil && found
+}
+
 func (m *MEBStore) Contains(atom ast.Atom) bool {
 	s, p, o := extractTripleFromAtom(atom)
-
-	for range m.Scan(s, p, o) {
-		return true
-	}
-	return false
+	return m.Exists(s, p, o)
 }
 
 func (m *MEBStore) ListPredicates() []ast.PredicateSym {

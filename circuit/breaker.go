@@ -106,6 +106,11 @@ func (b *Breaker) ExecuteContext(ctx context.Context, fn func() error) error {
 
 	errChan := make(chan error, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errChan <- fmt.Errorf("panic in circuit breaker: %v", r)
+			}
+		}()
 		errChan <- fn()
 	}()
 
@@ -147,6 +152,11 @@ func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func() (interface{},
 	}
 	resultChan := make(chan result, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				resultChan <- result{nil, fmt.Errorf("panic in circuit breaker: %v", r)}
+			}
+		}()
 		data, err := fn()
 		resultChan <- result{data, err}
 	}()
