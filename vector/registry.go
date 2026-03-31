@@ -362,6 +362,13 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		return err
 	}
 
+	// Clean up legacy monolithic keys if they exist
+	r.db.Update(func(txn *badger.Txn) error {
+		txn.Delete([]byte("sys:tq:vectors"))
+		txn.Delete([]byte("sys:tq:ids"))
+		return nil
+	})
+
 	slog.Info("TQ vector snapshot saved", "vectorCount", numVectors)
 	return nil
 }

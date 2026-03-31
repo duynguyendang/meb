@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,9 @@ type MEBStore struct {
 	defaultFlags      uint16
 
 	lastGCTimeNano atomic.Int64
+
+	cleanupStop chan struct{}
+	cleanupDone chan struct{}
 }
 
 func (m *MEBStore) loadStats() error {
@@ -73,7 +77,46 @@ func (m *MEBStore) saveStats() error {
 	})
 }
 
+func (m *MEBStore) ensureSchemaVersion() error {
+	var storedVersion uint64
+	err := m.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keys.KeySchemaVersion)
+		if err == badger.ErrKeyNotFound {
+			storedVersion = 0
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return item.Value(func(val []byte) error {
+			storedVersion = binary.BigEndian.Uint64(val)
+			return nil
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	if storedVersion == 0 {
+		return m.withWriteTxn(func(txn *badger.Txn) error {
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, keys.CurrentSchemaVersion)
+			return txn.Set(keys.KeySchemaVersion, buf)
+		})
+	}
+
+	if storedVersion != keys.CurrentSchemaVersion {
+		return fmt.Errorf("schema version mismatch: stored=%d, current=%d", storedVersion, keys.CurrentSchemaVersion)
+	}
+
+	return nil
+}
+
 func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
+	if cfg.Verbose {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
+
 	slog.Info("initializing MEB store",
 		"dataDir", cfg.DataDir,
 		"inMemory", cfg.InMemory,
@@ -109,14 +152,18 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		return nil, fmt.Errorf("failed to create dictionary encoder: %w", err)
 	}
 
+	vCfg := vector.DefaultConfig()
+	vCfg.SegmentDir = cfg.SegmentDir
 	m := &MEBStore{
 		db:                db,
 		dictDB:            dictDB,
 		dict:              dictEncoder,
 		config:            cfg,
-		vectors:           vector.NewRegistry(db, nil),
+		vectors:           vector.NewRegistry(db, vCfg),
 		breaker:           circuit.NewBreaker(nil),
 		defaultEntityType: keys.EntityUnknown,
+		cleanupStop:       make(chan struct{}),
+		cleanupDone:       make(chan struct{}),
 	}
 	m.topicID.Store(1) // default topic
 
@@ -130,7 +177,13 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		return nil, fmt.Errorf("failed to load stats: %w", err)
 	}
 
+	if err := m.ensureSchemaVersion(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schema version check failed: %w", err)
+	}
+
 	slog.Info("MEB store initialized successfully", "factCount", m.numFacts.Load())
+	go m.runCleanupLoop()
 	return m, nil
 }
 
@@ -153,6 +206,9 @@ func (m *MEBStore) Reset() error {
 
 func (m *MEBStore) Close() error {
 	slog.Info("closing store", "factCount", m.numFacts.Load())
+
+	close(m.cleanupStop)
+	<-m.cleanupDone
 
 	var errs []error
 
@@ -314,6 +370,10 @@ func (m *MEBStore) CircuitBreakerMetrics() circuit.Metrics {
 	return m.breaker.Metrics()
 }
 
+func (m *MEBStore) CircuitBreakerMetricsSnapshot() circuit.MetricsSnapshot {
+	return m.breaker.MetricsSnapshot()
+}
+
 func (m *MEBStore) ResolveID(id uint64) (string, error) {
 	return m.dict.GetString(id)
 }
@@ -368,4 +428,57 @@ func (m *MEBStore) triggerAutoGC() {
 
 	m.factsSinceGC.Store(0)
 	m.lastGCTimeNano.Store(now.UnixNano())
+}
+
+const cleanupInterval = 5 * time.Minute
+
+const (
+	defaultMaxFacts = 0 // 0 = unlimited
+)
+
+func (m *MEBStore) SetRetention(maxFacts uint64) {
+	if maxFacts == 0 {
+		return
+	}
+	current := m.numFacts.Load()
+	if current <= maxFacts {
+		return
+	}
+	slog.Info("retention policy triggered", "currentFacts", current, "maxFacts", maxFacts)
+}
+
+func (m *MEBStore) runCleanupLoop() {
+	defer close(m.cleanupDone)
+
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.cleanupStop:
+			return
+		case <-ticker.C:
+			m.runCleanup()
+		}
+	}
+}
+
+func (m *MEBStore) runCleanup() {
+	if m.config.ReadOnly {
+		return
+	}
+
+	slog.Debug("running periodic cleanup")
+
+	if err := m.db.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
+		slog.Debug("periodic GC failed for facts DB", "error", err)
+	} else if err == nil {
+		slog.Debug("periodic GC completed for facts DB")
+	}
+
+	if err := m.dictDB.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
+		slog.Debug("periodic GC failed for dictionary DB", "error", err)
+	} else if err == nil {
+		slog.Debug("periodic GC completed for dictionary DB")
+	}
 }

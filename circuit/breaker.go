@@ -64,6 +64,19 @@ type Metrics struct {
 	LastError         error
 }
 
+type MetricsSnapshot struct {
+	State             string  `json:"state"`
+	TotalQueries      int64   `json:"total_queries"`
+	SuccessfulQueries int64   `json:"successful_queries"`
+	FailedQueries     int64   `json:"failed_queries"`
+	TimeoutQueries    int64   `json:"timeout_queries"`
+	CancelledQueries  int64   `json:"cancelled_queries"`
+	RejectedQueries   int64   `json:"rejected_queries"`
+	FailureRate       float64 `json:"failure_rate"`
+	LastFailureTime   string  `json:"last_failure_time,omitempty"`
+	LastError         string  `json:"last_error,omitempty"`
+}
+
 type Breaker struct {
 	config *Config
 	mu     sync.RWMutex
@@ -276,6 +289,34 @@ func (b *Breaker) Metrics() Metrics {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.metrics
+}
+
+func (b *Breaker) MetricsSnapshot() MetricsSnapshot {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	var failureRate float64
+	if b.metrics.TotalQueries > 0 {
+		failureRate = float64(b.metrics.FailedQueries+b.metrics.TimeoutQueries) / float64(b.metrics.TotalQueries)
+	}
+
+	snap := MetricsSnapshot{
+		State:             b.state.String(),
+		TotalQueries:      b.metrics.TotalQueries,
+		SuccessfulQueries: b.metrics.SuccessfulQueries,
+		FailedQueries:     b.metrics.FailedQueries,
+		TimeoutQueries:    b.metrics.TimeoutQueries,
+		CancelledQueries:  b.metrics.CancelledQueries,
+		RejectedQueries:   b.metrics.RejectedQueries,
+		FailureRate:       failureRate,
+	}
+	if !b.metrics.LastFailureTime.IsZero() {
+		snap.LastFailureTime = b.metrics.LastFailureTime.Format(time.RFC3339)
+	}
+	if b.metrics.LastError != nil {
+		snap.LastError = b.metrics.LastError.Error()
+	}
+	return snap
 }
 
 func (b *Breaker) Reset() {

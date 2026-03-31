@@ -233,32 +233,11 @@ func DotProductHybrid(a, b []byte, dim int, cfg *HybridConfig) float32 {
 
 		switch cfg.BitWidth {
 		case 8:
-			for i := 0; i < blockLen; i++ {
-				qa := int64(a[offsetA+i])
-				qb := int64(b[offsetB+i])
-				sumQQ += qa * qb
-				sumQA += qa
-				sumQB += qb
-			}
+			sumQQ, sumQA, sumQB = dotProdBlock8(a[offsetA:offsetA+blockLen], b[offsetB:offsetB+blockLen])
 			offsetA += blockSize
 			offsetB += blockSize
 		case 4:
-			for i := 0; i < blockLen; i += 2 {
-				byteA := a[offsetA+i/2]
-				byteB := b[offsetB+i/2]
-				qa1 := int64(byteA >> 4)
-				qb1 := int64(byteB >> 4)
-				sumQQ += qa1 * qb1
-				sumQA += qa1
-				sumQB += qb1
-				if i+1 < blockLen {
-					qa2 := int64(byteA & 0x0F)
-					qb2 := int64(byteB & 0x0F)
-					sumQQ += qa2 * qb2
-					sumQA += qa2
-					sumQB += qb2
-				}
-			}
+			sumQQ, sumQA, sumQB = dotProdBlock4(a[offsetA:offsetA+blockLen/2], b[offsetB:offsetB+blockLen/2], blockLen)
 			offsetA += blockSize / 2
 			offsetB += blockSize / 2
 		}

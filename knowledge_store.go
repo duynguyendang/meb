@@ -47,6 +47,9 @@ func ShouldPruneTriple(value []byte, wantEntityType uint16, wantPublic bool) boo
 	if wantPublic && (flags&keys.FlagIsPublic) == 0 {
 		return true
 	}
+	if flags&keys.FlagIsDeprecated != 0 {
+		return true
+	}
 	return false
 }
 

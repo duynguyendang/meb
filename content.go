@@ -50,6 +50,17 @@ func (m *MEBStore) GetContent(id uint64) ([]byte, error) {
 }
 
 func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, metadata map[string]any) error {
+	return m.addDocumentWithTopic(m.topicID.Load(), docKey, content, vec, metadata)
+}
+
+func (m *MEBStore) AddDocumentWithTopic(topicID uint32, docKey string, content []byte, vec []float32, metadata map[string]any) error {
+	if topicID == 0 {
+		return fmt.Errorf("%w: topicID must be non-zero", ErrInvalidFact)
+	}
+	return m.addDocumentWithTopic(topicID, docKey, content, vec, metadata)
+}
+
+func (m *MEBStore) addDocumentWithTopic(topicID uint32, docKey string, content []byte, vec []float32, metadata map[string]any) error {
 	if docKey == "" {
 		return fmt.Errorf("%w: document key cannot be empty", ErrInvalidFact)
 	}
@@ -59,7 +70,6 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 		return fmt.Errorf("failed to get document ID: %w", err)
 	}
 
-	// Add metadata facts first — if this fails, nothing else is written
 	if len(metadata) > 0 {
 		facts := make([]Fact, 0, len(metadata))
 		for key, value := range metadata {
@@ -69,9 +79,12 @@ func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, met
 				Object:    value,
 			})
 		}
+		prevTopic := m.topicID.Swap(topicID)
 		if err := m.AddFactBatch(facts); err != nil {
+			m.topicID.Store(prevTopic)
 			return fmt.Errorf("failed to add metadata facts: %w", err)
 		}
+		m.topicID.Store(prevTopic)
 	}
 
 	if len(vec) > 0 {
@@ -160,6 +173,8 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 	if deletedCount > 0 {
 		m.numFacts.Add(^uint64(deletedCount - 1))
 	}
+
+	m.dict.DeleteID(docKey)
 
 	return nil
 }

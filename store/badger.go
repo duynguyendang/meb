@@ -42,6 +42,8 @@ type Config struct {
 	ValueLogFileSize int64
 
 	Verbose bool
+
+	SegmentDir string
 }
 
 func (c *Config) Validate() error {

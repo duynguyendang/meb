@@ -9,5 +9,7 @@ type Dictionary interface {
 
 	GetString(id uint64) (string, error)
 
+	DeleteID(s string) error
+
 	Close() error
 }

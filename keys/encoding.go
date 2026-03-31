@@ -66,6 +66,12 @@ const (
 
 var KeyFactCount = []byte{SystemPrefix, 0x01}
 
+// Schema version marker stored in BadgerDB to detect data format version.
+// Increment when bit layouts change (Inline ID, TopicID, Semantic Hints).
+var KeySchemaVersion = []byte{SystemPrefix, 0x02}
+
+const CurrentSchemaVersion = 1
+
 // Inline ID encoding: store primitive values directly in the 64-bit object ID.
 //
 // Bit layout:

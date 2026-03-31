@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/golang-lru/v2/expirable"
@@ -31,6 +32,7 @@ type Encoder struct {
 
 type lruCache[K comparable, V any] struct {
 	cache *expirable.LRU[K, V]
+	mu    sync.RWMutex
 }
 
 func newLRUCache[K comparable, V any](size int) *lruCache[K, V] {
@@ -40,11 +42,21 @@ func newLRUCache[K comparable, V any](size int) *lruCache[K, V] {
 }
 
 func (c *lruCache[K, V]) Get(key K) (V, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.cache.Get(key)
 }
 
 func (c *lruCache[K, V]) Add(key K, value V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.cache.Add(key, value)
+}
+
+func (c *lruCache[K, V]) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cache.Len()
 }
 
 func NewEncoder(db *badger.DB, cacheSize int) (*Encoder, error) {
@@ -300,6 +312,36 @@ func (e *Encoder) GetID(s string) (uint64, error) {
 	return id, nil
 }
 
+func (e *Encoder) DeleteID(s string) error {
+	id, err := e.GetID(s)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil
+		}
+		return err
+	}
+
+	err = e.db.Update(func(txn *badger.Txn) error {
+		if err := txn.Delete(makeDictForwardKey(s)); err != nil {
+			return err
+		}
+		return txn.Delete(makeDictReverseKey(id))
+	})
+	if err != nil {
+		return err
+	}
+
+	e.forwardCache.mu.Lock()
+	e.forwardCache.cache.Remove(s)
+	e.forwardCache.mu.Unlock()
+
+	e.reverseCache.mu.Lock()
+	e.reverseCache.cache.Remove(id)
+	e.reverseCache.mu.Unlock()
+
+	return nil
+}
+
 func makeDictForwardKey(s string) []byte {
 	if len(s) > 255 {
 		hash := sha256.Sum256([]byte(s))
@@ -336,8 +378,8 @@ func (e *Encoder) Close() error {
 
 func (e *Encoder) Stats() map[string]interface{} {
 	return map[string]interface{}{
-		"forward_cache_len": e.forwardCache.cache.Len(),
-		"reverse_cache_len": e.reverseCache.cache.Len(),
+		"forward_cache_len": e.forwardCache.Len(),
+		"reverse_cache_len": e.reverseCache.Len(),
 		"next_id":           e.allocator.CurrentID() + 1,
 	}
 }

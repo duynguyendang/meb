@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/duynguyendang/meb/keys"
@@ -176,6 +177,11 @@ func (e *LFTJEngine) leapfrogRecursive(
 		// Check visit limit
 		if vc != nil && maxVisits > 0 {
 			if vc.Add(1) > maxVisits {
+				slog.Warn("LFTJ visit limit exceeded",
+					"visits", vc.Load(),
+					"maxVisits", maxVisits,
+					"relations", len(relations),
+				)
 				yield(nil, ErrTooManyVisits)
 				return false
 			}
@@ -233,6 +239,11 @@ type TrieIterator struct {
 	bound  map[int]uint64
 	keyBuf []byte
 	atEnd  bool
+
+	// depthPrefix tracks the expected prefix bytes at the current join depth.
+	// When Next() or Seek() advances past this prefix, the iterator stops
+	// instead of wandering into adjacent branches.
+	depthPrefixLen int
 }
 
 func NewTrieIterator(txn *badger.Txn, prefix byte, bound map[int]uint64) *TrieIterator {
@@ -249,6 +260,7 @@ func (ti *TrieIterator) Open() {
 	ti.it = ti.txn.NewIterator(badger.DefaultIteratorOptions)
 	ti.buildPrefix()
 	ti.it.Seek(ti.keyBuf[:ti.prefixLen()])
+	ti.depthPrefixLen = ti.prefixLen()
 	ti.validatePosition()
 }
 
@@ -264,6 +276,8 @@ func (ti *TrieIterator) SetBinding(pos int, val uint64) {
 		ti.bound = make(map[int]uint64)
 	}
 	ti.bound[pos] = val
+	ti.buildPrefix()
+	ti.depthPrefixLen = ti.prefixLen()
 }
 
 func (ti *TrieIterator) AtEnd() bool {
@@ -278,8 +292,27 @@ func (ti *TrieIterator) Key() uint64 {
 	if len(key) < keys.TripleKeySize {
 		return 0
 	}
-	_, _, o := keys.DecodeTripleKey(key)
-	return o
+	s, p, o := keys.DecodeTripleKey(key)
+	return ti.keyAtDepth(s, p, o)
+}
+
+func (ti *TrieIterator) keyAtDepth(s, p, o uint64) uint64 {
+	if ti.prefix == keys.TripleSPOPrefix {
+		if _, ok := ti.bound[0]; !ok {
+			return s
+		}
+		if _, ok := ti.bound[1]; !ok {
+			return p
+		}
+		return o
+	}
+	if _, ok := ti.bound[2]; !ok {
+		return o
+	}
+	if _, ok := ti.bound[1]; !ok {
+		return p
+	}
+	return s
 }
 
 func (ti *TrieIterator) Seek(target uint64) {
@@ -291,11 +324,34 @@ func (ti *TrieIterator) Seek(target uint64) {
 	for k, v := range ti.bound {
 		boundWithTarget[k] = v
 	}
-	boundWithTarget[2] = target
+
+	unboundPos := ti.unboundPosition()
+	if unboundPos >= 0 {
+		boundWithTarget[unboundPos] = target
+	}
 
 	ti.keyBuf = keys.EncodeTripleKey(ti.prefix, boundWithTarget[0], boundWithTarget[1], boundWithTarget[2])
 	ti.it.Seek(ti.keyBuf[:ti.prefixLen()+8])
 	ti.validatePosition()
+}
+
+func (ti *TrieIterator) unboundPosition() int {
+	if ti.prefix == keys.TripleSPOPrefix {
+		if _, ok := ti.bound[0]; !ok {
+			return 0
+		}
+		if _, ok := ti.bound[1]; !ok {
+			return 1
+		}
+		return 2
+	}
+	if _, ok := ti.bound[2]; !ok {
+		return 2
+	}
+	if _, ok := ti.bound[1]; !ok {
+		return 1
+	}
+	return 0
 }
 
 func (ti *TrieIterator) Next() {
@@ -364,19 +420,35 @@ func (ti *TrieIterator) validatePosition() {
 			continue
 		}
 
-		match := true
-		for i := 0; i < pLen && i < len(key); i++ {
-			if key[i] != ti.keyBuf[i] {
-				match = false
-				break
+		if pLen > 0 {
+			match := true
+			for i := 0; i < pLen && i < len(key); i++ {
+				if key[i] != ti.keyBuf[i] {
+					match = false
+					break
+				}
+			}
+			if !match {
+				ti.atEnd = true
+				return
 			}
 		}
 
-		if match {
-			ti.atEnd = false
-			return
+		if ti.depthPrefixLen > 0 && len(key) >= ti.depthPrefixLen {
+			match := true
+			for i := 0; i < ti.depthPrefixLen; i++ {
+				if key[i] != ti.keyBuf[i] {
+					match = false
+					break
+				}
+			}
+			if !match {
+				ti.atEnd = true
+				return
+			}
 		}
 
-		ti.it.Next()
+		ti.atEnd = false
+		return
 	}
 }
