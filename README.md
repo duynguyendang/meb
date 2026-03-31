@@ -305,12 +305,6 @@ go test ./...
 go vet ./...
 ```
 
-## Documentation
-
-- [CSD (Conceptual Solution Design)](../kronos-docs/meb/CSD.md)
-- [TurboQuant Architecture](../kronos-docs/meb/turboquant-architecture.md)
-- [ROADMAP](../kronos-docs/meb/ROADMAP.md)
-
 ## Dependencies
 
 - `github.com/dgraph-io/badger/v4` — Key-value storage
