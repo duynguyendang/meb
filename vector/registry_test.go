@@ -14,13 +14,13 @@ func newTestRegistry(t *testing.T) *VectorRegistry {
 	dir := t.TempDir()
 	cfg := &Config{
 		FullDim:         128,
-		TQBitWidth:      8,
-		TQBlockSize:     32,
+		HybridBitWidth:  8,
+		HybridBlockSize: 32,
 		NumWorkers:      2,
 		VectorCapacity:  1024 * 1024,
 		InitialCapacity: 100,
 		SegmentDir:      dir,
-		SegmentSize:     64 * 1024, // 64KB segments (small for testing)
+		SegmentSize:     64 * 1024,
 	}
 	// Use an in-memory badger db for tests
 	opts := badger.DefaultOptions("")
@@ -67,13 +67,13 @@ func TestSegmentedMultipleSegments(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{
 		FullDim:         128,
-		TQBitWidth:      8,
-		TQBlockSize:     32,
+		HybridBitWidth:  8,
+		HybridBlockSize: 32,
 		NumWorkers:      1,
 		VectorCapacity:  1024 * 1024,
 		InitialCapacity: 10,
 		SegmentDir:      dir,
-		SegmentSize:     4096, // Very small: forces multiple segments
+		SegmentSize:     4096,
 	}
 	opts := badger.DefaultOptions("")
 	opts.InMemory = true

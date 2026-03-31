@@ -14,24 +14,24 @@ import (
 
 type Config struct {
 	FullDim         int
-	TQBitWidth      int
-	TQBlockSize     int
+	HybridBitWidth  int
+	HybridBlockSize int
 	NumWorkers      int
 	VectorCapacity  int
 	InitialCapacity int
-	SegmentDir      string // Directory for mmap segment files
-	SegmentSize     int    // Max bytes per segment (default: 64MB)
+	SegmentDir      string
+	SegmentSize     int
 }
 
 func DefaultConfig() *Config {
 	return &Config{
 		FullDim:         1536,
-		TQBitWidth:      8,
-		TQBlockSize:     32,
+		HybridBitWidth:  8,
+		HybridBlockSize: 32,
 		NumWorkers:      4,
 		VectorCapacity:  25 * 1024 * 1024,
 		InitialCapacity: 100000,
-		SegmentSize:     64 << 20, // 64MB per segment
+		SegmentSize:     64 << 20,
 	}
 }
 
@@ -39,11 +39,11 @@ func (c *Config) Validate() error {
 	if c.FullDim <= 0 {
 		return fmt.Errorf("FullDim must be positive")
 	}
-	if c.TQBitWidth != 4 && c.TQBitWidth != 8 {
-		return fmt.Errorf("TQBitWidth must be 4 or 8")
+	if c.HybridBitWidth != 4 && c.HybridBitWidth != 8 {
+		return fmt.Errorf("HybridBitWidth must be 4 or 8")
 	}
-	if c.TQBlockSize <= 0 || c.TQBlockSize%8 != 0 {
-		return fmt.Errorf("TQBlockSize must be positive and divisible by 8")
+	if c.HybridBlockSize <= 0 || c.HybridBlockSize%8 != 0 {
+		return fmt.Errorf("HybridBlockSize must be positive and divisible by 8")
 	}
 	if c.NumWorkers <= 0 {
 		return fmt.Errorf("NumWorkers must be positive")
@@ -57,25 +57,22 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func (c *Config) TQConfig() *TurboQuantConfig {
-	return &TurboQuantConfig{
-		BitWidth:  c.TQBitWidth,
-		BlockSize: c.TQBlockSize,
+func (c *Config) HybridConfig() *HybridConfig {
+	return &HybridConfig{
+		BitWidth:  c.HybridBitWidth,
+		BlockSize: c.HybridBlockSize,
 	}
 }
 
-// VectorRegistry holds TurboQuant compressed vectors for fast search.
-// Data is stored in segmented mmap files. New segments are appended
-// during growth — existing segments remain mapped, so concurrent
-// readers on older segments are never disturbed.
+// VectorRegistry holds Hybrid (FWHT + block-wise) compressed vectors for fast search.
 type VectorRegistry struct {
 	config     *Config
-	tqConfig   *TurboQuantConfig
+	hybridCfg  *HybridConfig
 	vectorSize int
 
 	segments          []*mmapSegment
 	vectorsPerSegment int
-	totalVectors      int // Total number of vectors stored
+	totalVectors      int
 
 	idMap  map[uint64]uint32
 	revMap []uint64
@@ -95,8 +92,8 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 		panic(fmt.Sprintf("invalid vector config: %v", err))
 	}
 
-	tqCfg := cfg.TQConfig()
-	vSize := TQVectorSize(cfg.FullDim, tqCfg) + hashSize
+	hybridCfg := cfg.HybridConfig()
+	vSize := HybridVectorSize(cfg.FullDim, hybridCfg) + hashSize
 
 	segSize := cfg.SegmentSize
 	if segSize <= 0 {
@@ -109,7 +106,7 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 
 	r := &VectorRegistry{
 		config:            cfg,
-		tqConfig:          tqCfg,
+		hybridCfg:         hybridCfg,
 		vectorSize:        vSize,
 		vectorsPerSegment: vectorsPerSeg,
 		idMap:             make(map[uint64]uint32, cfg.InitialCapacity),
@@ -152,14 +149,14 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		return fmt.Errorf("invalid vector dimension: expected %d, got %d", r.config.FullDim, len(fullVec))
 	}
 
-	tqData := QuantizeTurboQuant(fullVec, r.tqConfig)
-	tqSize := len(tqData)
+	hybridData := QuantizeHybrid(fullVec, r.hybridCfg)
+	hybridSize := len(hybridData)
 
 	r.mu.Lock()
 	if idx, exists := r.idMap[id]; exists {
 		slot := r.getVectorSlice(int(idx))
 		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+tqSize], tqData)
+		copy(slot[hashSize:hashSize+hybridSize], hybridData)
 		r.mu.Unlock()
 	} else {
 		newTotal := r.totalVectors + 1
@@ -174,7 +171,7 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 
 		slot := r.getVectorSlice(int(idx))
 		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+tqSize], tqData)
+		copy(slot[hashSize:hashSize+hybridSize], hybridData)
 
 		r.totalVectors = newTotal
 		r.mu.Unlock()
@@ -263,8 +260,8 @@ func (r *VectorRegistry) GetTQVector(idx int) []byte {
 	return slot[hashSize:]
 }
 
-func (r *VectorRegistry) TQConfig() *TurboQuantConfig {
-	return r.tqConfig
+func (r *VectorRegistry) HybridConfig() *HybridConfig {
+	return r.hybridCfg
 }
 
 func (r *VectorRegistry) VectorSize() int {

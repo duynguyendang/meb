@@ -6,25 +6,25 @@ import (
 )
 
 const (
-	DefaultTQBitWidth  = 8
-	DefaultTQBlockSize = 32
+	DefaultHybridBitWidth  = 8
+	DefaultHybridBlockSize = 32
 )
 
-type TurboQuantConfig struct {
+type HybridConfig struct {
 	BitWidth  int
 	BlockSize int
 }
 
-func DefaultTurboQuantConfig() *TurboQuantConfig {
-	return &TurboQuantConfig{
-		BitWidth:  DefaultTQBitWidth,
-		BlockSize: DefaultTQBlockSize,
+func DefaultHybridConfig() *HybridConfig {
+	return &HybridConfig{
+		BitWidth:  DefaultHybridBitWidth,
+		BlockSize: DefaultHybridBlockSize,
 	}
 }
 
-func TQVectorSize(dim int, cfg *TurboQuantConfig) int {
+func HybridVectorSize(dim int, cfg *HybridConfig) int {
 	if cfg == nil {
-		cfg = DefaultTurboQuantConfig()
+		cfg = DefaultHybridConfig()
 	}
 	numBlocks := (dim + cfg.BlockSize - 1) / cfg.BlockSize
 	switch cfg.BitWidth {
@@ -37,34 +37,44 @@ func TQVectorSize(dim int, cfg *TurboQuantConfig) int {
 	}
 }
 
-// QuantizeTurboQuant compresses a float32 vector to TurboQuant format.
-// Format per block: [scale:4 LE][zero:4 LE][q_0:1][q_1:1]...[q_{B-1}:1]
-func QuantizeTurboQuant(vec []float32, cfg *TurboQuantConfig) []byte {
+func QuantizeHybrid(vec []float32, cfg *HybridConfig) []byte {
 	if cfg == nil {
-		cfg = DefaultTurboQuantConfig()
+		cfg = DefaultHybridConfig()
 	}
 
 	dim := len(vec)
+	paddedDim := nextPow2(dim)
+
+	padded := make([]float32, paddedDim)
+	copy(padded, vec)
+
+	FWHT(padded)
+
+	invNorm := 1.0 / float32(math.Sqrt(float64(paddedDim)))
+	for i := range padded {
+		padded[i] *= invNorm
+	}
+
 	blockSize := cfg.BlockSize
-	numBlocks := (dim + blockSize - 1) / blockSize
-	outSize := TQVectorSize(dim, cfg)
+	numBlocks := (paddedDim + blockSize - 1) / blockSize
+	outSize := HybridVectorSize(paddedDim, cfg)
 	out := make([]byte, outSize)
 
 	offset := 0
 	for b := 0; b < numBlocks; b++ {
 		start := b * blockSize
 		end := start + blockSize
-		if end > dim {
-			end = dim
+		if end > paddedDim {
+			end = paddedDim
 		}
 
 		minVal, maxVal := float32(math.MaxFloat32), float32(-math.MaxFloat32)
 		for i := start; i < end; i++ {
-			if vec[i] < minVal {
-				minVal = vec[i]
+			if padded[i] < minVal {
+				minVal = padded[i]
 			}
-			if vec[i] > maxVal {
-				maxVal = vec[i]
+			if padded[i] > maxVal {
+				maxVal = padded[i]
 			}
 		}
 
@@ -85,7 +95,7 @@ func QuantizeTurboQuant(vec []float32, cfg *TurboQuantConfig) []byte {
 		switch cfg.BitWidth {
 		case 8:
 			for i := start; i < end; i++ {
-				v := (vec[i] - zero) / scale
+				v := (padded[i] - zero) / scale
 				q := int(math.Round(float64(v)))
 				if q < 0 {
 					q = 0
@@ -101,7 +111,7 @@ func QuantizeTurboQuant(vec []float32, cfg *TurboQuantConfig) []byte {
 			}
 		case 4:
 			for i := start; i < end; i += 2 {
-				v1 := (vec[i] - zero) / scale
+				v1 := (padded[i] - zero) / scale
 				q1 := int(math.Round(float64(v1)))
 				if q1 < 0 {
 					q1 = 0
@@ -110,7 +120,7 @@ func QuantizeTurboQuant(vec []float32, cfg *TurboQuantConfig) []byte {
 				}
 				var q2 int
 				if i+1 < end {
-					v2 := (vec[i+1] - zero) / scale
+					v2 := (padded[i+1] - zero) / scale
 					q2 = int(math.Round(float64(v2)))
 					if q2 < 0 {
 						q2 = 0
@@ -131,22 +141,22 @@ func QuantizeTurboQuant(vec []float32, cfg *TurboQuantConfig) []byte {
 	return out
 }
 
-// DequantizeTurboQuant decompresses a TQ vector back to float32.
-func DequantizeTurboQuant(data []byte, dim int, cfg *TurboQuantConfig) []float32 {
+func DequantizeHybrid(data []byte, dim int, cfg *HybridConfig) []float32 {
 	if cfg == nil {
-		cfg = DefaultTurboQuantConfig()
+		cfg = DefaultHybridConfig()
 	}
 
-	vec := make([]float32, dim)
+	paddedDim := nextPow2(dim)
+	vec := make([]float32, paddedDim)
 	blockSize := cfg.BlockSize
-	numBlocks := (dim + blockSize - 1) / blockSize
+	numBlocks := (paddedDim + blockSize - 1) / blockSize
 
 	offset := 0
 	for b := 0; b < numBlocks; b++ {
 		start := b * blockSize
 		end := start + blockSize
-		if end > dim {
-			end = dim
+		if end > paddedDim {
+			end = paddedDim
 		}
 
 		scaleBits := binary.LittleEndian.Uint32(data[offset:])
@@ -176,24 +186,30 @@ func DequantizeTurboQuant(data []byte, dim int, cfg *TurboQuantConfig) []float32
 		}
 	}
 
-	return vec
-}
-
-// DotProductTurboQuant computes the dot product between two TQ-compressed vectors
-// using blockwise dot product without full dequantization.
-// For cosine similarity, vectors must be L2-normalized before quantization.
-func DotProductTurboQuant(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
-	if cfg == nil {
-		cfg = DefaultTurboQuantConfig()
+	FWHT(vec)
+	invNorm := 1.0 / float32(math.Sqrt(float64(paddedDim)))
+	for i := range vec {
+		vec[i] *= invNorm
 	}
 
-	expectedSize := TQVectorSize(dim, cfg)
+	result := make([]float32, dim)
+	copy(result, vec[:dim])
+	return result
+}
+
+func DotProductHybrid(a, b []byte, dim int, cfg *HybridConfig) float32 {
+	if cfg == nil {
+		cfg = DefaultHybridConfig()
+	}
+
+	paddedDim := nextPow2(dim)
+	expectedSize := HybridVectorSize(paddedDim, cfg)
 	if len(a) < expectedSize || len(b) < expectedSize {
 		return 0
 	}
 
 	blockSize := cfg.BlockSize
-	numBlocks := (dim + blockSize - 1) / blockSize
+	numBlocks := (paddedDim + blockSize - 1) / blockSize
 
 	var totalSum float32
 	offsetA := 0
@@ -201,8 +217,8 @@ func DotProductTurboQuant(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
 
 	for block := 0; block < numBlocks; block++ {
 		blockLen := blockSize
-		if (block+1)*blockSize > dim {
-			blockLen = dim - block*blockSize
+		if (block+1)*blockSize > paddedDim {
+			blockLen = paddedDim - block*blockSize
 		}
 
 		scaleA := math.Float32frombits(binary.LittleEndian.Uint32(a[offsetA:]))
@@ -256,9 +272,8 @@ func DotProductTurboQuant(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
 	return totalSum
 }
 
-// DotProductTQFull dequantizes both vectors and computes exact dot product.
-func DotProductTQFull(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
-	vecA := DequantizeTurboQuant(a, dim, cfg)
-	vecB := DequantizeTurboQuant(b, dim, cfg)
+func DotProductHybridFull(a, b []byte, dim int, cfg *HybridConfig) float32 {
+	vecA := DequantizeHybrid(a, dim, cfg)
+	vecB := DequantizeHybrid(b, dim, cfg)
 	return DotProduct(vecA, vecB)
 }

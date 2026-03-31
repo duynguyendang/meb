@@ -51,7 +51,7 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 			"numWorkers", r.config.NumWorkers,
 		)
 
-		tqQuery := QuantizeTurboQuant(queryVec, r.tqConfig)
+		hybridQuery := QuantizeHybrid(queryVec, r.hybridCfg)
 
 		r.mu.RLock()
 		numVectors := r.totalVectors
@@ -89,7 +89,7 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := scanChunkTQ(getSlot, tqQuery, start, end, k, vectorSize, revMap, filterHash, r.config.FullDim, r.tqConfig)
+				topK := scanChunkHybrid(getSlot, hybridQuery, start, end, k, vectorSize, revMap, filterHash, r.config.FullDim, r.hybridCfg)
 				resultCh <- topK
 			}(startIdx, endIdx)
 		}
@@ -123,7 +123,7 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 			"k", k,
 		)
 
-		tqQuery := QuantizeTurboQuant(queryVec, r.tqConfig)
+		hybridQuery := QuantizeHybrid(queryVec, r.hybridCfg)
 
 		r.mu.RLock()
 		numVectors := r.totalVectors
@@ -162,7 +162,7 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := scanChunkTQWithTopic(getSlot, tqQuery, start, end, k, vectorSize, revMap, topicFilter, r.config.FullDim, r.tqConfig)
+				topK := scanChunkHybridWithTopic(getSlot, hybridQuery, start, end, k, vectorSize, revMap, topicFilter, r.config.FullDim, r.hybridCfg)
 				resultCh <- topK
 			}(startIdx, endIdx)
 		}
@@ -183,21 +183,20 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 	}
 }
 
-// scanChunkTQ scans a chunk of TQ vectors using a slot accessor function.
-func scanChunkTQ(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, filterHash uint8, fullDim int, tqCfg *TurboQuantConfig) []SearchResult {
+// scanChunkHybrid scans a chunk of Hybrid vectors using a slot accessor function.
+func scanChunkHybrid(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, filterHash uint8, fullDim int, hybridCfg *HybridConfig) []SearchResult {
 	h := make(scoreHeap, 0, k)
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		slot := getSlot(idx)
 
-		// Semantic hash filter
 		hashByte := slot[0]
 		if filterHash != 0 && hashByte != filterHash {
 			continue
 		}
 
 		vecData := slot[hashSize:vectorSize]
-		score := DotProductTurboQuant(vecData, query, fullDim, tqCfg)
+		score := DotProductHybrid(vecData, query, fullDim, hybridCfg)
 
 		if len(h) < k {
 			h = append(h, scoreIndex{score: score, idx: idx})
@@ -223,8 +222,8 @@ func scanChunkTQ(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int
 	return results
 }
 
-// scanChunkTQWithTopic scans a chunk of TQ vectors filtering by topic ID.
-func scanChunkTQWithTopic(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, topicFilter uint64, fullDim int, tqCfg *TurboQuantConfig) []SearchResult {
+// scanChunkHybridWithTopic scans a chunk of Hybrid vectors filtering by topic ID.
+func scanChunkHybridWithTopic(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, topicFilter uint64, fullDim int, hybridCfg *HybridConfig) []SearchResult {
 	h := make(scoreHeap, 0, k)
 	topicMask := TopicIDMask
 
@@ -238,7 +237,7 @@ func scanChunkTQWithTopic(getSlot func(int) []byte, query []byte, startIdx, endI
 
 		slot := getSlot(idx)
 		vecData := slot[hashSize:vectorSize]
-		score := DotProductTurboQuant(vecData, query, fullDim, tqCfg)
+		score := DotProductHybrid(vecData, query, fullDim, hybridCfg)
 
 		if len(h) < k {
 			h = append(h, scoreIndex{score: score, idx: idx})
