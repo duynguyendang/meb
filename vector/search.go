@@ -74,7 +74,6 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 		vectorsPerWorker := (numVectors + numWorkers - 1) / numWorkers
 
 		resultCh := make(chan []SearchResult, numWorkers)
-		done := make(chan struct{})
 		actualWorkers := 0
 
 		for i := 0; i < numWorkers; i++ {
@@ -91,10 +90,7 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 			go func(start, end int) {
 				defer func() { recover() }()
 				topK := scanChunkTQ(getSlot, tqQuery, start, end, k, vectorSize, revMap, filterHash, r.config.FullDim, r.tqConfig)
-				select {
-				case resultCh <- topK:
-				case <-done:
-				}
+				resultCh <- topK
 			}(startIdx, endIdx)
 		}
 
@@ -141,57 +137,34 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
 		r.mu.RUnlock()
 
-		packedTopicPrefix := uint64(topicID) << 40
-		topicMask := TopicIDMask
+		topicFilter := uint64(topicID) << 40
 
-		startIdx := -1
-		endIdx := -1
-		for i, id := range revMap {
-			if (id & topicMask) == packedTopicPrefix {
-				if startIdx == -1 {
-					startIdx = i
-				}
-				endIdx = i + 1
-			} else if startIdx != -1 {
-				break
-			}
-		}
-
-		if startIdx == -1 {
-			return
-		}
-
-		vectorsInRange := endIdx - startIdx
 		numWorkers := r.config.NumWorkers
-		if numWorkers > vectorsInRange {
-			numWorkers = vectorsInRange
+		if numWorkers > numVectors {
+			numWorkers = numVectors
 		}
 
-		vectorsPerWorker := (vectorsInRange + numWorkers - 1) / numWorkers
+		vectorsPerWorker := (numVectors + numWorkers - 1) / numWorkers
 
 		resultCh := make(chan []SearchResult, numWorkers)
-		done := make(chan struct{})
 		actualWorkers := 0
 
 		for i := 0; i < numWorkers; i++ {
-			wStart := startIdx + i*vectorsPerWorker
-			wEnd := wStart + vectorsPerWorker
-			if wEnd > endIdx {
-				wEnd = endIdx
+			startIdx := i * vectorsPerWorker
+			endIdx := startIdx + vectorsPerWorker
+			if endIdx > numVectors {
+				endIdx = numVectors
 			}
-			if wStart >= wEnd {
+			if startIdx >= endIdx {
 				break
 			}
 
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := scanChunkTQ(getSlot, tqQuery, start, end, k, vectorSize, revMap, 0, r.config.FullDim, r.tqConfig)
-				select {
-				case resultCh <- topK:
-				case <-done:
-				}
-			}(wStart, wEnd)
+				topK := scanChunkTQWithTopic(getSlot, tqQuery, start, end, k, vectorSize, revMap, topicFilter, r.config.FullDim, r.tqConfig)
+				resultCh <- topK
+			}(startIdx, endIdx)
 		}
 
 		allResults := make([]SearchResult, 0, k*actualWorkers)
@@ -223,6 +196,47 @@ func scanChunkTQ(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int
 			continue
 		}
 
+		vecData := slot[hashSize:vectorSize]
+		score := DotProductTurboQuant(vecData, query, fullDim, tqCfg)
+
+		if len(h) < k {
+			h = append(h, scoreIndex{score: score, idx: idx})
+			if len(h) == k {
+				heap.Init(&h)
+			}
+		} else if score > h[0].score {
+			h[0] = scoreIndex{score: score, idx: idx}
+			heap.Fix(&h, 0)
+		}
+	}
+
+	results := make([]SearchResult, 0, len(h))
+	for _, si := range h {
+		if si.idx < len(revMap) {
+			results = append(results, SearchResult{
+				ID:    revMap[si.idx],
+				Score: si.score,
+			})
+		}
+	}
+
+	return results
+}
+
+// scanChunkTQWithTopic scans a chunk of TQ vectors filtering by topic ID.
+func scanChunkTQWithTopic(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, topicFilter uint64, fullDim int, tqCfg *TurboQuantConfig) []SearchResult {
+	h := make(scoreHeap, 0, k)
+	topicMask := TopicIDMask
+
+	for idx := startIdx; idx < endIdx; idx++ {
+		if idx >= len(revMap) {
+			break
+		}
+		if (revMap[idx] & topicMask) != topicFilter {
+			continue
+		}
+
+		slot := getSlot(idx)
 		vecData := slot[hashSize:vectorSize]
 		score := DotProductTurboQuant(vecData, query, fullDim, tqCfg)
 

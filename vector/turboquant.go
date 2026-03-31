@@ -187,6 +187,11 @@ func DotProductTurboQuant(a, b []byte, dim int, cfg *TurboQuantConfig) float32 {
 		cfg = DefaultTurboQuantConfig()
 	}
 
+	expectedSize := TQVectorSize(dim, cfg)
+	if len(a) < expectedSize || len(b) < expectedSize {
+		return 0
+	}
+
 	blockSize := cfg.BlockSize
 	numBlocks := (dim + blockSize - 1) / blockSize
 

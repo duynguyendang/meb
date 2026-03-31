@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -14,24 +15,22 @@ func L2Normalize(vec []float32) []float32 {
 
 	magnitude := float32(math.Sqrt(float64(sumSquares)))
 
+	result := make([]float32, len(vec))
 	if magnitude < 1e-10 {
-		for i := range vec {
-			vec[i] = 0
-		}
-		return vec
+		return result
 	}
 
 	invMag := 1.0 / magnitude
-	for i := range vec {
-		vec[i] *= invMag
+	for i, v := range vec {
+		result[i] = v * invMag
 	}
 
-	return vec
+	return result
 }
 
 func DotProduct(v1, v2 []float32) float32 {
 	if len(v1) != len(v2) {
-		return 0
+		panic(fmt.Sprintf("DotProduct: dimension mismatch: len(v1)=%d, len(v2)=%d", len(v1), len(v2)))
 	}
 
 	var sum float32

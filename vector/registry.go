@@ -181,11 +181,11 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 	}
 
 	r.wg.Add(1)
-	go func() {
+	go func(vecCopy []float32) {
 		defer r.wg.Done()
 		key := keys.EncodeVectorFullKey(id)
 		value := make([]byte, r.config.FullDim*4)
-		for i, v := range fullVec {
+		for i, v := range vecCopy {
 			binary.LittleEndian.PutUint32(value[i*4:(i+1)*4], math.Float32bits(v))
 		}
 		if err := r.db.Update(func(txn *badger.Txn) error {
@@ -193,7 +193,7 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		}); err != nil {
 			slog.Error("failed to persist full vector to BadgerDB", "id", id, "error", err)
 		}
-	}()
+	}(append([]float32(nil), fullVec...))
 
 	return nil
 }
@@ -375,21 +375,15 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 	slog.Info("loading TQ vector snapshot")
 
-	// Try chunked format first, fall back to legacy single-key format
-	var numVectors int
-
 	err := r.db.View(func(txn *badger.Txn) error {
-		// Check for new chunked format metadata
 		metaItem, err := txn.Get([]byte("sys:tq:meta"))
 		if err == nil {
-			// New chunked format
 			return r.loadChunkedSnapshot(txn, metaItem)
 		}
 		if err != badger.ErrKeyNotFound {
 			return fmt.Errorf("failed to load TQ snapshot meta: %w", err)
 		}
 
-		// Legacy single-key format
 		return r.loadLegacySnapshot(txn)
 	})
 
@@ -397,9 +391,9 @@ func (r *VectorRegistry) LoadSnapshot() error {
 		return err
 	}
 
-	if numVectors > 0 {
+	if r.totalVectors > 0 {
 		slog.Info("TQ vector snapshot loaded",
-			"vectorCount", numVectors,
+			"vectorCount", r.totalVectors,
 			"vectorSize", r.vectorSize,
 		)
 	}
