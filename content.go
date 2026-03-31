@@ -120,6 +120,9 @@ func (m *MEBStore) GetDocumentMetadata(docKey string) (map[string]any, error) {
 }
 
 func (m *MEBStore) DeleteDocument(docKey string) error {
+	if m.config.ReadOnly {
+		return ErrStoreReadOnly
+	}
 	if docKey == "" {
 		return fmt.Errorf("document key cannot be empty")
 	}

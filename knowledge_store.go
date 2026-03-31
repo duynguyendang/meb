@@ -61,6 +61,9 @@ func (m *MEBStore) AddFact(fact Fact) error {
 }
 
 func (m *MEBStore) AddFactBatch(facts []Fact) error {
+	if m.config.ReadOnly {
+		return ErrStoreReadOnly
+	}
 	if err := validateFacts(facts); err != nil {
 		return fmt.Errorf("batch validation failed: %w", err)
 	}
@@ -177,6 +180,9 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 }
 
 func (m *MEBStore) DeleteFactsBySubject(subject string) error {
+	if m.config.ReadOnly {
+		return ErrStoreReadOnly
+	}
 	slog.Info("deleting facts by subject", "subject", subject)
 
 	sID, err := m.dict.GetID(subject)
@@ -287,16 +293,35 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 }
 
 func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int {
-	cleaned := 0
-	for id, count := range referencedIDs {
-		if count > 1 {
-			continue
-		}
+	if len(referencedIDs) == 0 {
+		return 0
+	}
 
-		// Check if this ID is still referenced by any other triple
+	// Convert packed IDs to local IDs and deduplicate.
+	// The dictionary stores local IDs, so we check if each local ID
+	// is still referenced by any remaining triple in the graph.
+	localCandidates := make(map[uint64]bool)
+	for packedID := range referencedIDs {
+		localID := keys.UnpackLocalID(packedID)
+		if localID != 0 {
+			localCandidates[localID] = true
+		}
+	}
+
+	if len(localCandidates) == 0 {
+		return 0
+	}
+
+	// For each candidate local ID, do a scoped prefix scan instead of a full SPO scan.
+	// Scanning EncodeTripleSPOPrefix(0, candidateID, 0) only visits triples with that
+	// specific predicate — typically a tiny fraction of the total graph.
+	cleaned := 0
+	for localID := range localCandidates {
 		stillReferenced := false
+
+		// Scoped scan: check if any triple still uses this predicate ID
 		m.withReadTxn(func(txn *badger.Txn) error {
-			prefix := keys.EncodeTripleSPOPrefix(0, id, 0)
+			prefix := keys.EncodeTripleSPOPrefix(0, localID, 0)
 			opts := badger.DefaultIteratorOptions
 			opts.PrefetchValues = false
 			it := txn.NewIterator(opts)
@@ -304,40 +329,42 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 
 			it.Seek(prefix)
 			if it.ValidForPrefix(prefix) {
-				key := it.Item().Key()
-				if len(key) >= keys.TripleKeySize {
-					s, _, _ := keys.DecodeTripleKey(key)
-					if keys.UnpackTopicID(s) == keys.UnpackTopicID(id) || keys.UnpackTopicID(s) != 0 {
-						stillReferenced = true
-					}
-				}
+				stillReferenced = true
 			}
 			return nil
 		})
 
-		if !stillReferenced {
-			m.withReadTxn(func(txn *badger.Txn) error {
-				prefix := keys.EncodeTripleOPSPrefix(id, 0, 0)
-				opts := badger.DefaultIteratorOptions
-				opts.PrefetchValues = false
-				it := txn.NewIterator(opts)
-				defer it.Close()
-
-				it.Seek(prefix)
-				if it.ValidForPrefix(prefix) {
-					stillReferenced = true
-				}
-				return nil
-			})
+		if stillReferenced {
+			continue
 		}
 
-		if !stillReferenced {
-			s, err := m.dict.GetString(id)
-			if err == nil && s != "" {
-				m.dict.DeleteID(s)
-				cleaned++
+		// Also check OPS index for object references
+		m.withReadTxn(func(txn *badger.Txn) error {
+			prefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			it := txn.NewIterator(opts)
+			defer it.Close()
+
+			it.Seek(prefix)
+			if it.ValidForPrefix(prefix) {
+				stillReferenced = true
 			}
+			return nil
+		})
+
+		if stillReferenced {
+			continue
+		}
+
+		s, err := m.dict.GetString(localID)
+		if err != nil {
+			continue
+		}
+		if err := m.dict.DeleteID(s); err == nil {
+			cleaned++
 		}
 	}
+
 	return cleaned
 }
