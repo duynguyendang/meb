@@ -47,6 +47,9 @@ type MEBStore struct {
 	cleanupDone chan struct{}
 
 	lftjEngine *query.LFTJEngine
+
+	telemetry telemetryManager
+	wal       *WAL
 }
 
 func (m *MEBStore) loadStats() error {
@@ -115,6 +118,44 @@ func (m *MEBStore) ensureSchemaVersion() error {
 	return nil
 }
 
+func (m *MEBStore) replayWAL() error {
+	entries, err := m.wal.ReadAll()
+	if err != nil {
+		return fmt.Errorf("failed to read WAL: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	slog.Info("replaying WAL", "entries", len(entries))
+
+	facts := make([]Fact, 0, len(entries))
+	for _, e := range entries {
+		fact := Fact{
+			Subject:   e.subject,
+			Predicate: e.pred,
+			Object:    e.object,
+		}
+		if fact.Object == nil && fact.Predicate != "" {
+			fact.Object = ""
+		}
+		facts = append(facts, fact)
+	}
+
+	if len(facts) > 0 {
+		if err := m.AddFactBatch(facts); err != nil {
+			return fmt.Errorf("WAL replay AddFactBatch failed: %w", err)
+		}
+	}
+
+	if err := m.wal.Clear(); err != nil {
+		return fmt.Errorf("failed to clear WAL after replay: %w", err)
+	}
+
+	slog.Info("WAL replay complete", "factsReplayed", len(facts))
+	return nil
+}
+
 func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	if cfg.Verbose {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -157,6 +198,14 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 
 	vCfg := vector.DefaultConfig()
 	vCfg.SegmentDir = cfg.SegmentDir
+
+	wal, err := NewWAL(cfg.DataDir)
+	if err != nil {
+		db.Close()
+		dictDB.Close()
+		return nil, fmt.Errorf("failed to create WAL: %w", err)
+	}
+
 	m := &MEBStore{
 		db:                db,
 		dictDB:            dictDB,
@@ -168,7 +217,15 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		cleanupStop:       make(chan struct{}),
 		cleanupDone:       make(chan struct{}),
 		lftjEngine:        query.NewLFTJEngine(db),
+		wal:               wal,
 	}
+	m.breaker.OnStateChange(func(oldState, newState circuit.State, err error) {
+		m.telemetry.Emit("circuit_state_change", map[string]any{
+			"oldState": oldState.String(),
+			"newState": newState.String(),
+			"error":    err,
+		})
+	})
 	m.topicID.Store(1) // default topic
 
 	if err := m.vectors.LoadSnapshot(); err != nil {
@@ -184,6 +241,11 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	if err := m.ensureSchemaVersion(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema version check failed: %w", err)
+	}
+
+	if err := m.replayWAL(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("WAL replay failed: %w", err)
 	}
 
 	slog.Info("MEB store initialized successfully", "factCount", m.numFacts.Load())
@@ -249,6 +311,11 @@ func (m *MEBStore) Close() error {
 	if err := m.dict.Close(); err != nil {
 		slog.Error("failed to close dictionary", "error", err)
 		errs = append(errs, fmt.Errorf("close dictionary: %w", err))
+	}
+
+	if err := m.wal.Close(); err != nil {
+		slog.Error("failed to close WAL", "error", err)
+		errs = append(errs, fmt.Errorf("close WAL: %w", err))
 	}
 
 	if err := m.dictDB.Close(); err != nil {
@@ -382,6 +449,14 @@ func (m *MEBStore) CircuitBreakerMetricsSnapshot() circuit.MetricsSnapshot {
 	return m.breaker.MetricsSnapshot()
 }
 
+func (m *MEBStore) RegisterTelemetrySink(sink TelemetrySink) {
+	m.telemetry.Register(sink)
+}
+
+func (m *MEBStore) UnregisterTelemetrySink(sink TelemetrySink) {
+	m.telemetry.Unregister(sink)
+}
+
 func (m *MEBStore) ResolveID(id uint64) (string, error) {
 	return m.dict.GetString(id)
 }
@@ -430,6 +505,10 @@ func (m *MEBStore) triggerAutoGC() {
 
 	if err := m.db.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
 		slog.Warn("auto-GC failed for facts DB", "error", err)
+		m.telemetry.Emit("gc_failure", map[string]any{
+			"db":    "facts",
+			"error": err.Error(),
+		})
 	} else if err == nil {
 		slog.Debug("auto-GC completed for facts DB")
 	}
@@ -453,6 +532,11 @@ func (m *MEBStore) SetRetention(maxFacts uint64) {
 		return
 	}
 	slog.Info("retention policy triggered", "currentFacts", current, "maxFacts", maxFacts)
+	m.telemetry.Emit("retention", map[string]any{
+		"currentFacts": current,
+		"maxFacts":     maxFacts,
+		"excess":       current - maxFacts,
+	})
 }
 
 func (m *MEBStore) runCleanupLoop() {
@@ -478,15 +562,117 @@ func (m *MEBStore) runCleanup() {
 
 	slog.Debug("running periodic cleanup")
 
+	// Phase 1: Delete deprecated triples from disk
+	deleted := m.cleanupDeprecatedTriples()
+	if deleted > 0 {
+		slog.Info("deprecated triples cleaned up", "count", deleted)
+		m.telemetry.Emit("deprecated_cleanup", map[string]any{
+			"count": deleted,
+		})
+	}
+
+	// Phase 2: Run GC on both DBs
 	if err := m.db.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
 		slog.Debug("periodic GC failed for facts DB", "error", err)
+		m.telemetry.Emit("gc_failure", map[string]any{
+			"db":    "facts",
+			"error": err.Error(),
+		})
 	} else if err == nil {
 		slog.Debug("periodic GC completed for facts DB")
 	}
 
 	if err := m.dictDB.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
 		slog.Debug("periodic GC failed for dictionary DB", "error", err)
+		m.telemetry.Emit("gc_failure", map[string]any{
+			"db":    "dictionary",
+			"error": err.Error(),
+		})
 	} else if err == nil {
 		slog.Debug("periodic GC completed for dictionary DB")
 	}
+}
+
+func (m *MEBStore) cleanupDeprecatedTriples() int {
+	const batchSize = 500
+	totalDeleted := 0
+
+	err := m.withWriteTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		prefix := []byte{keys.TripleSPOPrefix}
+		var keysToDelete [][]byte
+		deletedInBatch := 0
+
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) < keys.TripleKeySize {
+				continue
+			}
+
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("failed to read value: %w", err)
+			}
+
+			if len(val) < 16 {
+				continue
+			}
+
+			packed := binary.BigEndian.Uint64(val[8:16])
+			hints := uint16(packed >> 48)
+			_, _, flags := keys.DecodeSemanticHints(hints)
+
+			if flags&keys.FlagIsDeprecated == 0 {
+				continue
+			}
+
+			keysToDelete = append(keysToDelete, key)
+
+			s, p, o := keys.DecodeTripleKey(key)
+			opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, s, p, o)
+			keysToDelete = append(keysToDelete, opsKey)
+
+			deletedInBatch++
+			totalDeleted++
+
+			if deletedInBatch >= batchSize {
+				for _, k := range keysToDelete {
+					if err := txn.Delete(k); err != nil {
+						return fmt.Errorf("failed to delete key: %w", err)
+					}
+				}
+				keysToDelete = keysToDelete[:0]
+				deletedInBatch = 0
+			}
+		}
+
+		if len(keysToDelete) > 0 {
+			for _, k := range keysToDelete {
+				if err := txn.Delete(k); err != nil {
+					return fmt.Errorf("failed to delete key: %w", err)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		slog.Warn("deprecated cleanup failed", "error", err)
+		m.telemetry.Emit("deprecated_cleanup_failed", map[string]any{
+			"error": err.Error(),
+		})
+	}
+
+	if totalDeleted > 0 {
+		m.numFacts.Add(^uint64(totalDeleted - 1))
+	}
+
+	return totalDeleted
 }

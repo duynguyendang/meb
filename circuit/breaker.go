@@ -77,16 +77,17 @@ type MetricsSnapshot struct {
 	LastError         string  `json:"last_error,omitempty"`
 }
 
-type Breaker struct {
-	config *Config
-	mu     sync.RWMutex
+type StateChangeCallback func(oldState, newState State, err error)
 
+type Breaker struct {
+	config          *Config
+	mu              sync.RWMutex
 	state           State
 	failures        int
 	successes       int
 	lastFailureTime time.Time
-
-	metrics Metrics
+	metrics         Metrics
+	stateChangeCb   StateChangeCallback
 }
 
 func NewBreaker(config *Config) *Breaker {
@@ -97,6 +98,12 @@ func NewBreaker(config *Config) *Breaker {
 		config: config,
 		state:  StateClosed,
 	}
+}
+
+func (b *Breaker) OnStateChange(cb StateChangeCallback) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.stateChangeCb = cb
 }
 
 func (b *Breaker) Execute(fn func() error) error {
@@ -241,9 +248,13 @@ func (b *Breaker) recordSuccess() {
 	case StateHalfOpen:
 		b.successes++
 		if b.successes >= b.config.SuccessThreshold {
+			old := b.state
 			b.state = StateClosed
 			b.failures = 0
 			b.successes = 0
+			if b.stateChangeCb != nil {
+				b.stateChangeCb(old, b.state, nil)
+			}
 		}
 	case StateClosed:
 		b.failures = 0
@@ -267,9 +278,13 @@ func (b *Breaker) recordFailure(err error) {
 
 	switch b.state {
 	case StateHalfOpen:
+		old := b.state
 		b.state = StateOpen
 		b.lastFailureTime = time.Now()
 		b.failures = 1
+		if b.stateChangeCb != nil {
+			b.stateChangeCb(old, b.state, err)
+		}
 	case StateClosed:
 		b.failures++
 		b.lastFailureTime = time.Now()

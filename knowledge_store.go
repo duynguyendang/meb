@@ -65,6 +65,21 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		return fmt.Errorf("batch validation failed: %w", err)
 	}
 
+	// Write to WAL before any DB operations (dual-DB atomicity)
+	for _, fact := range facts {
+		objStr := ""
+		if s, ok := fact.Object.(string); ok {
+			objStr = s
+		}
+		if err := m.wal.Append(walEntry{
+			subject: fact.Subject,
+			pred:    fact.Predicate,
+			object:  objStr,
+		}); err != nil {
+			return fmt.Errorf("WAL append failed: %w", err)
+		}
+	}
+
 	type stringRef struct {
 		index int
 		isObj bool
@@ -119,15 +134,11 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 			isInline = keys.IsInline(oID)
 		}
 
-		// Symmetric TopicID packing: both sID and oID use the same structure.
-		// This ensures SPO and OPS indices both achieve data locality per topic.
-		// Inline IDs skip packing — the inline flag is in bit 39, not in the topic bits.
 		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
 		if !isInline {
 			oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
 		}
 
-		// Encode semantic hints for the subject entity
 		hints := keys.EncodeSemanticHints(m.defaultEntityType, uint16(keys.HashSemanticName(fact.Subject)), m.defaultFlags)
 		value := encodeTripleValueWithHints(0, 0, hints)
 
@@ -146,6 +157,13 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 
 	if err := batch.Flush(); err != nil {
 		return fmt.Errorf("failed to flush batch: %w", err)
+	}
+
+	// Clear WAL after successful graph DB write
+	if err := m.wal.Clear(); err != nil {
+		m.telemetry.Emit("wal_clear_failed", map[string]any{
+			"error": err.Error(),
+		})
 	}
 
 	m.persistStatsIfNeeded(uint64(len(facts)))
@@ -183,11 +201,14 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 	type tripleKeys struct {
 		spo []byte
 		ops []byte
+		pID uint64
+		oID uint64
 	}
 
 	const maxDeleteBatchSize = 1000
 	var keysToDelete []tripleKeys
 	totalDeleted := 0
+	referencedIDs := make(map[uint64]int)
 
 	flushBatch := func() error {
 		if len(keysToDelete) == 0 {
@@ -204,6 +225,12 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 			if err := deleteTxn.Delete(k.ops); err != nil {
 				deleteTxn.Discard()
 				return fmt.Errorf("failed to delete OPS key: %w", err)
+			}
+			if k.pID != 0 {
+				referencedIDs[k.pID]++
+			}
+			if k.oID != 0 && !keys.IsInline(k.oID) {
+				referencedIDs[k.oID]++
 			}
 		}
 
@@ -231,6 +258,8 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 		keysToDelete = append(keysToDelete, tripleKeys{
 			spo: spoKey,
 			ops: opsKey,
+			pID: p,
+			oID: o,
 		})
 
 		if len(keysToDelete) >= maxDeleteBatchSize {
@@ -249,6 +278,66 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 	m.persistStatsIfNeeded(0)
 
-	slog.Info("facts deleted successfully", "subject", subject, "factsDeleted", totalDeleted)
+	// Clean up orphaned dictionary entries for predicates and objects
+	// that are no longer referenced by any other triples
+	cleaned := m.cleanupOrphanedDictEntries(referencedIDs)
+
+	slog.Info("facts deleted successfully", "subject", subject, "factsDeleted", totalDeleted, "dictEntriesCleaned", cleaned)
 	return nil
+}
+
+func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int {
+	cleaned := 0
+	for id, count := range referencedIDs {
+		if count > 1 {
+			continue
+		}
+
+		// Check if this ID is still referenced by any other triple
+		stillReferenced := false
+		m.withReadTxn(func(txn *badger.Txn) error {
+			prefix := keys.EncodeTripleSPOPrefix(0, id, 0)
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchValues = false
+			it := txn.NewIterator(opts)
+			defer it.Close()
+
+			it.Seek(prefix)
+			if it.ValidForPrefix(prefix) {
+				key := it.Item().Key()
+				if len(key) >= keys.TripleKeySize {
+					s, _, _ := keys.DecodeTripleKey(key)
+					if keys.UnpackTopicID(s) == keys.UnpackTopicID(id) || keys.UnpackTopicID(s) != 0 {
+						stillReferenced = true
+					}
+				}
+			}
+			return nil
+		})
+
+		if !stillReferenced {
+			m.withReadTxn(func(txn *badger.Txn) error {
+				prefix := keys.EncodeTripleOPSPrefix(id, 0, 0)
+				opts := badger.DefaultIteratorOptions
+				opts.PrefetchValues = false
+				it := txn.NewIterator(opts)
+				defer it.Close()
+
+				it.Seek(prefix)
+				if it.ValidForPrefix(prefix) {
+					stillReferenced = true
+				}
+				return nil
+			})
+		}
+
+		if !stillReferenced {
+			s, err := m.dict.GetString(id)
+			if err == nil && s != "" {
+				m.dict.DeleteID(s)
+				cleaned++
+			}
+		}
+	}
+	return cleaned
 }
