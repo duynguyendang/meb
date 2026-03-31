@@ -2,6 +2,7 @@ package dict
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -14,9 +15,85 @@ const (
 	globalCounterKey = "__dict_global_counter"
 )
 
+type ShardedAllocator struct {
+	shards []*RangeAllocator
+	n      uint32
+	next   atomic.Uint32
+}
+
+func NewShardedAllocator(db *badger.DB, blockSize uint64, numShards int) (*ShardedAllocator, error) {
+	if numShards <= 1 {
+		alloc, err := NewRangeAllocator(db, blockSize)
+		if err != nil {
+			return nil, err
+		}
+		return &ShardedAllocator{
+			shards: []*RangeAllocator{alloc},
+			n:      1,
+		}, nil
+	}
+
+	shards := make([]*RangeAllocator, numShards)
+	for i := 0; i < numShards; i++ {
+		shard, err := NewRangeAllocatorWithKey(db, blockSize, fmt.Sprintf("%s_%d", globalCounterKey, i))
+		if err != nil {
+			for j := 0; j < i; j++ {
+				shards[j].Close()
+			}
+			return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
+		}
+		shards[i] = shard
+	}
+
+	return &ShardedAllocator{
+		shards: shards,
+		n:      uint32(numShards),
+	}, nil
+}
+
+func (s *ShardedAllocator) Allocate() (uint64, error) {
+	shard := s.nextShard()
+	return shard.Allocate()
+}
+
+func (s *ShardedAllocator) AllocateBatch(n uint64) (uint64, error) {
+	shard := s.nextShard()
+	return shard.AllocateBatch(n)
+}
+
+func (s *ShardedAllocator) CurrentID() uint64 {
+	var maxID uint64
+	for _, shard := range s.shards {
+		id := shard.CurrentID()
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return maxID
+}
+
+func (s *ShardedAllocator) NumShards() int {
+	return int(s.n)
+}
+
+func (s *ShardedAllocator) nextShard() *RangeAllocator {
+	if s.n == 1 {
+		return s.shards[0]
+	}
+	idx := s.next.Add(1) % s.n
+	return s.shards[idx]
+}
+
+func (s *ShardedAllocator) Close() {
+	for _, shard := range s.shards {
+		shard.Close()
+	}
+}
+
 type RangeAllocator struct {
-	db        *badger.DB
-	blockSize uint64
+	db         *badger.DB
+	counterKey string
+	blockSize  uint64
 
 	globalMax uint64
 	mu        sync.Mutex
@@ -26,13 +103,18 @@ type RangeAllocator struct {
 }
 
 func NewRangeAllocator(db *badger.DB, blockSize uint64) (*RangeAllocator, error) {
+	return NewRangeAllocatorWithKey(db, blockSize, globalCounterKey)
+}
+
+func NewRangeAllocatorWithKey(db *badger.DB, blockSize uint64, counterKey string) (*RangeAllocator, error) {
 	if blockSize == 0 {
 		blockSize = DefaultBlockSize
 	}
 
 	alloc := &RangeAllocator{
-		db:        db,
-		blockSize: blockSize,
+		db:         db,
+		counterKey: counterKey,
+		blockSize:  blockSize,
 	}
 
 	if err := alloc.loadGlobalCounter(); err != nil {
@@ -99,7 +181,7 @@ func (r *RangeAllocator) reserveBlock() error {
 
 func (r *RangeAllocator) loadGlobalCounter() error {
 	return r.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get([]byte(globalCounterKey))
+		item, err := txn.Get([]byte(r.counterKey))
 		if err == badger.ErrKeyNotFound {
 			r.globalMax = 0
 			return nil
@@ -120,10 +202,12 @@ func (r *RangeAllocator) saveGlobalCounter() error {
 	return r.db.Update(func(txn *badger.Txn) error {
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, r.globalMax)
-		return txn.Set([]byte(globalCounterKey), buf)
+		return txn.Set([]byte(r.counterKey), buf)
 	})
 }
 
 func (r *RangeAllocator) CurrentID() uint64 {
 	return r.current.Load()
 }
+
+func (r *RangeAllocator) Close() {}

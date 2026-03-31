@@ -27,7 +27,7 @@ type Encoder struct {
 	forwardCache *lruCache[string, uint64]
 	reverseCache *lruCache[uint64, string]
 
-	allocator *RangeAllocator
+	allocator *ShardedAllocator
 }
 
 type lruCache[K comparable, V any] struct {
@@ -59,8 +59,8 @@ func (c *lruCache[K, V]) Len() int {
 	return c.cache.Len()
 }
 
-func NewEncoder(db *badger.DB, cacheSize int) (*Encoder, error) {
-	allocator, err := NewRangeAllocator(db, DefaultBlockSize)
+func NewEncoder(db *badger.DB, cacheSize int, numShards int) (*Encoder, error) {
+	allocator, err := NewShardedAllocator(db, DefaultBlockSize, numShards)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create range allocator: %w", err)
 	}

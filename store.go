@@ -12,6 +12,7 @@ import (
 	"github.com/duynguyendang/meb/circuit"
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
+	"github.com/duynguyendang/meb/query"
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
 
@@ -44,6 +45,8 @@ type MEBStore struct {
 
 	cleanupStop chan struct{}
 	cleanupDone chan struct{}
+
+	lftjEngine *query.LFTJEngine
 }
 
 func (m *MEBStore) loadStats() error {
@@ -145,7 +148,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 
 	slog.Info("BadgerDB (Dictionary) opened successfully")
 
-	dictEncoder, err := dict.NewEncoder(dictDB, cfg.LRUCacheSize)
+	dictEncoder, err := dict.NewEncoder(dictDB, cfg.LRUCacheSize, cfg.NumDictShards)
 	if err != nil {
 		dictDB.Close()
 		db.Close()
@@ -164,6 +167,7 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		defaultEntityType: keys.EntityUnknown,
 		cleanupStop:       make(chan struct{}),
 		cleanupDone:       make(chan struct{}),
+		lftjEngine:        query.NewLFTJEngine(db),
 	}
 	m.topicID.Store(1) // default topic
 
@@ -307,6 +311,10 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 
 func (m *MEBStore) Vectors() *vector.VectorRegistry {
 	return m.vectors
+}
+
+func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
+	return m.lftjEngine
 }
 
 func (m *MEBStore) Find() *Builder {

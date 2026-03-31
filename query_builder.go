@@ -1,9 +1,11 @@
 package meb
 
 import (
+	"context"
 	"fmt"
 	"iter"
 
+	"github.com/duynguyendang/meb/query"
 	"github.com/duynguyendang/meb/utils"
 	"github.com/duynguyendang/meb/vector"
 )
@@ -22,6 +24,7 @@ type Store interface {
 	Scan(s, p, o string) iter.Seq2[Fact, error]
 	GetContent(id uint64) ([]byte, error)
 	ResolveID(id uint64) (string, error)
+	LFTJEngine() *query.LFTJEngine
 }
 
 type Builder struct {
@@ -31,7 +34,9 @@ type Builder struct {
 	filters             []QueryFilter
 	limit               int
 	candidateMultiplier int
-	topicID             uint32 // 0 = use default; non-zero = restrict to topic
+	topicID             uint32
+	relations           []query.RelationPattern
+	resultVars          []string
 }
 
 func NewBuilder(store Store) *Builder {
@@ -78,6 +83,15 @@ func (b *Builder) InTopic(topicID uint32) *Builder {
 	return b
 }
 
+// JoinWithLFTJ adds LFTJ relations for structural expansion after vector search.
+// The seedVar must match a variable name used in the relations.
+// Results are streamed — no intermediate materialization.
+func (b *Builder) JoinWithLFTJ(relations []query.RelationPattern, resultVars []string) *Builder {
+	b.relations = relations
+	b.resultVars = resultVars
+	return b
+}
+
 func (b *Builder) Execute() ([]Result, error) {
 	if len(b.vectorQuery) == 0 {
 		return nil, fmt.Errorf("query must include SimilarTo() vector search")
@@ -88,7 +102,6 @@ func (b *Builder) Execute() ([]Result, error) {
 		candidateK = 100
 	}
 
-	// Use topic-aware search if topicID is set — streaming via iter.Seq2
 	var vecIter iter.Seq2[vector.SearchResult, error]
 	if b.topicID > 0 {
 		vecIter = b.store.Vectors().SearchInTopic(b.topicID, b.vectorQuery, candidateK)
@@ -97,6 +110,10 @@ func (b *Builder) Execute() ([]Result, error) {
 	}
 
 	results := make([]Result, 0, b.limit)
+
+	if len(b.relations) > 0 {
+		return b.executeWithLFTJ(vecIter, results)
+	}
 
 	for vecResult, err := range vecIter {
 		if err != nil {
@@ -129,6 +146,101 @@ func (b *Builder) Execute() ([]Result, error) {
 			if len(results) >= b.limit {
 				break
 			}
+		}
+	}
+
+	return results, nil
+}
+
+func (b *Builder) executeWithLFTJ(vecIter iter.Seq2[vector.SearchResult, error], results []Result) ([]Result, error) {
+	engine := b.store.LFTJEngine()
+	if engine == nil {
+		return nil, fmt.Errorf("LFTJ engine not available")
+	}
+
+	seedIDs := func(yield func(uint64, error) bool) {
+		for vecResult, err := range vecIter {
+			if err != nil {
+				yield(0, err)
+				return
+			}
+			if b.threshold > 0 && vecResult.Score < b.threshold {
+				continue
+			}
+			if !yield(vecResult.ID, nil) {
+				return
+			}
+		}
+	}
+
+	boundVars := map[string]uint64{}
+	for _, rel := range b.relations {
+		for pos, name := range rel.VariablePositions {
+			if _, ok := boundVars[name]; !ok {
+				boundVars[name] = 0
+			}
+			_ = pos
+		}
+	}
+
+	seedVar := ""
+	for _, rel := range b.relations {
+		for pos, name := range rel.VariablePositions {
+			if boundVars[name] == 0 {
+				seedVar = name
+				boundVars[name] = 0
+				_ = pos
+				break
+			}
+		}
+		if seedVar != "" {
+			break
+		}
+	}
+	if seedVar == "" {
+		seedVar = "seed"
+	}
+
+	for joinResult, err := range engine.ExecuteWithSeeds(
+		context.Background(),
+		b.relations,
+		seedVar,
+		seedIDs,
+		b.resultVars,
+	) {
+		if err != nil {
+			return nil, fmt.Errorf("LFTJ join failed: %w", err)
+		}
+
+		var id uint64
+		for _, v := range joinResult {
+			id = v
+			break
+		}
+		if id == 0 {
+			continue
+		}
+
+		candidateKey, err := b.store.ResolveID(id)
+		if err != nil {
+			continue
+		}
+
+		contentBytes, err := b.store.GetContent(id)
+		contentStr := ""
+		if err == nil && contentBytes != nil {
+			contentStr = utils.BytesToString(contentBytes)
+		}
+
+		results = append(results, Result{
+			ID:      id,
+			Key:     candidateKey,
+			Score:   1.0,
+			Content: contentStr,
+		})
+
+		if len(results) >= b.limit {
+			break
 		}
 	}
 
