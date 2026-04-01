@@ -384,6 +384,10 @@ func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
 	return m.lftjEngine
 }
 
+func (m *MEBStore) Dict() dict.Dictionary {
+	return m.dict
+}
+
 func (m *MEBStore) Find() *Builder {
 	return NewBuilder(m)
 }

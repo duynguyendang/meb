@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 
+	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/query"
 	"github.com/duynguyendang/meb/utils"
 	"github.com/duynguyendang/meb/vector"
@@ -25,6 +26,7 @@ type Store interface {
 	GetContent(id uint64) ([]byte, error)
 	ResolveID(id uint64) (string, error)
 	LFTJEngine() *query.LFTJEngine
+	Dict() dict.Dictionary
 }
 
 type Builder struct {
