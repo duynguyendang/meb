@@ -1,8 +1,10 @@
 package meb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"iter"
 	"log/slog"
 	"os"
 	"sync"
@@ -679,4 +681,89 @@ func (m *MEBStore) cleanupDeprecatedTriples() int {
 	}
 
 	return totalDeleted
+}
+
+// ScanSubjectsByPrefix returns all subjects starting with the given prefix string.
+// Uses SPO index with LSM-tree prefix scan - O(log N + k) where k is number of results.
+// The prefix is matched against the full subject string (e.g., "project/pkg/" matches
+// all subjects under that path like "project/pkg/server/server.go:NewServer").
+// Returns empty iterator if no matches found (never returns error for "not found").
+func (m *MEBStore) ScanSubjectsByPrefix(ctx context.Context, prefix string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if prefix == "" {
+			return
+		}
+
+		txn := m.db.NewTransaction(false)
+		defer txn.Discard()
+
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = false
+		it := txn.NewIterator(itOpts)
+		defer it.Close()
+
+		spoPrefix := []byte{keys.TripleSPOPrefix}
+		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) != keys.TripleKeySize {
+				continue
+			}
+
+			s, _, _ := keys.DecodeTripleKey(key)
+			localID := keys.UnpackLocalID(s)
+
+			subjectStr, err := m.dict.GetString(localID)
+			if err != nil {
+				continue
+			}
+
+			if hasPrefix(subjectStr, prefix) {
+				if !yield(subjectStr) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// FindSubjectsByObject returns all subjects matching exact predicate and object.
+// Uses SPO index scan across ALL topics - does not filter by current topicID.
+// Returns empty iterator if no matches found (never returns error for "not found").
+func (m *MEBStore) FindSubjectsByObject(ctx context.Context, predicate, object string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		if predicate == "" || object == "" {
+			return
+		}
+
+		// Scan SPO index with predicate only (works across all topics)
+		// Then filter by object value manually
+		for fact, err := range m.ScanContext(ctx, "", predicate, "") {
+			if err != nil {
+				continue
+			}
+			
+			// Check if object matches
+			if objStr, ok := fact.Object.(string); ok && objStr == object {
+				if !yield(fact.Subject) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// hasPrefix checks if s starts with prefix, handling empty prefix edge case.
+func hasPrefix(s, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
