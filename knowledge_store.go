@@ -352,7 +352,10 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 
 // cleanupOrphanedDictEntriesFullScan scans all dictionary entries and removes
 // those that are not referenced by any triple in the SPO/OPS indices.
+// Throttled: max 1000 orphans per cycle to avoid long GC pauses.
 func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
+	const maxOrphansPerCycle = 1000
+
 	// Collect all local IDs from the dictionary (reverse index: ID → string)
 	var candidateIDs []uint64
 	m.withReadTxn(func(txn *badger.Txn) error {
@@ -413,7 +416,7 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 				}
 			}
 
-			if !stillReferenced {
+			if !stillReferenced && len(unreferenced) < maxOrphansPerCycle {
 				unreferenced = append(unreferenced, localID)
 			}
 		}
@@ -436,10 +439,34 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 
 // cleanupOrphanedVectors scans vectors and removes those that have no
 // corresponding content or any referencing facts.
+// Uses a two-pass approach: O(facts + vectors) instead of O(facts × vectors).
 func (m *MEBStore) cleanupOrphanedVectors() int {
 	cleaned := 0
+	const maxOrphansPerCycle = 1000
 
 	m.withWriteTxn(func(txn *badger.Txn) error {
+		// Phase 1: Build set of all subject local IDs referenced by facts (single scan)
+		factSubjectIDs := make(map[uint64]bool)
+		spoPrefix := []byte{keys.TripleSPOPrefix}
+
+		spoItOpts := badger.DefaultIteratorOptions
+		spoItOpts.PrefetchValues = false
+		spoIt := txn.NewIterator(spoItOpts)
+
+		for spoIt.Seek(spoPrefix); spoIt.ValidForPrefix(spoPrefix); spoIt.Next() {
+			sKey := spoIt.Item().Key()
+			if len(sKey) != keys.TripleKeySize {
+				continue
+			}
+			s, _, _ := keys.DecodeTripleKey(sKey)
+			localID := keys.UnpackLocalID(s)
+			if localID != 0 {
+				factSubjectIDs[localID] = true
+			}
+		}
+		spoIt.Close()
+
+		// Phase 2: Scan vectors, check against set in O(1)
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -461,29 +488,14 @@ func (m *MEBStore) cleanupOrphanedVectors() int {
 			_, err := txn.Get(contentKey)
 			hasContent := err == nil
 
-			// Check if any fact references this ID (as object, subject is string so check as subject)
-			hasFact := false
-			if !hasContent {
-				// Check SPO: is this ID used as a subject (packed with any topic)?
-				// Since subjects are packed with topicID, we need to scan all topics
-				spoPrefix := []byte{keys.TripleSPOPrefix}
-				subIt := txn.NewIterator(badger.DefaultIteratorOptions)
-				for subIt.Seek(spoPrefix); subIt.ValidForPrefix(spoPrefix); subIt.Next() {
-					sKey := subIt.Item().Key()
-					if len(sKey) != keys.TripleKeySize {
-						continue
-					}
-					s, _, _ := keys.DecodeTripleKey(sKey)
-					if keys.UnpackLocalID(s) == id {
-						hasFact = true
-						break
-					}
-				}
-				subIt.Close()
-			}
+			// Check if any fact references this ID as subject
+			hasFact := factSubjectIDs[id]
 
 			if !hasContent && !hasFact {
 				orphanKeys = append(orphanKeys, key)
+				if len(orphanKeys) >= maxOrphansPerCycle {
+					break
+				}
 			}
 		}
 

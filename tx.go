@@ -518,8 +518,10 @@ func (m *MEBStore) deleteDocumentInTxn(txn *badger.Txn, docKey string, topicID u
 	vecKey := keys.EncodeVectorFullKey(id)
 	_ = txn.Delete(vecKey)
 
-	// Delete vector from in-memory registry
-	m.vectors.Delete(id)
+	// Delete vector from in-memory registry (safe guard: check first)
+	if m.vectors.HasVector(id) {
+		m.vectors.Delete(id)
+	}
 
 	// Delete metadata facts
 	packedID := keys.PackID(topicID, keys.UnpackLocalID(id))

@@ -11,7 +11,8 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 - **LSM-Level Topic Filtering**: `SearchInTopic()` uses Badger prefix scan — zero I/O on unrelated topics
 - **Hybrid Vector Compression**: FWHT preconditioning + block-wise 4/8-bit quantization preserving full 1536 dimensions
 - **Zero-Copy Streaming**: Go 1.23+ `iter.Seq2` for constant-memory scan operations
-- **Dual BadgerDB**: Separate graph and dictionary databases for performance isolation
+- **Unified BadgerDB**: Single database for graph, dictionary, vectors, and content — enables cross-subsystem transactions
+- **Cross-Subsystem Transactions**: Opt-in `View()`/`Update()` API for atomic multi-operation writes (graph + vector + content + dictionary)
 - **Datalog Integration**: Mangle `factstore.FactStore` interface for symbolic reasoning
 - **Neuro-Symbolic Search**: Hybrid vector + LFTJ graph query builder with streaming joins
 - **Circuit Breaker**: Configurable query timeout protection with push telemetry
@@ -42,9 +43,18 @@ func main() {
     s.AddFact(meb.NewFact("Alice", "knows", "Bob"))
     s.AddFact(meb.NewFact("Alice", "works_at", "Acme"))
 
-    // Add document with explicit topic isolation
+    // Add document with explicit topic isolation (atomic: dict + facts + vector + content)
     topicID := uint32(101)
     s.AddDocumentWithTopic(topicID, "auth:Login", sourceCode, embedding, metadata)
+
+    // Cross-subsystem transaction (opt-in, all-or-nothing)
+    s.Update(func(txn *meb.StoreTxn) error {
+        id, _ := txn.GetOrCreateID("entity:Foo")
+        txn.AddFact(meb.Fact{Subject: "entity:Foo", Predicate: "type", Object: "class"})
+        txn.AddVector(id, embedding)
+        txn.SetContent(id, sourceCode)
+        return nil // any error rolls back everything
+    })
 
     // Hybrid search limited to a specific topic
     results, _ := s.Find().
@@ -83,12 +93,19 @@ func main() {
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
 │  │  Telemetry (Push)    │  WAL (Crash Recovery)               │ │
-│  │  Circuit/GC/Events   │  Dual-DB atomicity                  │ │
+│  │  Circuit/GC/Events   │  Single-DB atomicity                │ │
 │  └────────────────────────────────────────────────────────────┘ │
 │                                                                  │
 │  ┌────────────────────────────────────────────────────────────┐ │
-│  │  Dual BadgerDB (Graph: async writes + Dict: sync writes)   │ │
-│  │  + Vector Store (sync writes, LSM-keyed)                   │ │
+│  │  Transaction API (Opt-in)                                   │ │
+│  │  View() / Update() — atomic across all subsystems           │ │
+│  │  Auto-rollback on error, counter recovery                  │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │  Unified BadgerDB (Graph + Dict + Vectors + Content)       │ │
+│  │  Key prefixes: 0x10 content | 0x11 vectors | 0x20/0x21     │ │
+│  │  graph | 0x80/0x81 dict | 0xFF system                     │ │
 │  └────────────────────────────────────────────────────────────┘ │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
@@ -134,6 +151,9 @@ Prefix │ Index │ Key Size │ Value Size │ ID Layout (64-bit)
 0x20   │ SPO   │ 25 bytes │ 16 bytes   │ [Topic:24] | [Local:40]
 0x21   │ OPS   │ 25 bytes │ 16 bytes   │ [Topic:24] | [Local:40]
 0x10   │ Chunk │ 9 bytes  │ S2 blob    │ [Local:40]
+0x11   │ Vec   │ 9 bytes  │ compressed │ [Local:40]
+0x80   │ Dict→ │ var      │ 8 bytes    │ string → ID
+0x81   │ Dict← │ 9 bytes  │ var        │ ID → string
 0xFF   │ Sys   │ 2 bytes  │ counter    │ —
 ```
 
@@ -233,6 +253,64 @@ dot(a, b) = Σ_blocks (scale_a * scale_b * Σ(q_a_i * q_b_i)
                       + block_size * zero_a * zero_b)
 ```
 
+## Cross-Subsystem Transactions
+
+MEB provides **opt-in transactions** for atomic operations across graph, dictionary, vectors, and content. The existing API (`AddFact`, `AddDocument`, etc.) works unchanged; transactions are an additional layer for complex use cases.
+
+```go
+// Atomic multi-operation: all succeed or all rollback
+err := store.Update(func(txn *meb.StoreTxn) error {
+    // Dictionary
+    id, err := txn.GetOrCreateID("entity:UserService")
+
+    // Graph facts
+    txn.AddFact(meb.Fact{Subject: "entity:UserService", Predicate: "type", Object: "class"})
+    txn.AddFact(meb.Fact{Subject: "entity:UserService", Predicate: "package", Object: "com.example"})
+
+    // Vector embedding
+    txn.AddVector(id, embedding)
+
+    // Content
+    txn.SetContent(id, sourceCode)
+
+    return nil // any error → automatic rollback
+})
+
+// Read-only transaction
+store.View(func(txn *meb.StoreTxn) error {
+    for f, err := range txn.Scan("entity:UserService", "", "") {
+        // ...
+    }
+    return nil
+})
+```
+
+**Transaction guarantees:**
+- **Atomicity**: All writes commit together, or none do
+- **Rollback**: Any error discards all writes in the transaction
+- **Counter recovery**: `numFacts` counter is restored on rollback
+- **Isolation**: Uses BadgerDB's MVCC for read/write isolation
+
+**When to use transactions:**
+| Scenario | Use `AddFact()`/`AddDocument()` | Use `Update()` |
+|----------|--------------------------------|----------------|
+| Single fact | ✅ | |
+| Single document | ✅ | |
+| Multiple subsystems (dict + facts + vector + content) | | ✅ |
+| Conditional writes | | ✅ |
+| Rollback on error | | ✅ |
+
+### Background Orphan Cleanup
+
+MEB runs periodic cleanup of orphaned data during `runCleanup()`:
+
+1. **Deprecated triples** — Scans SPO index, deletes entries with `FlagIsDeprecated`
+2. **Orphan dictionary entries** — Scans reverse dictionary, removes entries not referenced by any fact
+3. **Orphan vectors** — Two-pass scan: collects all subject IDs from facts, then removes vectors with no content and no referencing facts
+4. **ValueLog GC** — Runs BadgerDB GC to reclaim space from tombstones
+
+All cleanup operations are **throttled** (max 1000 orphans per cycle) to avoid long GC pauses.
+
 ## Package Structure
 
 ```
@@ -250,9 +328,10 @@ meb/
 ├── utils/             # Zero-copy string/byte conversion
 ├── adapter/           # Mangle Datalog integration
 ├── store.go           # MEBStore orchestrator
+├── tx.go              # Transaction API (View/Update, StoreTxn)
 ├── knowledge_store.go # SPO/OPS dual-index write, orphan cleanup
 ├── scan.go            # Index selection scan (iter.Seq2 streaming)
-├── content.go         # S2-compressed content storage
+├── content.go         # S2-compressed content storage, atomic Add/DeleteDocument
 ├── query_builder.go   # Neuro-symbolic query builder with LFTJ joins
 ├── telemetry.go       # Push telemetry (TelemetrySink interface)
 ├── wal.go             # Write-ahead log (mutex-free reads)
@@ -291,6 +370,8 @@ store.RegisterTelemetrySink(&mySink{})
 //   "gc_failure" — ValueLogGC errors
 //   "retention" — fact count exceeds threshold
 //   "deprecated_cleanup" — deprecated triples purged
+//   "dict_orphan_cleanup" — orphaned dictionary entries removed
+//   "vector_orphan_cleanup" — orphaned vectors removed
 //   "wal_clear_failed" — WAL consistency issue
 ```
 
@@ -300,16 +381,16 @@ store.RegisterTelemetrySink(&mySink{})
 
 | Benchmark | Ops/sec | Latency | Memory | Allocs |
 |-----------|---------|---------|--------|--------|
+| **Fact Insertion** (single) | 34,166 | 29.4 µs/op | 8.3 KB/op | 192 |
+| **Fact Insertion** (batch × 10) | 10,000 | 116 µs/op | 45 KB/op | 1,042 |
+| **Fact Insertion** (batch × 100) | 1,450 | 870 µs/op | 424 KB/op | 9,503 |
+| **Fact Insertion** (batch × 1000) | 139 | 8.8 ms/op | 4.7 MB/op | 93,336 |
+| **Document Add** (content + vector + metadata) | 14,866 | 102 µs/op | 122 KB/op | 151 |
+| **Transaction Batch** (100 facts) | 2,302 | 563 µs/op | 257 KB/op | 5,973 |
+| **Scan** (1000 facts, single key) | 21,594 | 52.4 µs/op | 27 KB/op | 621 |
 | **Vector Add** (1536-d, 8-bit Hybrid) | 27,866 | 61.3 µs/op | 145 KB/op | 39 |
 | **Vector Search** (10K vectors, k=10) | 9,481 | 124.5 µs/op | 13.8 KB/op | 30 |
-| **Fact Insertion** (single) | 101,677 | 9.8 µs/op | 2.8 KB/op | 62 |
-| **Fact Insertion** (batch × 100) | 8,613 | 177.6 µs/op | 98.5 KB/op | 1,900 |
-| **Scan** (10K facts, subject prefix) | 12,144 | 97.9 µs/op | 28.0 KB/op | 669 |
-| **Scan Key-Only** (100K facts, subject prefix) | 1,213 | 1.05 ms/op | 28.0 KB/op | 669 |
-| **Document Add** (content + vector + metadata) | 23,964 | 50.1 µs/op | 34.7 KB/op | 156 |
-| **Hybrid Search** (1K docs, k=10) | 30,639 | 37.9 µs/op | 33.1 KB/op | 175 |
 | **Dictionary Lookup** (GetOrCreate) | 1,619,012 | 707 ns/op | 400 B/op | 7 |
-| **Delete Facts by Subject** (100 facts × 100 subjects) | 1,632 | 651 µs/op | 2.2 KB/op | 48 |
 
 **Derived throughput:**
 
@@ -322,10 +403,23 @@ store.RegisterTelemetrySink(&mySink{})
 | **Dictionary Lookup** | ~1.6M lookups/sec | Sharded LRU cache hit |
 
 **Key observations:**
-- Batch insertion is ~8.5x more efficient per-fact than single insertion
+- Batch insertion is ~8.5x more efficient per-fact than single insertion (batch × 100: ~8.7 µs/fact)
+- **Unified DB trade-off**: Single-fact inserts are ~3x slower than the original dual-DB design because dictionary and graph writes share the same LSM tree. Batch inserts amortize this overhead — at batch × 100, per-fact latency matches the original ~10 µs
 - Scan latency scales with matching facts, not total graph size (prefix scan)
 - Dictionary lookups are sub-microsecond with thread-safe LRU cache
 - DeleteFactsBySubject uses scoped prefix scans (not full graph scan) for orphan cleanup
+
+**Storage scaling** (per 1M items):
+
+| Mode | Storage | Components Used |
+|------|---------|----------------|
+| **Facts only** | ~150 MB | SPO(41) + OPS(41) + Dict(23) per fact |
+| **+ 100K vectors** (8-bit) | ~410 MB | Facts(150) + Vectors(260) |
+| **+ 100K vectors + 10K docs** (S2) | ~510 MB | Facts(150) + Vectors(260) + Content(100) |
+
+- Facts-only mode uses minimal storage — no overhead from unused subsystems
+- Vectors dominate storage (4-5x larger than facts at 8-bit)
+- Content is moderate if documents are few (S2 compressed)
 
 | Metric | Value | Notes |
 |--------|-------|-------|

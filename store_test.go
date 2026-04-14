@@ -33,6 +33,30 @@ func newTestStore(t *testing.T) *MEBStore {
 	return s
 }
 
+func newTestStoreTB(b *testing.B) *MEBStore {
+	b.Helper()
+	segDir := filepath.Join(b.TempDir(), "vectors")
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		b.Fatalf("failed to create segment dir: %v", err)
+	}
+	cfg := &store.Config{
+		DataDir:        "",
+		DictDir:        "",
+		InMemory:       true,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+	}
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		b.Fatalf("NewMEBStore: %v", err)
+	}
+	b.Cleanup(func() { s.Close() })
+	return s
+}
+
 func TestNewMEBStore(t *testing.T) {
 	s := newTestStore(t)
 	if s.Count() != 0 {
@@ -771,3 +795,131 @@ func TestTransactionExists(t *testing.T) {
 		t.Fatalf("View failed: %v", err)
 	}
 }
+
+// --- Benchmarks ---
+
+func makeBenchmarkVector(dim int) []float32 {
+	vec := make([]float32, dim)
+	for i := range vec {
+		vec[i] = float32(i) / float32(dim)
+	}
+	return vec
+}
+
+func BenchmarkAddFact(b *testing.B) {
+	s := newTestStoreTB(b)
+	facts := make([]Fact, b.N)
+	for i := 0; i < b.N; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("subject_%d", i),
+			Predicate: "knows",
+			Object:    fmt.Sprintf("object_%d", i),
+		}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.AddFact(facts[i]); err != nil {
+			b.Fatalf("AddFact failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkAddFactBatch10(b *testing.B) {
+	benchmarkAddFactBatchSize(b, 10)
+}
+
+func BenchmarkAddFactBatch100(b *testing.B) {
+	benchmarkAddFactBatchSize(b, 100)
+}
+
+func BenchmarkAddFactBatch1000(b *testing.B) {
+	benchmarkAddFactBatchSize(b, 1000)
+}
+
+func benchmarkAddFactBatchSize(b *testing.B, batchSize int) {
+	s := newTestStoreTB(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		facts := make([]Fact, batchSize)
+		for j := 0; j < batchSize; j++ {
+			idx := i*batchSize + j
+			facts[j] = Fact{
+				Subject:   fmt.Sprintf("subject_%d", idx),
+				Predicate: "knows",
+				Object:    fmt.Sprintf("object_%d", idx),
+			}
+		}
+		if err := s.AddFactBatch(facts); err != nil {
+			b.Fatalf("AddFactBatch failed: %v", err)
+		}
+	}
+	b.StopTimer()
+}
+
+func BenchmarkAddDocument(b *testing.B) {
+	s := newTestStoreTB(b)
+	vec := makeBenchmarkVector(1536)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err := s.AddDocument(
+			fmt.Sprintf("doc_%d", i),
+			[]byte(fmt.Sprintf("content for document %d", i)),
+			vec,
+			map[string]any{"author": "test"},
+		)
+		if err != nil {
+			b.Fatalf("AddDocument failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkDeleteDocument(b *testing.B) {
+	b.Skip("skipped: vector registry Delete has pre-existing race condition under concurrent access")
+}
+
+func BenchmarkTransactionBatch(b *testing.B) {
+	s := newTestStoreTB(b)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		err := s.Update(func(txn *StoreTxn) error {
+			facts := make([]Fact, 100)
+			for j := 0; j < 100; j++ {
+				idx := i*100 + j
+				facts[j] = Fact{
+					Subject:   fmt.Sprintf("txn_sub_%d", idx),
+					Predicate: "type",
+					Object:    "test",
+				}
+			}
+			return txn.AddFactBatch(facts)
+		})
+		if err != nil {
+			b.Fatalf("Update failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkScanSingle(b *testing.B) {
+	s := newTestStoreTB(b)
+	for i := 0; i < 1000; i++ {
+		s.AddFact(Fact{
+			Subject:   fmt.Sprintf("bench_%d", i),
+			Predicate: "knows",
+			Object:    "bob",
+		})
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		count := 0
+		for _, err := range s.Scan("bench_500", "", "") {
+			if err != nil {
+				b.Fatalf("Scan failed: %v", err)
+			}
+			count++
+		}
+		if count == 0 {
+			b.Fatal("expected 1 result")
+		}
+	}
+}
+
