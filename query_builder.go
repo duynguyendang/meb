@@ -27,6 +27,7 @@ type Store interface {
 	ResolveID(id uint64) (string, error)
 	LFTJEngine() *query.LFTJEngine
 	Dict() dict.Dictionary
+	Exists(s, p, o string) bool
 }
 
 type Builder struct {
@@ -251,20 +252,9 @@ func (b *Builder) executeWithLFTJ(vecIter iter.Seq2[vector.SearchResult, error],
 
 func (b *Builder) matchesFilters(candidateKey string) bool {
 	for _, filter := range b.filters {
-		matched := false
-
-		for _, err := range b.store.Scan(candidateKey, filter.Predicate, fmt.Sprintf("%v", filter.Object)) {
-			if err != nil {
-				return false
-			}
-			matched = true
-			break
-		}
-
-		if !matched {
+		if !b.store.Exists(candidateKey, filter.Predicate, fmt.Sprintf("%v", filter.Object)) {
 			return false
 		}
 	}
-
 	return true
 }

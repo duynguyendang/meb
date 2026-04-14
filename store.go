@@ -22,9 +22,8 @@ import (
 )
 
 type MEBStore struct {
-	db     *badger.DB
-	dictDB *badger.DB
-	dict   dict.Dictionary
+	db   *badger.DB
+	dict dict.Dictionary
 
 	config *store.Config
 	mu     sync.RWMutex
@@ -254,23 +253,10 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		return nil, fmt.Errorf("failed to open BadgerDB: %w", err)
 	}
 
-	slog.Info("BadgerDB (graph) opened successfully")
+	slog.Info("BadgerDB opened successfully")
 
-	dictCfg := *cfg
-	dictCfg.DataDir = cfg.DictDir
-	dictCfg.SyncWrites = true
-
-	dictDB, err := store.OpenBadgerDB(&dictCfg)
+	dictEncoder, err := dict.NewEncoder(db, cfg.LRUCacheSize, cfg.NumDictShards)
 	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to open Dictionary BadgerDB: %w", err)
-	}
-
-	slog.Info("BadgerDB (Dictionary) opened successfully")
-
-	dictEncoder, err := dict.NewEncoder(dictDB, cfg.LRUCacheSize, cfg.NumDictShards)
-	if err != nil {
-		dictDB.Close()
 		db.Close()
 		return nil, fmt.Errorf("failed to create dictionary encoder: %w", err)
 	}
@@ -281,13 +267,11 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	wal, err := NewWAL(cfg.DataDir)
 	if err != nil {
 		db.Close()
-		dictDB.Close()
 		return nil, fmt.Errorf("failed to create WAL: %w", err)
 	}
 
 	m := &MEBStore{
 		db:                db,
-		dictDB:            dictDB,
 		dict:              dictEncoder,
 		config:            cfg,
 		vectors:           vector.NewRegistry(db, vCfg),
@@ -347,17 +331,10 @@ func (m *MEBStore) Reset() error {
 	}
 	<-m.cleanupDone
 
-	// Reset graph database
+	// Reset unified database (graph + dictionary + content + vectors)
 	err := m.db.DropAll()
 	if err != nil {
-		return fmt.Errorf("failed to reset graph database: %w", err)
-	}
-
-	// Reset dictionary database
-	if m.dictDB != nil {
-		if err := m.dictDB.DropAll(); err != nil {
-			return fmt.Errorf("failed to reset dictionary database: %w", err)
-		}
+		return fmt.Errorf("failed to reset database: %w", err)
 	}
 
 	// Reset dictionary encoder caches and allocator
@@ -394,9 +371,9 @@ func (m *MEBStore) Reset() error {
 	go m.runCleanupLoop()
 
 	slog.Info("store reset complete",
-		"graphDropped", true,
-		"dictDropped", true,
-		"vectorsReset", true,
+		"dbDropped", true,
+		"dictReseted", true,
+		"vectorsReseted", true,
 		"walCleared", true,
 	)
 	return nil
@@ -417,10 +394,7 @@ func (m *MEBStore) Close() error {
 		}
 		slog.Info("running GC before shutdown", "ratio", gcRatio)
 		if err := m.db.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
-			slog.Warn("GC failed for facts DB", "error", err)
-		}
-		if err := m.dictDB.RunValueLogGC(gcRatio); err != nil && err != badger.ErrNoRewrite {
-			slog.Warn("GC failed for dictionary DB", "error", err)
+			slog.Warn("GC failed", "error", err)
 		}
 	}
 
@@ -448,11 +422,6 @@ func (m *MEBStore) Close() error {
 	if err := m.wal.Close(); err != nil {
 		slog.Error("failed to close WAL", "error", err)
 		errs = append(errs, fmt.Errorf("close WAL: %w", err))
-	}
-
-	if err := m.dictDB.Close(); err != nil {
-		slog.Error("failed to close dictionary database", "error", err)
-		errs = append(errs, fmt.Errorf("close dictionary database: %w", err))
 	}
 
 	if err := m.db.Close(); err != nil {
@@ -559,11 +528,7 @@ func (m *MEBStore) RunValueLogGC(ratio float64) error {
 	}
 
 	if err := m.db.RunValueLogGC(ratio); err != nil && err != badger.ErrNoRewrite {
-		return fmt.Errorf("failed to run GC on facts DB: %w", err)
-	}
-
-	if err := m.dictDB.RunValueLogGC(ratio); err != nil && err != badger.ErrNoRewrite {
-		return fmt.Errorf("failed to run GC on dictionary DB: %w", err)
+		return fmt.Errorf("failed to run GC on database: %w", err)
 	}
 
 	return nil
@@ -782,25 +747,32 @@ func (m *MEBStore) runCleanup() {
 		})
 	}
 
-	// Phase 2: Run GC on both DBs
-	if err := m.db.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
-		slog.Debug("periodic GC failed for facts DB", "error", err)
-		m.telemetry.Emit("gc_failure", map[string]any{
-			"db":    "facts",
-			"error": err.Error(),
+	// Phase 2: Clean up orphaned dictionary entries
+	dictCleaned := m.cleanupOrphanedDictEntries(nil)
+	if dictCleaned > 0 {
+		slog.Info("orphaned dictionary entries cleaned up", "count", dictCleaned)
+		m.telemetry.Emit("dict_orphan_cleanup", map[string]any{
+			"count": dictCleaned,
 		})
-	} else if err == nil {
-		slog.Debug("periodic GC completed for facts DB")
 	}
 
-	if err := m.dictDB.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
-		slog.Debug("periodic GC failed for dictionary DB", "error", err)
+	// Phase 3: Clean up orphaned vectors (in BadgerDB, not in-memory cache)
+	vecCleaned := m.cleanupOrphanedVectors()
+	if vecCleaned > 0 {
+		slog.Info("orphaned vectors cleaned up", "count", vecCleaned)
+		m.telemetry.Emit("vector_orphan_cleanup", map[string]any{
+			"count": vecCleaned,
+		})
+	}
+
+	// Phase 4: Run GC on unified DB
+	if err := m.db.RunValueLogGC(0.5); err != nil && err != badger.ErrNoRewrite {
+		slog.Debug("periodic GC failed", "error", err)
 		m.telemetry.Emit("gc_failure", map[string]any{
-			"db":    "dictionary",
 			"error": err.Error(),
 		})
 	} else if err == nil {
-		slog.Debug("periodic GC completed for dictionary DB")
+		slog.Debug("periodic GC completed")
 	}
 }
 
@@ -1017,7 +989,9 @@ func (m *MEBStore) FindSubjectsByObject(ctx context.Context, predicate, object s
 	}
 }
 
-// hasPrefix checks if s starts with prefix, handling empty prefix edge case.
+// hasPrefix checks if s starts with prefix.
+// Unlike strings.HasPrefix, returns false for empty prefix (used to skip
+// full-table scans in ScanSubjectsByPrefix).
 func hasPrefix(s, prefix string) bool {
 	if prefix == "" {
 		return false

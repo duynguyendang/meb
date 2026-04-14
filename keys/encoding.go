@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/fnv"
 	"math"
+	"sync"
 )
 
 const (
@@ -12,6 +13,10 @@ const (
 
 	ChunkPrefix      byte = 0x10
 	VectorFullPrefix byte = 0x11
+
+	ForwardDictPrefix byte = 0x80
+	ReverseDictPrefix byte = 0x81
+
 	SystemPrefix     byte = 0xFF
 )
 
@@ -282,4 +287,57 @@ func EncodeVectorFullKey(id uint64) []byte {
 	k[0] = VectorFullPrefix
 	binary.BigEndian.PutUint64(k[1:], id)
 	return k
+}
+
+// TripleValueSize is the size of a triple value in bytes (exported for pools).
+const TripleValueSize = 16
+
+// TripleKeyPool provides reusable 25-byte triple key buffers.
+var TripleKeyPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, TripleKeySize)
+		return &b
+	},
+}
+
+// TripleValuePool provides reusable 16-byte triple value buffers.
+var TripleValuePool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, TripleValueSize)
+		return &b
+	},
+}
+
+// EncodeTripleKeyInto writes the encoded triple key into the provided buffer
+// and returns the buffer. The buffer must be at least TripleKeySize bytes.
+func EncodeTripleKeyInto(buf []byte, prefix byte, s, p, o uint64) []byte {
+	buf = buf[:TripleKeySize]
+	buf[0] = prefix
+
+	switch prefix {
+	case TripleSPOPrefix:
+		binary.BigEndian.PutUint64(buf[1:9], s)
+		binary.BigEndian.PutUint64(buf[9:17], p)
+		binary.BigEndian.PutUint64(buf[17:25], o)
+	case TripleOPSPrefix:
+		binary.BigEndian.PutUint64(buf[1:9], o)
+		binary.BigEndian.PutUint64(buf[9:17], p)
+		binary.BigEndian.PutUint64(buf[17:25], s)
+	default:
+		binary.BigEndian.PutUint64(buf[1:9], s)
+		binary.BigEndian.PutUint64(buf[9:17], p)
+		binary.BigEndian.PutUint64(buf[17:25], o)
+	}
+
+	return buf
+}
+
+// EncodeTripleValueWithHintsInto writes the encoded triple value into the provided buffer
+// and returns the buffer. The buffer must be at least TripleValueSize bytes.
+func EncodeTripleValueWithHintsInto(buf []byte, vectorID uint64, contentOffset uint64, hints uint16) []byte {
+	buf = buf[:TripleValueSize]
+	packed := (uint64(hints) << 48) | (contentOffset & ((1 << 48) - 1))
+	binary.BigEndian.PutUint64(buf[0:8], vectorID)
+	binary.BigEndian.PutUint64(buf[8:16], packed)
+	return buf
 }

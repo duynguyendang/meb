@@ -1,10 +1,15 @@
 package vector
 
 import (
+	"bytes"
 	"container/heap"
+	"encoding/binary"
 	"iter"
 	"log/slog"
 	"sort"
+
+	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/keys"
 )
 
 type SearchResult struct {
@@ -14,7 +19,7 @@ type SearchResult struct {
 
 type scoreIndex struct {
 	score float32
-	idx   int
+	id    uint64
 }
 
 type scoreHeap []scoreIndex
@@ -34,39 +39,47 @@ func (h *scoreHeap) Pop() any {
 const TopicIDMask = uint64(0xFFFFFF) << 40
 
 // Search returns an iterator of top-k most similar vectors.
+// Fast path: parallel mmap scan if vectors are loaded in RAM.
+// Fallback: streams from BadgerDB for cold start.
 func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	return r.SearchWithFilter(queryVec, k, 0)
 }
 
 // SearchWithFilter returns an iterator of top-k most similar vectors matching a semantic hash.
+// Fast path: parallel mmap scan if vectors are loaded in RAM.
+// Fallback: streams from BadgerDB for cold start.
 func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
 			return
 		}
 
-		slog.Debug("TQ vector search started",
-			"vectorCount", r.Count(),
-			"k", k,
-			"numWorkers", r.config.NumWorkers,
-		)
-
-		hybridQuery := QuantizeHybrid(queryVec, r.hybridCfg)
-
 		r.mu.RLock()
 		numVectors := r.totalVectors
-		if numVectors == 0 {
-			r.mu.RUnlock()
-			return
-		}
+		hasVectors := numVectors > 0
 		vectorSize := r.vectorSize
-		revMap := make([]uint64, len(r.revMap))
-		copy(revMap, r.revMap)
-		// Capture function to access vector slots (safe: segments won't shrink)
+		hybridCfg := r.hybridCfg
+		fullDim := r.config.FullDim
+		numWorkers := r.config.NumWorkers
+		revMap := *r.revMap.Load()
+
+		// Capture function to access vector slots
 		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
 		r.mu.RUnlock()
 
-		numWorkers := r.config.NumWorkers
+		if !hasVectors {
+			// Cold start: stream from Badger
+			r.searchFromBadger(queryVec, k, filterHash, hybridCfg, fullDim, yield)
+			return
+		}
+
+		slog.Debug("mmap-fast vector search",
+			"vectorCount", numVectors,
+			"k", k,
+		)
+
+		hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
+
 		if numWorkers > numVectors {
 			numWorkers = numVectors
 		}
@@ -89,7 +102,7 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := scanChunkHybrid(getSlot, hybridQuery, start, end, k, vectorSize, revMap, filterHash, r.config.FullDim, r.hybridCfg)
+				topK := scanChunkHybrid(getSlot, hybridQuery, start, end, k, vectorSize, revMap, filterHash, fullDim, hybridCfg)
 				resultCh <- topK
 			}(startIdx, endIdx)
 		}
@@ -111,76 +124,178 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 }
 
 // SearchInTopic returns an iterator of top-k most similar vectors within a specific topic.
+// Always uses Badger prefix scan — LSM-level filtering is faster than scanning all mmap vectors.
 func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
 			return
 		}
 
-		slog.Debug("TQ topic-aware vector search started",
+		slog.Debug("Badger-streaming topic-aware vector search started",
 			"topicID", topicID,
 			"vectorCount", r.Count(),
 			"k", k,
 		)
 
-		hybridQuery := QuantizeHybrid(queryVec, r.hybridCfg)
-
 		r.mu.RLock()
-		numVectors := r.totalVectors
-		if numVectors == 0 {
-			r.mu.RUnlock()
-			return
-		}
-		vectorSize := r.vectorSize
-		revMap := make([]uint64, len(r.revMap))
-		copy(revMap, r.revMap)
-		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
+		hybridCfg := r.hybridCfg
+		fullDim := r.config.FullDim
 		r.mu.RUnlock()
 
-		topicFilter := uint64(topicID) << 40
+		hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
 
-		numWorkers := r.config.NumWorkers
-		if numWorkers > numVectors {
-			numWorkers = numVectors
-		}
+		txn := r.db.NewTransaction(false)
+		defer txn.Discard()
 
-		vectorsPerWorker := (numVectors + numWorkers - 1) / numWorkers
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = true
+		it := txn.NewIterator(itOpts)
+		defer it.Close()
 
-		resultCh := make(chan []SearchResult, numWorkers)
-		actualWorkers := 0
+		// Topic prefix: [0x11][topicID << 40] — Badger LSM-tree prunes unrelated topics
+		topicPrefix := buildTopicVectorPrefix(topicID)
+		topicEnd := buildTopicVectorEnd(topicID)
+		h := make(scoreHeap, 0, k)
 
-		for i := 0; i < numWorkers; i++ {
-			startIdx := i * vectorsPerWorker
-			endIdx := startIdx + vectorsPerWorker
-			if endIdx > numVectors {
-				endIdx = numVectors
-			}
-			if startIdx >= endIdx {
+		for it.Seek(topicPrefix); it.Valid(); it.Next() {
+			key := it.Item().Key()
+			if bytes.Compare(key, topicEnd) >= 0 {
 				break
 			}
+			if len(key) != keys.ChunkKeySize || key[0] != keys.VectorFullPrefix {
+				continue
+			}
 
-			actualWorkers++
-			go func(start, end int) {
-				defer func() { recover() }()
-				topK := scanChunkHybridWithTopic(getSlot, hybridQuery, start, end, k, vectorSize, revMap, topicFilter, r.config.FullDim, r.hybridCfg)
-				resultCh <- topK
-			}(startIdx, endIdx)
+			// Extract ID from key: [0x11][id:8]
+			id := binary.BigEndian.Uint64(key[1:])
+
+			var score float32
+			err := it.Item().Value(func(val []byte) error {
+				if len(val) < 1 {
+					return nil
+				}
+				vecData := val[1:]
+				score = DotProductHybrid(vecData, hybridQuery, fullDim, hybridCfg)
+				return nil
+			})
+			if err != nil {
+				yield(SearchResult{}, err)
+				return
+			}
+
+			// Maintain top-k heap
+			if len(h) < k {
+				heap.Push(&h, scoreIndex{score: score, id: id})
+			} else if score > h[0].score {
+				h[0] = scoreIndex{score: score, id: id}
+				heap.Fix(&h, 0)
+			}
 		}
 
-		allResults := make([]SearchResult, 0, k*actualWorkers)
-		for i := 0; i < actualWorkers; i++ {
-			results := <-resultCh
-			allResults = append(allResults, results...)
-		}
-		close(resultCh)
-
-		final := getTopK(allResults, k)
-		for _, sr := range final {
+		// Sort by descending score and yield
+		results := extractResults(h)
+		for _, sr := range results {
 			if !yield(sr, nil) {
 				return
 			}
 		}
 	}
+}
+
+// searchFromBadger streams all vectors from Badger and maintains a top-k heap.
+// Used as fallback when mmap cache is empty (cold start).
+func (r *VectorRegistry) searchFromBadger(queryVec []float32, k int, filterHash uint8, hybridCfg *HybridConfig, fullDim int, yield func(SearchResult, error) bool) {
+	slog.Debug("Badger-streaming vector search (cold start)",
+		"k", k,
+	)
+
+	hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
+
+	txn := r.db.NewTransaction(false)
+	defer txn.Discard()
+
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.PrefetchValues = true
+	it := txn.NewIterator(itOpts)
+	defer it.Close()
+
+	// Prefix: [0x11] — all vectors
+	prefix := []byte{keys.VectorFullPrefix}
+	h := make(scoreHeap, 0, k)
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		item := it.Item()
+		vecKey := item.Key()
+		if len(vecKey) != keys.ChunkKeySize {
+			continue
+		}
+
+		// Extract ID from key: [0x11][id:8]
+		id := binary.BigEndian.Uint64(vecKey[1:])
+
+		var score float32
+		err := item.Value(func(val []byte) error {
+			if len(val) < 1 {
+				return nil
+			}
+			hashByte := val[0]
+			if filterHash != 0 && hashByte != filterHash {
+				return nil
+			}
+			vecData := val[1:]
+			score = DotProductHybrid(vecData, hybridQuery, fullDim, hybridCfg)
+			return nil
+		})
+		if err != nil {
+			yield(SearchResult{}, err)
+			return
+		}
+
+		// Maintain top-k heap
+		if len(h) < k {
+			heap.Push(&h, scoreIndex{score: score, id: id})
+		} else if score > h[0].score {
+			h[0] = scoreIndex{score: score, id: id}
+			heap.Fix(&h, 0)
+		}
+	}
+
+	// Sort by descending score and yield
+	results := extractResults(h)
+	for _, sr := range results {
+		if !yield(sr, nil) {
+			return
+		}
+	}
+}
+
+// buildTopicVectorPrefix builds a Badger prefix for streaming vectors of a specific topic.
+// Key format: [0x11][TopicID:24][LocalID:40] — topic is in the upper 24 bits of the ID.
+func buildTopicVectorPrefix(topicID uint32) []byte {
+	prefix := make([]byte, 5)
+	prefix[0] = keys.VectorFullPrefix
+	binary.BigEndian.PutUint32(prefix[1:], topicID)
+	return prefix
+}
+
+// buildTopicVectorEnd builds the exclusive upper bound for a topic's vector range.
+func buildTopicVectorEnd(topicID uint32) []byte {
+	end := make([]byte, 5)
+	end[0] = keys.VectorFullPrefix
+	binary.BigEndian.PutUint32(end[1:], topicID+1)
+	return end
+}
+
+func extractResults(h scoreHeap) []SearchResult {
+	results := make([]SearchResult, len(h))
+	for i := len(h) - 1; i >= 0; i-- {
+		si := heap.Pop(&h).(scoreIndex)
+		results[i] = SearchResult{
+			ID:    si.id,
+			Score: si.score,
+		}
+	}
+	return results
 }
 
 // scanChunkHybrid scans a chunk of Hybrid vectors using a slot accessor function.
@@ -199,67 +314,23 @@ func scanChunkHybrid(getSlot func(int) []byte, query []byte, startIdx, endIdx, k
 		score := DotProductHybrid(vecData, query, fullDim, hybridCfg)
 
 		if len(h) < k {
-			h = append(h, scoreIndex{score: score, idx: idx})
+			h = append(h, scoreIndex{score: score, id: revMap[idx]})
 			if len(h) == k {
 				heap.Init(&h)
 			}
 		} else if score > h[0].score {
-			h[0] = scoreIndex{score: score, idx: idx}
+			h[0] = scoreIndex{score: score, id: revMap[idx]}
 			heap.Fix(&h, 0)
 		}
 	}
 
-	results := make([]SearchResult, 0, len(h))
-	for _, si := range h {
-		if si.idx < len(revMap) {
-			results = append(results, SearchResult{
-				ID:    revMap[si.idx],
-				Score: si.score,
-			})
+	results := make([]SearchResult, len(h))
+	for i, si := range h {
+		results[i] = SearchResult{
+			ID:    si.id,
+			Score: si.score,
 		}
 	}
-
-	return results
-}
-
-// scanChunkHybridWithTopic scans a chunk of Hybrid vectors filtering by topic ID.
-func scanChunkHybridWithTopic(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, topicFilter uint64, fullDim int, hybridCfg *HybridConfig) []SearchResult {
-	h := make(scoreHeap, 0, k)
-	topicMask := TopicIDMask
-
-	for idx := startIdx; idx < endIdx; idx++ {
-		if idx >= len(revMap) {
-			break
-		}
-		if (revMap[idx] & topicMask) != topicFilter {
-			continue
-		}
-
-		slot := getSlot(idx)
-		vecData := slot[hashSize:vectorSize]
-		score := DotProductHybrid(vecData, query, fullDim, hybridCfg)
-
-		if len(h) < k {
-			h = append(h, scoreIndex{score: score, idx: idx})
-			if len(h) == k {
-				heap.Init(&h)
-			}
-		} else if score > h[0].score {
-			h[0] = scoreIndex{score: score, idx: idx}
-			heap.Fix(&h, 0)
-		}
-	}
-
-	results := make([]SearchResult, 0, len(h))
-	for _, si := range h {
-		if si.idx < len(revMap) {
-			results = append(results, SearchResult{
-				ID:    revMap[si.idx],
-				Score: si.score,
-			})
-		}
-	}
-
 	return results
 }
 
@@ -276,12 +347,4 @@ func getTopK(results []SearchResult, k int) []SearchResult {
 		return results[:k]
 	}
 	return results
-}
-
-// DecodeVectorTopic extracts the TopicID from a vector's packed ID in the registry.
-func DecodeVectorTopic(revMap []uint64, idx int) uint32 {
-	if idx < 0 || idx >= len(revMap) {
-		return 0
-	}
-	return uint32((revMap[idx] & TopicIDMask) >> 40)
 }

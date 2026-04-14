@@ -10,27 +10,6 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
-const TripleValueSize = 16
-
-// encodeTripleValue encodes a triple value with vector ID and content offset.
-// The upper 16 bits of contentOffset can carry semantic hints.
-func encodeTripleValue(vectorID, contentOffset uint64) []byte {
-	val := make([]byte, TripleValueSize)
-	binary.BigEndian.PutUint64(val[0:8], vectorID)
-	binary.BigEndian.PutUint64(val[8:16], contentOffset)
-	return val
-}
-
-// encodeTripleValueWithHints encodes a triple value with semantic hints packed into
-// the upper 16 bits of contentOffset. Lower 48 bits hold the actual offset.
-func encodeTripleValueWithHints(vectorID uint64, contentOffset uint64, hints uint16) []byte {
-	packed := (uint64(hints) << 48) | (contentOffset & ((1 << 48) - 1))
-	val := make([]byte, TripleValueSize)
-	binary.BigEndian.PutUint64(val[0:8], vectorID)
-	binary.BigEndian.PutUint64(val[8:16], packed)
-	return val
-}
-
 // ShouldPruneTriple reads semantic hints from a 16-byte triple value and returns true
 // if the triple should be pruned based on the requested entity type and public flag.
 func ShouldPruneTriple(value []byte, wantEntityType uint16, wantPublic bool) bool {
@@ -53,6 +32,16 @@ func ShouldPruneTriple(value []byte, wantEntityType uint16, wantPublic bool) boo
 	return false
 }
 
+// encodeTripleValueWithHints encodes a triple value with semantic hints packed into
+// the upper 16 bits of contentOffset. Lower 48 bits hold the actual offset.
+func encodeTripleValueWithHints(vectorID uint64, contentOffset uint64, hints uint16) []byte {
+	packed := (uint64(hints) << 48) | (contentOffset & ((1 << 48) - 1))
+	val := make([]byte, keys.TripleValueSize)
+	binary.BigEndian.PutUint64(val[0:8], vectorID)
+	binary.BigEndian.PutUint64(val[8:16], packed)
+	return val
+}
+
 func (m *MEBStore) AddFact(fact Fact) error {
 	if err := validateFact(fact); err != nil {
 		return fmt.Errorf("failed to add fact: %w", err)
@@ -70,7 +59,10 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 
 	// Write to WAL before any DB operations (dual-DB atomicity)
 	for _, fact := range facts {
-		objStr := fmt.Sprintf("%v", fact.Object)
+		objStr, isString := fact.Object.(string)
+		if !isString {
+			objStr = fmt.Sprintf("%v", fact.Object)
+		}
 		if err := m.wal.Append(walEntry{
 			subject: fact.Subject,
 			pred:    fact.Predicate,
@@ -201,39 +193,35 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 	it := txn.NewIterator(opts)
 
-	type tripleKeys struct {
-		spo []byte
-		ops []byte
-		pID uint64
-		oID uint64
-	}
-
 	const maxDeleteBatchSize = 1000
-	var keysToDelete []tripleKeys
+	var spoKeys [][]byte
+	var opsKeys [][]byte
+	pIDs := make([]uint64, 0, maxDeleteBatchSize)
+	oIDs := make([]uint64, 0, maxDeleteBatchSize)
 	totalDeleted := 0
 	referencedIDs := make(map[uint64]int)
 
 	flushBatch := func() error {
-		if len(keysToDelete) == 0 {
+		if len(spoKeys) == 0 {
 			return nil
 		}
 
-		batchSize := len(keysToDelete)
+		batchSize := len(spoKeys)
 		deleteTxn := m.db.NewTransaction(true)
-		for _, k := range keysToDelete {
-			if err := deleteTxn.Delete(k.spo); err != nil {
+		for i := 0; i < batchSize; i++ {
+			if err := deleteTxn.Delete(spoKeys[i]); err != nil {
 				deleteTxn.Discard()
 				return fmt.Errorf("failed to delete SPO key: %w", err)
 			}
-			if err := deleteTxn.Delete(k.ops); err != nil {
+			if err := deleteTxn.Delete(opsKeys[i]); err != nil {
 				deleteTxn.Discard()
 				return fmt.Errorf("failed to delete OPS key: %w", err)
 			}
-			if k.pID != 0 {
-				referencedIDs[k.pID]++
+			if pIDs[i] != 0 {
+				referencedIDs[pIDs[i]]++
 			}
-			if k.oID != 0 && !keys.IsInline(k.oID) {
-				referencedIDs[k.oID]++
+			if oIDs[i] != 0 && !keys.IsInline(oIDs[i]) {
+				referencedIDs[oIDs[i]]++
 			}
 		}
 
@@ -243,7 +231,10 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 		m.numFacts.Add(^uint64(batchSize - 1))
 		totalDeleted += batchSize
-		keysToDelete = keysToDelete[:0]
+		spoKeys = spoKeys[:0]
+		opsKeys = opsKeys[:0]
+		pIDs = pIDs[:0]
+		oIDs = oIDs[:0]
 		return nil
 	}
 
@@ -258,14 +249,12 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 		opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, s, p, o)
 
-		keysToDelete = append(keysToDelete, tripleKeys{
-			spo: spoKey,
-			ops: opsKey,
-			pID: p,
-			oID: o,
-		})
+		spoKeys = append(spoKeys, spoKey)
+		opsKeys = append(opsKeys, opsKey)
+		pIDs = append(pIDs, p)
+		oIDs = append(oIDs, o)
 
-		if len(keysToDelete) >= maxDeleteBatchSize {
+		if len(spoKeys) >= maxDeleteBatchSize {
 			if err := flushBatch(); err != nil {
 				it.Close()
 				return err
@@ -291,17 +280,20 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int {
 	if len(referencedIDs) == 0 {
-		return 0
+		// Standalone scan: find all dictionary entries and check if they're referenced
+		return m.cleanupOrphanedDictEntriesFullScan()
 	}
 
 	// Convert packed IDs to local IDs and deduplicate.
 	// The dictionary stores local IDs, so we check if each local ID
 	// is still referenced by any remaining triple in the graph.
-	localCandidates := make(map[uint64]bool)
+	localCandidates := make([]uint64, 0, len(referencedIDs))
+	seen := make(map[uint64]bool)
 	for packedID := range referencedIDs {
 		localID := keys.UnpackLocalID(packedID)
-		if localID != 0 {
-			localCandidates[localID] = true
+		if localID != 0 && !seen[localID] {
+			seen[localID] = true
+			localCandidates = append(localCandidates, localID)
 		}
 	}
 
@@ -309,51 +301,43 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 		return 0
 	}
 
-	// For each candidate local ID, do a scoped prefix scan instead of a full SPO scan.
-	// Scanning EncodeTripleSPOPrefix(0, candidateID, 0) only visits triples with that
-	// specific predicate — typically a tiny fraction of the total graph.
-	cleaned := 0
-	for localID := range localCandidates {
-		stillReferenced := false
+	// Batch all reference checks into a single read transaction.
+	// For each candidate, check both SPO (as predicate) and OPS (as object) indices.
+	unreferenced := make([]uint64, 0, len(localCandidates))
+	m.withReadTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-		// Scoped scan: check if any triple still uses this predicate ID
-		m.withReadTxn(func(txn *badger.Txn) error {
+		for _, localID := range localCandidates {
+			stillReferenced := false
+
+			// Check SPO index: is this ID used as a predicate?
 			prefix := keys.EncodeTripleSPOPrefix(0, localID, 0)
-			opts := badger.DefaultIteratorOptions
-			opts.PrefetchValues = false
-			it := txn.NewIterator(opts)
-			defer it.Close()
-
 			it.Seek(prefix)
 			if it.ValidForPrefix(prefix) {
 				stillReferenced = true
 			}
-			return nil
-		})
 
-		if stillReferenced {
-			continue
-		}
-
-		// Also check OPS index for object references
-		m.withReadTxn(func(txn *badger.Txn) error {
-			prefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
-			opts := badger.DefaultIteratorOptions
-			opts.PrefetchValues = false
-			it := txn.NewIterator(opts)
-			defer it.Close()
-
-			it.Seek(prefix)
-			if it.ValidForPrefix(prefix) {
-				stillReferenced = true
+			if !stillReferenced {
+				// Check OPS index: is this ID used as an object?
+				opsPrefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
+				it.Seek(opsPrefix)
+				if it.ValidForPrefix(opsPrefix) {
+					stillReferenced = true
+				}
 			}
-			return nil
-		})
 
-		if stillReferenced {
-			continue
+			if !stillReferenced {
+				unreferenced = append(unreferenced, localID)
+			}
 		}
+		return nil
+	})
 
+	cleaned := 0
+	for _, localID := range unreferenced {
 		s, err := m.dict.GetString(localID)
 		if err != nil {
 			continue
@@ -362,6 +346,157 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 			cleaned++
 		}
 	}
+
+	return cleaned
+}
+
+// cleanupOrphanedDictEntriesFullScan scans all dictionary entries and removes
+// those that are not referenced by any triple in the SPO/OPS indices.
+func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
+	// Collect all local IDs from the dictionary (reverse index: ID → string)
+	var candidateIDs []uint64
+	m.withReadTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		revPrefix := []byte{keys.ReverseDictPrefix} // 0x81
+		for it.Seek(revPrefix); it.ValidForPrefix(revPrefix); it.Next() {
+			key := it.Item().Key()
+			if len(key) < 9 { // 1 prefix + 8 ID bytes
+				continue
+			}
+			id := binary.BigEndian.Uint64(key[1:9])
+			candidateIDs = append(candidateIDs, id)
+		}
+		return nil
+	})
+
+	if len(candidateIDs) == 0 {
+		return 0
+	}
+
+	// Check which IDs are still referenced by triples
+	unreferenced := make([]uint64, 0, len(candidateIDs))
+	m.withReadTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for _, localID := range candidateIDs {
+			stillReferenced := false
+
+			// Check SPO index: is this ID used as a predicate?
+			prefix := keys.EncodeTripleSPOPrefix(0, localID, 0)
+			it.Seek(prefix)
+			if it.ValidForPrefix(prefix) {
+				stillReferenced = true
+			}
+
+			if !stillReferenced {
+				// Check OPS index: is this ID used as an object?
+				opsPrefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
+				it.Seek(opsPrefix)
+				if it.ValidForPrefix(opsPrefix) {
+					stillReferenced = true
+				}
+			}
+
+			// Also check as a subject (SPO with subject = localID)
+			if !stillReferenced {
+				spoPrefix := keys.EncodeTripleSPOPrefix(localID, 0, 0)
+				it.Seek(spoPrefix)
+				if it.ValidForPrefix(spoPrefix) {
+					stillReferenced = true
+				}
+			}
+
+			if !stillReferenced {
+				unreferenced = append(unreferenced, localID)
+			}
+		}
+		return nil
+	})
+
+	cleaned := 0
+	for _, localID := range unreferenced {
+		s, err := m.dict.GetString(localID)
+		if err != nil {
+			continue
+		}
+		if err := m.dict.DeleteID(s); err == nil {
+			cleaned++
+		}
+	}
+
+	return cleaned
+}
+
+// cleanupOrphanedVectors scans vectors and removes those that have no
+// corresponding content or any referencing facts.
+func (m *MEBStore) cleanupOrphanedVectors() int {
+	cleaned := 0
+
+	m.withWriteTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		vecPrefix := []byte{keys.VectorFullPrefix}
+		var orphanKeys [][]byte
+
+		for it.Seek(vecPrefix); it.ValidForPrefix(vecPrefix); it.Next() {
+			key := it.Item().Key()
+			if len(key) != keys.ChunkKeySize {
+				continue
+			}
+
+			id := binary.BigEndian.Uint64(key[1:])
+
+			// Check if content exists for this vector
+			contentKey := keys.EncodeChunkKey(id)
+			_, err := txn.Get(contentKey)
+			hasContent := err == nil
+
+			// Check if any fact references this ID (as object, subject is string so check as subject)
+			hasFact := false
+			if !hasContent {
+				// Check SPO: is this ID used as a subject (packed with any topic)?
+				// Since subjects are packed with topicID, we need to scan all topics
+				spoPrefix := []byte{keys.TripleSPOPrefix}
+				subIt := txn.NewIterator(badger.DefaultIteratorOptions)
+				for subIt.Seek(spoPrefix); subIt.ValidForPrefix(spoPrefix); subIt.Next() {
+					sKey := subIt.Item().Key()
+					if len(sKey) != keys.TripleKeySize {
+						continue
+					}
+					s, _, _ := keys.DecodeTripleKey(sKey)
+					if keys.UnpackLocalID(s) == id {
+						hasFact = true
+						break
+					}
+				}
+				subIt.Close()
+			}
+
+			if !hasContent && !hasFact {
+				orphanKeys = append(orphanKeys, key)
+			}
+		}
+
+		// Delete orphans
+		for _, key := range orphanKeys {
+			if err := txn.Delete(key); err != nil {
+				return err
+			}
+			cleaned++
+		}
+
+		return nil
+	})
 
 	return cleaned
 }

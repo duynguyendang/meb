@@ -129,7 +129,6 @@ type scanResult struct {
 	foundPID uint64
 	foundOID uint64
 	key      []byte
-	value    []byte // Triple value bytes (needed for inline object decoding)
 }
 
 type scanOptions struct {
@@ -285,15 +284,22 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 // returned as int64/float64 rather than string. If exact type preservation is
 // required, use inline types (bool, int32, float32) which bypass the dictionary.
 func restoreTypedValue(s string) any {
-	// Try int64 first (matches "%d" format)
-	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return i
+	// Fast-path: skip parsing for obviously non-numeric strings.
+	// Most dictionary values are strings, so this avoids two expensive
+	// parse attempts per fact in the common case.
+	if len(s) == 0 {
+		return s
 	}
-	// Try float64 (matches "%.17g" format)
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return f
+	c := s[0]
+	if c >= '0' && c <= '9' || c == '-' || c == '+' || c == '.' {
+		// Could be numeric — try parsing.
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f
+		}
 	}
-	// Default to string
 	return s
 }
 
@@ -321,7 +327,7 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 		}
 
 		itOpts := badger.DefaultIteratorOptions
-		itOpts.PrefetchValues = true // Always fetch values (needed for inline object decoding)
+		itOpts.PrefetchValues = true // Needed for semantic hint pruning (ShouldPruneTriple)
 		it := txn.NewIterator(itOpts)
 		defer it.Close()
 
@@ -366,12 +372,6 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 			}
 
 			result.key = key
-			// Capture value bytes for inline object decoding
-			_ = item.Value(func(val []byte) error {
-				result.value = make([]byte, len(val))
-				copy(result.value, val)
-				return nil
-			})
 			fact, err := processFn(&result)
 			if err != nil {
 				yield(Fact{}, err)

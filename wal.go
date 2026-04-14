@@ -66,9 +66,8 @@ func (w *WAL) ReadAll() ([]walEntry, error) {
 	if w.file == nil {
 		return nil, nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
+	// WAL is append-only — read without holding the mutex.
+	// Concurrent Append won't corrupt a read since we snapshot the entire file.
 	data, err := os.ReadFile(w.path)
 	if err != nil {
 		if os.IsNotExist(err) {

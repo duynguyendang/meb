@@ -34,7 +34,15 @@ func DotProduct(v1, v2 []float32) float32 {
 	}
 
 	var sum float32
-	for i := range v1 {
+	n := len(v1)
+
+	// Manual unroll by 8 to help Go compiler generate AVX instructions
+	i := 0
+	for ; i+7 < n; i += 8 {
+		sum += v1[i]*v2[i] + v1[i+1]*v2[i+1] + v1[i+2]*v2[i+2] + v1[i+3]*v2[i+3] +
+			v1[i+4]*v2[i+4] + v1[i+5]*v2[i+5] + v1[i+6]*v2[i+6] + v1[i+7]*v2[i+7]
+	}
+	for ; i < n; i++ {
 		sum += v1[i] * v2[i]
 	}
 

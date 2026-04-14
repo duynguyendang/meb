@@ -1,6 +1,7 @@
 package meb
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -586,5 +587,187 @@ func TestInlineMixedTypes(t *testing.T) {
 	}
 	if len(docFacts) != 4 {
 		t.Errorf("expected 4 doc facts, got %d", len(docFacts))
+	}
+}
+
+// --- Transaction tests ---
+
+func TestTransactionAddFactBatch(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.Update(func(txn *StoreTxn) error {
+		return txn.AddFactBatch([]Fact{
+			{Subject: "alice", Predicate: "knows", Object: "bob"},
+			{Subject: "alice", Predicate: "knows", Object: "charlie"},
+		})
+	})
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	if s.Count() != 2 {
+		t.Errorf("expected count 2, got %d", s.Count())
+	}
+}
+
+func TestTransactionRollback(t *testing.T) {
+	s := newTestStore(t)
+
+	// Add one fact successfully
+	err := s.Update(func(txn *StoreTxn) error {
+		return txn.AddFact(Fact{Subject: "alice", Predicate: "knows", Object: "bob"})
+	})
+	if err != nil {
+		t.Fatalf("first Update failed: %v", err)
+	}
+
+	if s.Count() != 1 {
+		t.Fatalf("expected count 1, got %d", s.Count())
+	}
+
+	// Attempt to add facts but rollback
+	err = s.Update(func(txn *StoreTxn) error {
+		if err := txn.AddFact(Fact{Subject: "charlie", Predicate: "knows", Object: "dave"}); err != nil {
+			return err
+		}
+		return fmt.Errorf("intentional rollback")
+	})
+	if err == nil {
+		t.Fatal("expected error from intentional rollback")
+	}
+
+	// Count should still be 1 (charlie fact was rolled back)
+	if s.Count() != 1 {
+		t.Errorf("expected count 1 after rollback, got %d", s.Count())
+	}
+}
+
+func TestTransactionView(t *testing.T) {
+	s := newTestStore(t)
+
+	s.AddFact(Fact{Subject: "alice", Predicate: "knows", Object: "bob"})
+
+	var facts []Fact
+	err := s.View(func(txn *StoreTxn) error {
+		for f, err := range txn.Scan("alice", "", "") {
+			if err != nil {
+				return err
+			}
+			facts = append(facts, f)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("View failed: %v", err)
+	}
+
+	if len(facts) != 1 {
+		t.Errorf("expected 1 fact, got %d", len(facts))
+	}
+	if facts[0].Subject != "alice" || facts[0].Predicate != "knows" || facts[0].Object != "bob" {
+		t.Errorf("unexpected fact: %+v", facts[0])
+	}
+}
+
+func TestTransactionAddDocument(t *testing.T) {
+	s := newTestStore(t)
+
+	vec := make([]float32, 1536)
+	for i := range vec {
+		vec[i] = float32(i) / 1536.0
+	}
+
+	err := s.AddDocument("doc1", []byte("hello world"), vec, map[string]any{
+		"author": "alice",
+		"year":   int32(2024),
+	})
+	if err != nil {
+		t.Fatalf("AddDocument failed: %v", err)
+	}
+
+	// Should have 2 metadata facts (author + year)
+	if s.Count() != 2 {
+		t.Errorf("expected count 2, got %d", s.Count())
+	}
+
+	// Verify content
+	content, err := s.GetContentByKey("doc1")
+	if err != nil {
+		t.Fatalf("GetContentByKey failed: %v", err)
+	}
+	if string(content) != "hello world" {
+		t.Errorf("content mismatch: got %s, want hello world", string(content))
+	}
+
+	// Verify metadata
+	metadata, err := s.GetDocumentMetadata("doc1")
+	if err != nil {
+		t.Fatalf("GetDocumentMetadata failed: %v", err)
+	}
+	if metadata["author"] != "alice" {
+		t.Errorf("author mismatch: got %v, want alice", metadata["author"])
+	}
+}
+
+func TestTransactionDeleteDocument(t *testing.T) {
+	s := newTestStore(t)
+
+	vec := make([]float32, 1536)
+	for i := range vec {
+		vec[i] = float32(i) / 1536.0
+	}
+
+	err := s.AddDocument("doc1", []byte("hello world"), vec, map[string]any{
+		"author": "alice",
+	})
+	if err != nil {
+		t.Fatalf("AddDocument failed: %v", err)
+	}
+
+	if s.Count() != 1 {
+		t.Fatalf("expected count 1, got %d", s.Count())
+	}
+
+	err = s.DeleteDocument("doc1")
+	if err != nil {
+		t.Fatalf("DeleteDocument failed: %v", err)
+	}
+
+	if s.Count() != 0 {
+		t.Errorf("expected count 0 after delete, got %d", s.Count())
+	}
+
+	// Verify document no longer exists (dictionary entry deleted)
+	_, err = s.GetContentByKey("doc1")
+	if err == nil {
+		t.Errorf("expected error from GetContentByKey after delete, got nil")
+	}
+
+	// Verify HasDocument returns false
+	exists, err := s.HasDocument("doc1")
+	if err != nil {
+		t.Fatalf("HasDocument failed: %v", err)
+	}
+	if exists {
+		t.Error("expected HasDocument to return false after delete")
+	}
+}
+
+func TestTransactionExists(t *testing.T) {
+	s := newTestStore(t)
+
+	s.AddFact(Fact{Subject: "alice", Predicate: "knows", Object: "bob"})
+
+	err := s.View(func(txn *StoreTxn) error {
+		if !txn.Exists("alice", "knows", "bob") {
+			t.Error("expected exists to return true")
+		}
+		if txn.Exists("alice", "knows", "charlie") {
+			t.Error("expected exists to return false")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("View failed: %v", err)
 	}
 }

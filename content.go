@@ -2,9 +2,9 @@ package meb
 
 import (
 	"fmt"
-	"log/slog"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 	"github.com/klauspost/compress/s2"
 )
@@ -50,7 +50,7 @@ func (m *MEBStore) GetContent(id uint64) ([]byte, error) {
 }
 
 func (m *MEBStore) AddDocument(docKey string, content []byte, vec []float32, metadata map[string]any) error {
-	return m.addDocumentWithTopic(m.topicID.Load(), docKey, content, vec, metadata)
+	return m.AddDocumentWithTopic(m.topicID.Load(), docKey, content, vec, metadata)
 }
 
 func (m *MEBStore) AddDocumentWithTopic(topicID uint32, docKey string, content []byte, vec []float32, metadata map[string]any) error {
@@ -65,41 +65,47 @@ func (m *MEBStore) addDocumentWithTopic(topicID uint32, docKey string, content [
 		return fmt.Errorf("%w: document key cannot be empty", ErrInvalidFact)
 	}
 
-	id, err := m.dict.GetOrCreateID(docKey)
-	if err != nil {
-		return fmt.Errorf("failed to get document ID: %w", err)
-	}
-
-	if len(metadata) > 0 {
-		facts := make([]Fact, 0, len(metadata))
-		for key, value := range metadata {
-			facts = append(facts, Fact{
-				Subject:   docKey,
-				Predicate: key,
-				Object:    value,
-			})
+	// All operations in a single atomic transaction
+	return m.Update(func(txn *StoreTxn) error {
+		// Get or create dictionary ID
+		id, err := txn.GetOrCreateID(docKey)
+		if err != nil {
+			return fmt.Errorf("failed to get document ID: %w", err)
 		}
-		prevTopic := m.topicID.Swap(topicID)
-		if err := m.AddFactBatch(facts); err != nil {
-			m.topicID.Store(prevTopic)
-			return fmt.Errorf("failed to add metadata facts: %w", err)
-		}
-		m.topicID.Store(prevTopic)
-	}
 
-	if len(vec) > 0 {
-		if err := m.vectors.Add(id, vec); err != nil {
-			return fmt.Errorf("failed to add vector: %w", err)
+		// Add metadata facts
+		if len(metadata) > 0 {
+			facts := make([]Fact, 0, len(metadata))
+			for key, value := range metadata {
+				facts = append(facts, Fact{
+					Subject:   docKey,
+					Predicate: key,
+					Object:    value,
+				})
+			}
+			if err := txn.AddFactBatchWithTopic(facts, topicID); err != nil {
+				return fmt.Errorf("failed to add metadata facts: %w", err)
+			}
 		}
-	}
 
-	if len(content) > 0 {
-		if err := m.SetContent(id, content); err != nil {
-			return fmt.Errorf("failed to store content: %w", err)
+		// Add vector
+		if len(vec) > 0 {
+			if err := txn.AddVector(id, vec); err != nil {
+				return fmt.Errorf("failed to add vector: %w", err)
+			}
+			// Also update in-memory registry for fast access
+			m.vectors.AddWithHash(id, vec, 0)
 		}
-	}
 
-	return nil
+		// Store content
+		if len(content) > 0 {
+			if err := txn.SetContent(id, content); err != nil {
+				return fmt.Errorf("failed to store content: %w", err)
+			}
+		}
+
+		return nil
+	})
 }
 
 func (m *MEBStore) GetDocumentMetadata(docKey string) (map[string]any, error) {
@@ -127,59 +133,20 @@ func (m *MEBStore) DeleteDocument(docKey string) error {
 		return fmt.Errorf("document key cannot be empty")
 	}
 
-	id, err := m.dict.GetID(docKey)
-	if err != nil {
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		return fmt.Errorf("failed to get document ID: %w", err)
+	return m.DeleteDocumentWithTopic(docKey, m.topicID.Load())
+}
+
+func (m *MEBStore) DeleteDocumentWithTopic(docKey string, topicID uint32) error {
+	if m.config.ReadOnly {
+		return ErrStoreReadOnly
+	}
+	if docKey == "" {
+		return fmt.Errorf("document key cannot be empty")
 	}
 
-	contentKey := keys.EncodeChunkKey(id)
-	if err := m.withWriteTxn(func(txn *badger.Txn) error {
-		return txn.Delete(contentKey)
-	}); err != nil && err != badger.ErrKeyNotFound {
-		return fmt.Errorf("failed to delete content: %w", err)
-	}
-
-	if !m.vectors.Delete(id) {
-		slog.Debug("vector not found for deletion", "key", docKey, "id", id)
-	}
-
-	// Pack TopicID into subject ID — facts are stored with packed IDs
-	packedID := keys.PackID(m.topicID.Load(), keys.UnpackLocalID(id))
-	metadataPrefix := keys.EncodeTripleSPOPrefix(packedID, 0, 0)
-
-	var deletedCount uint64
-	if err := m.withWriteTxn(func(txn *badger.Txn) error {
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
-
-		for it.Seek(metadataPrefix); it.ValidForPrefix(metadataPrefix); it.Next() {
-			item := it.Item()
-			key := item.Key()
-			s, p, o := keys.DecodeTripleKey(key)
-			opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, s, p, o)
-			if err := txn.Delete(key); err != nil {
-				return err
-			}
-			if err := txn.Delete(opsKey); err != nil {
-				return err
-			}
-			deletedCount++
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to delete metadata facts: %w", err)
-	}
-
-	if deletedCount > 0 {
-		m.numFacts.Add(^uint64(deletedCount - 1))
-	}
-
-	m.dict.DeleteID(docKey)
-
-	return nil
+	return m.Update(func(txn *StoreTxn) error {
+		return txn.DeleteDocumentWithTopic(docKey, topicID)
+	})
 }
 
 func (m *MEBStore) HasDocument(docKey string) (bool, error) {
@@ -189,7 +156,7 @@ func (m *MEBStore) HasDocument(docKey string) (bool, error) {
 
 	id, err := m.dict.GetID(docKey)
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if err == badger.ErrKeyNotFound || err == dict.ErrNotFound {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to get document ID: %w", err)

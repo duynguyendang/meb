@@ -151,16 +151,24 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		key   string
 	}
 	var misses []miss
-
-	batchLocalMap := make(map[string]uint64)
+	var batchLocalMap map[string]uint64
 
 	for i, key := range keys {
 		if id, ok := e.forwardCache.Get(key); ok && id != 0 {
 			results[i] = id
-		} else if id, ok := batchLocalMap[key]; ok {
-			results[i] = id
+		} else if batchLocalMap != nil {
+			if id, ok := batchLocalMap[key]; ok {
+				results[i] = id
+			} else {
+				misses = append(misses, miss{index: i, key: key})
+				if batchLocalMap == nil {
+					batchLocalMap = make(map[string]uint64, len(keys)-i)
+				}
+				batchLocalMap[key] = 0
+			}
 		} else {
 			misses = append(misses, miss{index: i, key: key})
+			batchLocalMap = make(map[string]uint64, len(keys)-i)
 			batchLocalMap[key] = 0
 		}
 	}
@@ -237,6 +245,7 @@ func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 		}
 	}
 
+	// Cache DB-found misses (toCreate items are already cached above).
 	for _, m := range misses {
 		id := results[m.index]
 		if id != 0 {
@@ -405,4 +414,141 @@ func (e *Encoder) Stats() map[string]interface{} {
 		"reverse_cache_len": e.reverseCache.Len(),
 		"next_id":           e.allocator.CurrentID() + 1,
 	}
+}
+
+// --- Transaction-aware methods ---
+
+// GetOrCreateIDInTxn gets or creates a dictionary ID within an existing transaction.
+func (e *Encoder) GetOrCreateIDInTxn(txn *badger.Txn, s string) (uint64, error) {
+	if id, ok := e.forwardCache.Get(s); ok && id != 0 {
+		return id, nil
+	}
+
+	key := makeDictForwardKey(s)
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		// Allocate new ID and write within the same transaction
+		return e.allocateNewIDInTxn(txn, s)
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	var id uint64
+	if err := item.Value(func(val []byte) error {
+		id = binary.BigEndian.Uint64(val)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	e.forwardCache.Add(s, id)
+	e.reverseCache.Add(id, s)
+	return id, nil
+}
+
+func (e *Encoder) allocateNewIDInTxn(txn *badger.Txn, s string) (uint64, error) {
+	newID, err := e.allocator.Allocate()
+	if err != nil {
+		return 0, fmt.Errorf("failed to allocate ID: %w", err)
+	}
+
+	key := makeDictForwardKey(s)
+	idBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(idBytes, newID)
+	if err := txn.Set(key, idBytes); err != nil {
+		return 0, err
+	}
+
+	reverseKey := makeDictReverseKey(newID)
+	if err := txn.Set(reverseKey, []byte(s)); err != nil {
+		return 0, err
+	}
+
+	e.forwardCache.Add(s, newID)
+	e.reverseCache.Add(newID, s)
+
+	return newID, nil
+}
+
+// GetIDInTxn gets a dictionary ID within an existing transaction.
+func (e *Encoder) GetIDInTxn(txn *badger.Txn, s string) (uint64, error) {
+	if id, ok := e.forwardCache.Get(s); ok && id != 0 {
+		return id, nil
+	}
+
+	key := makeDictForwardKey(s)
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	var id uint64
+	if err := item.Value(func(val []byte) error {
+		id = binary.BigEndian.Uint64(val)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	e.forwardCache.Add(s, id)
+	return id, nil
+}
+
+// GetStringInTxn resolves a dictionary ID to its string within an existing transaction.
+func (e *Encoder) GetStringInTxn(txn *badger.Txn, id uint64) (string, error) {
+	if s, ok := e.reverseCache.Get(id); ok && s != "" {
+		return s, nil
+	}
+
+	key := makeDictReverseKey(id)
+	item, err := txn.Get(key)
+	if err == badger.ErrKeyNotFound {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+
+	var s string
+	if err := item.Value(func(val []byte) error {
+		s = string(val)
+		return nil
+	}); err != nil {
+		return "", err
+	}
+
+	e.reverseCache.Add(id, s)
+	return s, nil
+}
+
+// DeleteIDInTxn deletes a dictionary entry within an existing transaction.
+func (e *Encoder) DeleteIDInTxn(txn *badger.Txn, s string) error {
+	id, err := e.GetIDInTxn(txn, s)
+	if err != nil {
+		if err == ErrNotFound {
+			return nil
+		}
+		return err
+	}
+
+	if err := txn.Delete(makeDictForwardKey(s)); err != nil {
+		return err
+	}
+	if err := txn.Delete(makeDictReverseKey(id)); err != nil {
+		return err
+	}
+
+	e.forwardCache.mu.Lock()
+	e.forwardCache.cache.Remove(s)
+	e.forwardCache.mu.Unlock()
+
+	e.reverseCache.mu.Lock()
+	e.reverseCache.cache.Remove(id)
+	e.reverseCache.mu.Unlock()
+
+	return nil
 }
