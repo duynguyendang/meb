@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+	"syscall"
 
 	"github.com/duynguyendang/meb/keys"
 
@@ -115,6 +116,45 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	}
 
 	return r
+}
+
+// Reset clears all vectors, mappings, and segment data from the registry.
+// This is used by MEBStore.Reset() to ensure a clean state.
+func (r *VectorRegistry) Reset() error {
+	// Wait for pending vector persistence goroutines before resetting state
+	r.wg.Wait()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slog.Info("resetting vector registry",
+		"totalVectors", r.totalVectors,
+		"segments", len(r.segments),
+	)
+
+	// Clear mappings
+	r.idMap = make(map[uint64]uint32, r.config.InitialCapacity)
+	r.revMap = make([]uint64, 0, r.config.InitialCapacity)
+	r.totalVectors = 0
+
+	// Unmap and close segments
+	for _, seg := range r.segments {
+		if seg.data != nil {
+			syscall.Munmap(seg.data)
+			seg.data = nil
+		}
+		if seg.file != nil {
+			// Truncate file to 0 and close
+			seg.file.Truncate(0)
+			seg.file.Close()
+		}
+	}
+
+	// Clear segment list
+	r.segments = r.segments[:0]
+
+	slog.Info("vector registry reset complete")
+	return nil
 }
 
 // ensureCapacity grows the segment list if needed to hold the required number of vectors.

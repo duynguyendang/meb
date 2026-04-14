@@ -76,6 +76,17 @@ func (s *ShardedAllocator) NumShards() int {
 	return int(s.n)
 }
 
+// Reset clears all shards and resets the global counter.
+func (s *ShardedAllocator) Reset() error {
+	for _, shard := range s.shards {
+		if err := shard.Reset(); err != nil {
+			return fmt.Errorf("failed to reset shard: %w", err)
+		}
+	}
+	s.next.Store(0)
+	return nil
+}
+
 func (s *ShardedAllocator) nextShard() *RangeAllocator {
 	if s.n == 1 {
 		return s.shards[0]
@@ -208,6 +219,18 @@ func (r *RangeAllocator) saveGlobalCounter() error {
 
 func (r *RangeAllocator) CurrentID() uint64 {
 	return r.current.Load()
+}
+
+// Reset clears the allocator state and resets the global counter to 0.
+func (r *RangeAllocator) Reset() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.globalMax = 0
+	r.current.Store(0)
+	r.limit.Store(0)
+
+	return r.saveGlobalCounter()
 }
 
 func (r *RangeAllocator) Close() {}

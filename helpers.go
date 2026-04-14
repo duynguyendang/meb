@@ -74,7 +74,8 @@ func (m *MEBStore) encodeObject(obj any) (string, uint64, error) {
 		}
 		return objStr, oID, nil
 	case float64:
-		objStr := fmt.Sprintf("%f", v)
+		// Use %.17g to preserve full float64 precision (up to 17 significant digits)
+		objStr := fmt.Sprintf("%.17g", v)
 		oID, err := m.dict.GetOrCreateID(objStr)
 		if err != nil {
 			return "", 0, fmt.Errorf("failed to encode float64 object: %w", err)

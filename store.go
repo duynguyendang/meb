@@ -131,7 +131,14 @@ func (m *MEBStore) replayWAL() error {
 
 	slog.Info("replaying WAL", "entries", len(entries))
 
+	// Build set of existing facts to prevent duplicates on replay
+	existingFacts, err := m.buildExistingFactSet()
+	if err != nil {
+		return fmt.Errorf("failed to build existing fact set: %w", err)
+	}
+
 	facts := make([]Fact, 0, len(entries))
+	duplicatesSkipped := 0
 	for _, e := range entries {
 		fact := Fact{
 			Subject:   e.subject,
@@ -140,6 +147,13 @@ func (m *MEBStore) replayWAL() error {
 		}
 		if fact.Object == nil && fact.Predicate != "" {
 			fact.Object = ""
+		}
+
+		// Check if fact already exists (idempotent replay)
+		factKey := factKeyString(fact)
+		if existingFacts[factKey] {
+			duplicatesSkipped++
+			continue
 		}
 		facts = append(facts, fact)
 	}
@@ -154,8 +168,71 @@ func (m *MEBStore) replayWAL() error {
 		return fmt.Errorf("failed to clear WAL after replay: %w", err)
 	}
 
-	slog.Info("WAL replay complete", "factsReplayed", len(facts))
+	slog.Info("WAL replay complete",
+		"factsReplayed", len(facts),
+		"duplicatesSkipped", duplicatesSkipped,
+	)
 	return nil
+}
+
+// buildExistingFactSet scans the SPO index and returns a set of all existing facts.
+// Used for WAL replay deduplication.
+func (m *MEBStore) buildExistingFactSet() (map[string]bool, error) {
+	existing := make(map[string]bool)
+
+	txn := m.db.NewTransaction(false)
+	defer txn.Discard()
+
+	itOpts := badger.DefaultIteratorOptions
+	itOpts.PrefetchValues = true
+	it := txn.NewIterator(itOpts)
+	defer it.Close()
+
+	spoPrefix := []byte{keys.TripleSPOPrefix}
+	for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
+		item := it.Item()
+		key := item.Key()
+
+		if len(key) != keys.TripleKeySize {
+			continue
+		}
+
+		s, p, o := keys.DecodeTripleKey(key)
+		localSID := keys.UnpackLocalID(s)
+		localPID := keys.UnpackLocalID(p)
+
+		subject, err := m.dict.GetString(localSID)
+		if err != nil {
+			continue
+		}
+		predicate, err := m.dict.GetString(localPID)
+		if err != nil {
+			continue
+		}
+
+		var objectStr string
+		if keys.IsInline(o) {
+			obj := decodeInlineID(o)
+			objectStr = fmt.Sprintf("%v", obj)
+		} else {
+			localOID := keys.UnpackLocalID(o)
+			objectStr, err = m.dict.GetString(localOID)
+			if err != nil {
+				continue
+			}
+		}
+
+		factKey := subject + "|" + predicate + "|" + objectStr
+		existing[factKey] = true
+	}
+
+	return existing, nil
+}
+
+// factKeyString generates a unique key for a fact for deduplication.
+func factKeyString(f Fact) string {
+	objStr := fmt.Sprintf("%v", f.Object)
+	return f.Subject + "|" + f.Predicate + "|" + objStr
 }
 
 func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
@@ -261,14 +338,67 @@ func (m *MEBStore) Reset() error {
 
 	slog.Info("resetting store", "factCount", m.numFacts.Load())
 
+	// Stop cleanup loop (guard against double-close)
+	select {
+	case <-m.cleanupStop:
+		// already closed, skip
+	default:
+		close(m.cleanupStop)
+	}
+	<-m.cleanupDone
+
+	// Reset graph database
 	err := m.db.DropAll()
 	if err != nil {
-		return fmt.Errorf("failed to reset store: %w", err)
+		return fmt.Errorf("failed to reset graph database: %w", err)
 	}
 
-	m.numFacts.Store(0)
+	// Reset dictionary database
+	if m.dictDB != nil {
+		if err := m.dictDB.DropAll(); err != nil {
+			return fmt.Errorf("failed to reset dictionary database: %w", err)
+		}
+	}
 
-	slog.Info("store reset complete")
+	// Reset dictionary encoder caches and allocator
+	if err := m.dict.Reset(); err != nil {
+		return fmt.Errorf("failed to reset dictionary: %w", err)
+	}
+
+	// Reset vector registry
+	if m.vectors != nil {
+		if err := m.vectors.Reset(); err != nil {
+			return fmt.Errorf("failed to reset vector registry: %w", err)
+		}
+	}
+
+	// Clear WAL
+	if m.wal != nil {
+		if err := m.wal.Clear(); err != nil {
+			slog.Warn("failed to clear WAL during reset", "error", err)
+		}
+	}
+
+	// Reset all atomic counters and state
+	m.numFacts.Store(0)
+	m.factsSinceLastPersist.Store(0)
+	m.factsSinceGC.Store(0)
+	m.lastGCTimeNano.Store(0)
+	m.topicID.Store(1) // 1 is the default valid topic ID (0 is reserved as invalid)
+	m.defaultEntityType = 0
+	m.defaultFlags = 0
+
+	// Restart cleanup loop
+	m.cleanupStop = make(chan struct{})
+	m.cleanupDone = make(chan struct{})
+	go m.runCleanupLoop()
+
+	slog.Info("store reset complete",
+		"graphDropped", true,
+		"dictDropped", true,
+		"vectorsReset", true,
+		"walCleared", true,
+	)
 	return nil
 }
 
@@ -529,20 +659,95 @@ const (
 	defaultMaxFacts = 0 // 0 = unlimited
 )
 
-func (m *MEBStore) SetRetention(maxFacts uint64) {
+func (m *MEBStore) SetRetention(maxFacts uint64) error {
 	if maxFacts == 0 {
-		return
+		return nil
 	}
 	current := m.numFacts.Load()
 	if current <= maxFacts {
-		return
+		return nil
 	}
-	slog.Info("retention policy triggered", "currentFacts", current, "maxFacts", maxFacts)
-	m.telemetry.Emit("retention", map[string]any{
-		"currentFacts": current,
-		"maxFacts":     maxFacts,
-		"excess":       current - maxFacts,
+
+	slog.Info("retention policy triggered",
+		"currentFacts", current,
+		"maxFacts", maxFacts,
+		"excess", current-maxFacts,
+	)
+
+	// Single-pass incremental deletion: scan SPO index and delete facts
+	// until numFacts <= maxFacts. SPO keys are sorted by subject ID,
+	// so deletion order is deterministic (FIFO by subject insertion order).
+	totalDeleted := uint64(0)
+
+	err := m.withWriteTxn(func(txn *badger.Txn) error {
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = true
+		it := txn.NewIterator(itOpts)
+		defer it.Close()
+
+		spoPrefix := []byte{keys.TripleSPOPrefix}
+		var batchKeys [][]byte
+
+		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix) && m.numFacts.Load() > maxFacts; it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) != keys.TripleKeySize {
+				continue
+			}
+
+			s, p, o := keys.DecodeTripleKey(key)
+			spoKey := make([]byte, len(key))
+			copy(spoKey, key)
+			opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, s, p, o)
+
+			batchKeys = append(batchKeys, spoKey, opsKey)
+
+			// Flush in batches to avoid large transactions
+			if len(batchKeys) >= 200 {
+				for _, k := range batchKeys {
+					if err := txn.Delete(k); err != nil {
+						return fmt.Errorf("failed to delete key: %w", err)
+					}
+				}
+				totalDeleted += uint64(len(batchKeys) / 2)
+				batchKeys = batchKeys[:0]
+			}
+		}
+
+		// Flush remaining
+		for _, k := range batchKeys {
+			if err := txn.Delete(k); err != nil {
+				return fmt.Errorf("failed to delete key: %w", err)
+			}
+		}
+		totalDeleted += uint64(len(batchKeys) / 2)
+
+		return nil
 	})
+
+	if err != nil {
+		slog.Warn("retention cleanup failed", "error", err)
+		return err
+	}
+
+	// Update fact count to match actual deletions
+	if totalDeleted > 0 {
+		m.numFacts.Add(^uint64(totalDeleted - 1))
+	}
+
+	m.telemetry.Emit("retention", map[string]any{
+		"currentFacts":  m.numFacts.Load(),
+		"maxFacts":      maxFacts,
+		"factsDeleted":  totalDeleted,
+	})
+
+	slog.Info("retention cleanup complete",
+		"currentFacts", m.numFacts.Load(),
+		"factsDeleted", totalDeleted,
+	)
+
+	return nil
 }
 
 func (m *MEBStore) runCleanupLoop() {
@@ -688,6 +893,58 @@ func (m *MEBStore) cleanupDeprecatedTriples() int {
 // The prefix is matched against the full subject string (e.g., "project/pkg/" matches
 // all subjects under that path like "project/pkg/server/server.go:NewServer").
 // Returns empty iterator if no matches found (never returns error for "not found").
+// ScanSubjects returns all subjects in the store by scanning the SPO index.
+// Warning: This performs a full table scan.
+func (m *MEBStore) ScanSubjects(ctx context.Context) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		txn := m.db.NewTransaction(false)
+		defer txn.Discard()
+
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = false
+		it := txn.NewIterator(itOpts)
+		defer it.Close()
+
+		spoPrefix := []byte{keys.TripleSPOPrefix}
+		var lastSubjectID uint64
+		first := true
+
+		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) != keys.TripleKeySize {
+				continue
+			}
+
+			s, _, _ := keys.DecodeTripleKey(key)
+			localID := keys.UnpackLocalID(s)
+
+			// SPO keys are sorted by subject ID — deduplicate consecutive entries
+			if !first && localID == lastSubjectID {
+				continue
+			}
+			lastSubjectID = localID
+			first = false
+
+			subjectStr, err := m.dict.GetString(localID)
+			if err != nil {
+				continue
+			}
+
+			if !yield(subjectStr) {
+				return
+			}
+		}
+	}
+}
+
 func (m *MEBStore) ScanSubjectsByPrefix(ctx context.Context, prefix string) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		if prefix == "" {

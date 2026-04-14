@@ -28,6 +28,7 @@ type Encoder struct {
 	reverseCache *lruCache[uint64, string]
 
 	allocator *ShardedAllocator
+	cacheSize int
 }
 
 type lruCache[K comparable, V any] struct {
@@ -70,6 +71,7 @@ func NewEncoder(db *badger.DB, cacheSize int, numShards int) (*Encoder, error) {
 		forwardCache: newLRUCache[string, uint64](cacheSize),
 		reverseCache: newLRUCache[uint64, string](cacheSize),
 		allocator:    allocator,
+		cacheSize:    cacheSize,
 	}
 
 	return enc, nil
@@ -373,6 +375,27 @@ func (e *Encoder) Close() error {
 		"reverseCacheLen", stats["reverse_cache_len"],
 	)
 
+	return nil
+}
+
+// Reset clears all dictionary data including caches and allocator state.
+// This is used by MEBStore.Reset() to ensure a clean state.
+func (e *Encoder) Reset() error {
+	slog.Info("resetting dictionary encoder",
+		"forwardCacheLen", e.forwardCache.Len(),
+		"reverseCacheLen", e.reverseCache.Len(),
+	)
+
+	// Clear caches by creating new ones with same size estimate
+	e.forwardCache = newLRUCache[string, uint64](e.cacheSize)
+	e.reverseCache = newLRUCache[uint64, string](e.cacheSize)
+
+	// Reset allocator
+	if err := e.allocator.Reset(); err != nil {
+		return fmt.Errorf("failed to reset allocator: %w", err)
+	}
+
+	slog.Info("dictionary encoder reset complete")
 	return nil
 }
 

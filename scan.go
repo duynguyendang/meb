@@ -266,7 +266,8 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 		if err != nil {
 			return Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", r.foundOID, err)
 		}
-		object = objectStr
+		// Attempt to restore original type from dictionary string
+		object = restoreTypedValue(objectStr)
 	}
 
 	return Fact{
@@ -274,6 +275,26 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 		Predicate: predicate,
 		Object:    object,
 	}, nil
+}
+
+// restoreTypedValue attempts to restore the original Go type from a dictionary string.
+// Tries int64 first (matches "%d" format), then float64 (matches "%.17g" format),
+// then falls back to string.
+//
+// NOTE: This means strings that parse as numbers (e.g., "42", "3.14") will be
+// returned as int64/float64 rather than string. If exact type preservation is
+// required, use inline types (bool, int32, float32) which bypass the dictionary.
+func restoreTypedValue(s string) any {
+	// Try int64 first (matches "%d" format)
+	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return i
+	}
+	// Try float64 (matches "%.17g" format)
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	// Default to string
+	return s
 }
 
 // decodeInlineID converts an inline ID back to its Go primitive value.

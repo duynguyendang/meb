@@ -70,10 +70,7 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 
 	// Write to WAL before any DB operations (dual-DB atomicity)
 	for _, fact := range facts {
-		objStr := ""
-		if s, ok := fact.Object.(string); ok {
-			objStr = s
-		}
+		objStr := fmt.Sprintf("%v", fact.Object)
 		if err := m.wal.Append(walEntry{
 			subject: fact.Subject,
 			pred:    fact.Predicate,

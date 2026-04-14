@@ -11,5 +11,7 @@ type Dictionary interface {
 
 	DeleteID(s string) error
 
+	Reset() error
+
 	Close() error
 }
