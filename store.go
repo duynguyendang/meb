@@ -190,7 +190,7 @@ func (m *MEBStore) buildExistingFactSet() (map[string]bool, error) {
 	spoPrefix := []byte{keys.TripleSPOPrefix}
 	for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
 		item := it.Item()
-		key := item.Key()
+		key := item.KeyCopy(nil)
 
 		if len(key) != keys.TripleKeySize {
 			continue
@@ -653,7 +653,7 @@ func (m *MEBStore) SetRetention(maxFacts uint64) error {
 		spoPrefix := []byte{keys.TripleSPOPrefix}
 		var batchKeys [][]byte
 
-		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix) && m.numFacts.Load() > maxFacts; it.Next() {
+		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix) && m.numFacts.Load()-totalDeleted-uint64(len(batchKeys)/2) > maxFacts; it.Next() {
 			item := it.Item()
 			key := item.Key()
 

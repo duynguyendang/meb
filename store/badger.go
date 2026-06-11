@@ -152,7 +152,9 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		return opts
 	}
 
-	opts.DetectConflicts = false
+	// Enable conflict detection for profiles where read-modify-write consistency matters.
+	// Disable for Ingest-Heavy to maximize throughput (single-writer or idempotent writes).
+	opts.DetectConflicts = cfg.Profile != "Ingest-Heavy"
 	opts.BloomFalsePositive = 0.01
 
 	if cfg.Compression {

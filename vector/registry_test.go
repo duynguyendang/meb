@@ -224,3 +224,88 @@ func TestPackInlineNotCollidingWithSegments(t *testing.T) {
 		t.Errorf("expected 10, got %d", r.Count())
 	}
 }
+
+func TestNonPow2DimensionSearch(t *testing.T) {
+	// Regression test for C1: FullDim=1536 (non-power-of-2) requires padding
+	// to nextPow2(1536)=2048. The mmap slot must be sized for the padded dimension.
+	dir := t.TempDir()
+	cfg := &Config{
+		FullDim:         1536,
+		HybridBitWidth:  8,
+		HybridBlockSize: 32,
+		NumWorkers:      2,
+		VectorCapacity:  1024 * 1024,
+		InitialCapacity: 10,
+		SegmentDir:      dir,
+		SegmentSize:     64 * 1024,
+	}
+	opts := badger.DefaultOptions("")
+	opts.InMemory = true
+	opts.Logger = nil
+	db, err := badger.Open(opts)
+	if err != nil {
+		t.Fatalf("failed to open in-memory badger: %v", err)
+	}
+	r := NewRegistry(db, cfg)
+	defer func() {
+		r.Close()
+		db.Close()
+	}()
+
+	paddedDim := nextPow2(1536) // 2048
+	expectedVecSize := HybridVectorSize(paddedDim, cfg.HybridConfig()) + hashSize // +1 for hash byte
+
+	if r.VectorSize() != expectedVecSize {
+		t.Errorf("vector size mismatch: got %d, expected %d (paddedDim=%d)", r.VectorSize(), expectedVecSize, paddedDim)
+	}
+
+	queryVec := make([]float32, 1536)
+	queryVec[0] = 1.0
+
+	// Add 5 vectors with IDs 1-5
+	for id := uint64(1); id <= 5; id++ {
+		v := make([]float32, 1536)
+		v[0] = float32(id)
+		v[1] = 1.0
+		if err := r.Add(id, v); err != nil {
+			t.Fatalf("Add(%d) failed: %v", id, err)
+		}
+	}
+
+	if r.Count() != 5 {
+		t.Fatalf("expected count 5, got %d", r.Count())
+	}
+
+	// Verify neighbor slots are not corrupted: check that neighbor vector 2 data is intact.
+	// We verify this by checking that slot 0's hash byte is still 0 (it was set to 0)
+	// and that after a full search, we get expected results.
+	slot0 := r.getVectorSlice(0)
+	if slot0[0] != 0 {
+		t.Errorf("hash byte corrupted: got %d", slot0[0])
+	}
+
+	// Verify vector 2's slot begins at the right offset and hash byte is also 0
+	slot1 := r.getVectorSlice(1)
+	if slot1[0] != 0 {
+		t.Errorf("slot 1 hash byte corrupted: got %d (should be 0) — neighbor-slot overwrite from oversized write", slot1[0])
+	}
+
+	// Search should return non-zero scores
+	results := make([]SearchResult, 0)
+	for sr, err := range r.Search(queryVec, 5) {
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		results = append(results, sr)
+	}
+
+	if len(results) == 0 {
+		t.Fatal("search returned zero results")
+	}
+
+	for _, sr := range results {
+		if sr.Score == 0 {
+			t.Errorf("search returned zero score for ID=%d — indicates slot sizing mismatch", sr.ID)
+		}
+	}
+}

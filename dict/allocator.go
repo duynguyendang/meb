@@ -33,15 +33,16 @@ func NewShardedAllocator(db *badger.DB, blockSize uint64, numShards int) (*Shard
 		}, nil
 	}
 
+	// Multiple shards share a single global counter to avoid ID collisions.
+	// Each shard reserves blocks from the shared counter independently.
+	globalAlloc, err := NewRangeAllocator(db, blockSize)
+	if err != nil {
+		return nil, err
+	}
+
 	shards := make([]*RangeAllocator, numShards)
 	for i := 0; i < numShards; i++ {
-		shard, err := NewRangeAllocatorWithKey(db, blockSize, fmt.Sprintf("%s_%d", globalCounterKey, i))
-		if err != nil {
-			for j := 0; j < i; j++ {
-				shards[j].Close()
-			}
-			return nil, fmt.Errorf("failed to create shard %d: %w", i, err)
-		}
+		shard := globalAlloc.fork()
 		shards[i] = shard
 	}
 
@@ -106,11 +107,27 @@ type RangeAllocator struct {
 	counterKey string
 	blockSize  uint64
 
-	globalMax uint64
-	mu        sync.Mutex
+	// Shared state for forked allocators: globalMax and mu are shared across shards
+	// to ensure all shards carve disjoint ranges from the same counter.
+	globalMax *uint64
+	mu        *sync.Mutex
 
 	current atomic.Uint64
 	limit   atomic.Uint64
+}
+
+// fork creates a new RangeAllocator that shares the global counter and mutex
+// with the parent, but has its own current/limit atomics for lock-free allocation.
+func (r *RangeAllocator) fork() *RangeAllocator {
+	return &RangeAllocator{
+		db:         r.db,
+		counterKey: r.counterKey,
+		blockSize:  r.blockSize,
+		globalMax:  r.globalMax,
+		mu:         r.mu,
+		current:    atomic.Uint64{},
+		limit:      atomic.Uint64{},
+	}
 }
 
 func NewRangeAllocator(db *badger.DB, blockSize uint64) (*RangeAllocator, error) {
@@ -122,18 +139,22 @@ func NewRangeAllocatorWithKey(db *badger.DB, blockSize uint64, counterKey string
 		blockSize = DefaultBlockSize
 	}
 
+	var gm uint64
+	var mu sync.Mutex
 	alloc := &RangeAllocator{
 		db:         db,
 		counterKey: counterKey,
 		blockSize:  blockSize,
+		globalMax:  &gm,
+		mu:         &mu,
 	}
 
 	if err := alloc.loadGlobalCounter(); err != nil {
 		return nil, err
 	}
 
-	alloc.current.Store(alloc.globalMax)
-	alloc.limit.Store(alloc.globalMax)
+	alloc.current.Store(gm)
+	alloc.limit.Store(gm)
 
 	return alloc, nil
 }
@@ -162,9 +183,9 @@ func (r *RangeAllocator) Allocate() (uint64, error) {
 			return 0, err
 		}
 
-		newStart := r.globalMax - r.blockSize
+		newStart := *r.globalMax - r.blockSize
 		r.current.Store(newStart)
-		r.limit.Store(r.globalMax)
+		r.limit.Store(*r.globalMax)
 
 		r.mu.Unlock()
 	}
@@ -174,11 +195,11 @@ func (r *RangeAllocator) AllocateBatch(n uint64) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	oldGlobal := r.globalMax
-	r.globalMax += n
+	oldGlobal := *r.globalMax
+	*r.globalMax += n
 
 	if err := r.saveGlobalCounter(); err != nil {
-		r.globalMax = oldGlobal
+		*r.globalMax = oldGlobal
 		return 0, err
 	}
 
@@ -186,7 +207,7 @@ func (r *RangeAllocator) AllocateBatch(n uint64) (uint64, error) {
 }
 
 func (r *RangeAllocator) reserveBlock() error {
-	r.globalMax += r.blockSize
+	*r.globalMax += r.blockSize
 	return r.saveGlobalCounter()
 }
 
@@ -194,7 +215,7 @@ func (r *RangeAllocator) loadGlobalCounter() error {
 	return r.db.View(func(txn *badger.Txn) error {
 		item, err := txn.Get([]byte(r.counterKey))
 		if err == badger.ErrKeyNotFound {
-			r.globalMax = 0
+			*r.globalMax = 0
 			return nil
 		}
 		if err != nil {
@@ -202,7 +223,7 @@ func (r *RangeAllocator) loadGlobalCounter() error {
 		}
 		return item.Value(func(val []byte) error {
 			if len(val) >= 8 {
-				r.globalMax = binary.BigEndian.Uint64(val)
+				*r.globalMax = binary.BigEndian.Uint64(val)
 			}
 			return nil
 		})
@@ -212,7 +233,7 @@ func (r *RangeAllocator) loadGlobalCounter() error {
 func (r *RangeAllocator) saveGlobalCounter() error {
 	return r.db.Update(func(txn *badger.Txn) error {
 		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, r.globalMax)
+		binary.BigEndian.PutUint64(buf, *r.globalMax)
 		return txn.Set([]byte(r.counterKey), buf)
 	})
 }
@@ -226,7 +247,7 @@ func (r *RangeAllocator) Reset() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.globalMax = 0
+	*r.globalMax = 0
 	r.current.Store(0)
 	r.limit.Store(0)
 

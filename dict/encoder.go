@@ -525,23 +525,31 @@ func (e *Encoder) GetStringInTxn(txn *badger.Txn, id uint64) (string, error) {
 	return s, nil
 }
 
-// DeleteIDInTxn deletes a dictionary entry within an existing transaction.
-func (e *Encoder) DeleteIDInTxn(txn *badger.Txn, s string) error {
-	id, err := e.GetIDInTxn(txn, s)
-	if err != nil {
-		if err == ErrNotFound {
-			return nil
+// DeleteIDInTxnDiskOnly deletes dict entries from Badger only, leaving caches intact.
+// The idHint parameter avoids a second lookup when the caller already knows the ID.
+// Returns any badger error, or discards the error if the entry was not found.
+func (e *Encoder) DeleteIDInTxnDiskOnly(txn *badger.Txn, idHint uint64, s string) error {
+	id := idHint
+	if id == 0 {
+		var err error
+		id, err = e.GetIDInTxn(txn, s)
+		if err != nil {
+			if err == ErrNotFound {
+				return nil
+			}
+			return err
 		}
-		return err
 	}
 
 	if err := txn.Delete(makeDictForwardKey(s)); err != nil {
 		return err
 	}
-	if err := txn.Delete(makeDictReverseKey(id)); err != nil {
-		return err
-	}
+	return txn.Delete(makeDictReverseKey(id))
+}
 
+// RemoveFromCaches removes a string→ID and ID→string mapping from the in-memory caches.
+// Used from post-commit hooks to finalize deletions.
+func (e *Encoder) RemoveFromCaches(s string, id uint64) {
 	e.forwardCache.mu.Lock()
 	e.forwardCache.cache.Remove(s)
 	e.forwardCache.mu.Unlock()
@@ -549,6 +557,4 @@ func (e *Encoder) DeleteIDInTxn(txn *badger.Txn, s string) error {
 	e.reverseCache.mu.Lock()
 	e.reverseCache.cache.Remove(id)
 	e.reverseCache.mu.Unlock()
-
-	return nil
 }

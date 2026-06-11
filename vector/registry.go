@@ -94,7 +94,8 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	}
 
 	hybridCfg := cfg.HybridConfig()
-	vSize := HybridVectorSize(cfg.FullDim, hybridCfg) + hashSize
+	paddedDim := nextPow2(cfg.FullDim)
+	vSize := HybridVectorSize(paddedDim, hybridCfg) + hashSize
 
 	segSize := cfg.SegmentSize
 	if segSize <= 0 {
@@ -180,6 +181,52 @@ func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
 	return r.AddWithHash(id, fullVec, 0)
 }
 
+// AddToMmapCache adds a vector to the in-memory mmap cache only (no Badger write).
+// Used from post-commit paths where the Badger write was already done via a transaction.
+func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHash uint8) error {
+	if len(fullVec) != r.config.FullDim {
+		return fmt.Errorf("invalid vector dimension: expected %d, got %d", r.config.FullDim, len(fullVec))
+	}
+
+	hybridData := QuantizeHybrid(fullVec, r.hybridCfg)
+	hybridSize := len(hybridData)
+
+	if hashSize+hybridSize > r.vectorSize {
+		panic(fmt.Sprintf("vector slot too small: need %d, have %d (dim=%d, padded=%d)",
+			hashSize+hybridSize, r.vectorSize, r.config.FullDim, nextPow2(r.config.FullDim)))
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if idx, exists := r.idMap[id]; exists {
+		slot := r.getVectorSlice(int(idx))
+		slot[0] = semanticHash
+		copy(slot[hashSize:hashSize+hybridSize], hybridData)
+		return nil
+	}
+
+	newTotal := r.totalVectors + 1
+	if err := r.ensureCapacity(newTotal); err != nil {
+		return err
+	}
+
+	idx := uint32(r.totalVectors)
+	r.idMap[id] = idx
+	oldRev := r.revMap.Load()
+	newRev := make([]uint64, len(*oldRev)+1)
+	copy(newRev, *oldRev)
+	newRev[len(*oldRev)] = id
+	r.revMap.Store(&newRev)
+
+	slot := r.getVectorSlice(int(idx))
+	slot[0] = semanticHash
+	copy(slot[hashSize:hashSize+hybridSize], hybridData)
+
+	r.totalVectors = newTotal
+	return nil
+}
+
 // AddWithHash adds a vector with a semantic hash byte for early filtering during search.
 // The compressed vector is written to Badger as the primary store, and also stored
 // in mmap segments as an in-memory cache for low-latency warm data access.
@@ -190,6 +237,11 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 
 	hybridData := QuantizeHybrid(fullVec, r.hybridCfg)
 	hybridSize := len(hybridData)
+
+	if hashSize+hybridSize > r.vectorSize {
+		panic(fmt.Sprintf("vector slot too small: need %d, have %d (dim=%d, padded=%d)",
+			hashSize+hybridSize, r.vectorSize, r.config.FullDim, nextPow2(r.config.FullDim)))
+	}
 
 	// Build value: [hashByte:1][hybridData:N]
 	valueBuf := make([]byte, 1+hybridSize)
@@ -204,39 +256,7 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		return fmt.Errorf("failed to persist vector to BadgerDB: %w", err)
 	}
 
-	r.mu.Lock()
-	if idx, exists := r.idMap[id]; exists {
-		// Overwrite existing vector in mmap cache
-		slot := r.getVectorSlice(int(idx))
-		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+hybridSize], hybridData)
-		r.mu.Unlock()
-	} else {
-		// Append to mmap cache
-		newTotal := r.totalVectors + 1
-		if err := r.ensureCapacity(newTotal); err != nil {
-			r.mu.Unlock()
-			return err
-		}
-
-		idx := uint32(r.totalVectors)
-		r.idMap[id] = idx
-		// RCU-style: construct new slice, then atomic swap
-		oldRev := r.revMap.Load()
-		newRev := make([]uint64, len(*oldRev)+1)
-		copy(newRev, *oldRev)
-		newRev[len(*oldRev)] = id
-		r.revMap.Store(&newRev)
-
-		slot := r.getVectorSlice(int(idx))
-		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+hybridSize], hybridData)
-
-		r.totalVectors = newTotal
-		r.mu.Unlock()
-	}
-
-	return nil
+	return r.AddToMmapCache(id, fullVec, semanticHash)
 }
 
 func (r *VectorRegistry) Count() int {

@@ -923,3 +923,48 @@ func BenchmarkScanSingle(b *testing.B) {
 	}
 }
 
+func TestSetRetention(t *testing.T) {
+	s := newTestStore(t)
+
+	// Add 1100 facts (each SPO+OPS = 2 keys)
+	numFacts := 1100
+	facts := make([]Fact, numFacts)
+	for i := 0; i < numFacts; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("retain_%04d", i),
+			Predicate: "type",
+			Object:    "test",
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch failed: %v", err)
+	}
+
+	if s.Count() != uint64(numFacts) {
+		t.Fatalf("expected count %d, got %d", numFacts, s.Count())
+	}
+
+	// Retain max 1050 facts (deficit = 50, which is not a multiple of the 100-pair flush batch)
+	maxFacts := uint64(1050)
+	if err := s.SetRetention(maxFacts); err != nil {
+		t.Fatalf("SetRetention failed: %v", err)
+	}
+
+	if s.Count() != maxFacts {
+		t.Errorf("expected count %d, got %d (deleted %d instead of %d)", maxFacts, s.Count(), uint64(numFacts)-s.Count(), uint64(numFacts)-maxFacts)
+	}
+
+	// Verify the remaining facts are still accessible
+	remaining := uint64(0)
+	for _, err := range s.Scan("", "type", "test") {
+		if err != nil {
+			t.Fatalf("Scan failed: %v", err)
+		}
+		remaining++
+	}
+
+	if remaining != maxFacts {
+		t.Errorf("expected %d remaining facts (SPO index), got %d", maxFacts, remaining)
+	}
+}
+

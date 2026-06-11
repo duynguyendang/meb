@@ -280,13 +280,9 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int {
 	if len(referencedIDs) == 0 {
-		// Standalone scan: find all dictionary entries and check if they're referenced
 		return m.cleanupOrphanedDictEntriesFullScan()
 	}
 
-	// Convert packed IDs to local IDs and deduplicate.
-	// The dictionary stores local IDs, so we check if each local ID
-	// is still referenced by any remaining triple in the graph.
 	localCandidates := make([]uint64, 0, len(referencedIDs))
 	seen := make(map[uint64]bool)
 	for packedID := range referencedIDs {
@@ -301,40 +297,22 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 		return 0
 	}
 
-	// Batch all reference checks into a single read transaction.
-	// For each candidate, check both SPO (as predicate) and OPS (as object) indices.
+	candidateSet := make(map[uint64]bool, len(localCandidates))
+	for _, id := range localCandidates {
+		candidateSet[id] = true
+	}
+
+	// Single scan over SPO+OPS to build set of all referenced local IDs,
+	// then check candidates against that set. O(N + M) instead of O(N*M).
+	referencedSet := make(map[uint64]bool)
+	m.buildReferencedLocalIDSet(referencedSet)
+
 	unreferenced := make([]uint64, 0, len(localCandidates))
-	m.withReadTxn(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
-
-		for _, localID := range localCandidates {
-			stillReferenced := false
-
-			// Check SPO index: is this ID used as a predicate?
-			prefix := keys.EncodeTripleSPOPrefix(0, localID, 0)
-			it.Seek(prefix)
-			if it.ValidForPrefix(prefix) {
-				stillReferenced = true
-			}
-
-			if !stillReferenced {
-				// Check OPS index: is this ID used as an object?
-				opsPrefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
-				it.Seek(opsPrefix)
-				if it.ValidForPrefix(opsPrefix) {
-					stillReferenced = true
-				}
-			}
-
-			if !stillReferenced {
-				unreferenced = append(unreferenced, localID)
-			}
+	for _, localID := range localCandidates {
+		if !referencedSet[localID] {
+			unreferenced = append(unreferenced, localID)
 		}
-		return nil
-	})
+	}
 
 	cleaned := 0
 	for _, localID := range unreferenced {
@@ -350,13 +328,40 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 	return cleaned
 }
 
+// buildReferencedLocalIDSet scans all triple keys and collects every referenced local ID
+// (subjects, predicates, and objects) into the given set.
+func (m *MEBStore) buildReferencedLocalIDSet(refs map[uint64]bool) {
+	m.withReadTxn(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		for _, prefix := range [][]byte{{keys.TripleSPOPrefix}, {keys.TripleOPSPrefix}} {
+			it.Seek(prefix)
+			for ; it.ValidForPrefix(prefix); it.Next() {
+				key := it.Item().Key()
+				if len(key) != keys.TripleKeySize {
+					continue
+				}
+				s, p, o := keys.DecodeTripleKey(key)
+				refs[keys.UnpackLocalID(s)] = true
+				refs[keys.UnpackLocalID(p)] = true
+				if !keys.IsInline(o) {
+					refs[keys.UnpackLocalID(o)] = true
+				}
+			}
+		}
+		return nil
+	})
+}
+
 // cleanupOrphanedDictEntriesFullScan scans all dictionary entries and removes
-// those that are not referenced by any triple in the SPO/OPS indices.
-// Throttled: max 1000 orphans per cycle to avoid long GC pauses.
+// those not referenced by any triple, content, or vector key.
+// Throttled: max 1000 orphans per cycle.
 func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 	const maxOrphansPerCycle = 1000
 
-	// Collect all local IDs from the dictionary (reverse index: ID → string)
 	var candidateIDs []uint64
 	m.withReadTxn(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -364,10 +369,10 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		revPrefix := []byte{keys.ReverseDictPrefix} // 0x81
+		revPrefix := []byte{keys.ReverseDictPrefix}
 		for it.Seek(revPrefix); it.ValidForPrefix(revPrefix); it.Next() {
 			key := it.Item().Key()
-			if len(key) < 9 { // 1 prefix + 8 ID bytes
+			if len(key) < 9 {
 				continue
 			}
 			id := binary.BigEndian.Uint64(key[1:9])
@@ -380,48 +385,37 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 		return 0
 	}
 
-	// Check which IDs are still referenced by triples
-	unreferenced := make([]uint64, 0, len(candidateIDs))
+	// Build set of all referenced local IDs (triples + content + vectors)
+	referencedSet := make(map[uint64]bool)
+	m.buildReferencedLocalIDSet(referencedSet)
+
+	// Also check content (0x10) and vector (0x11) keys
 	m.withReadTxn(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		for _, localID := range candidateIDs {
-			stillReferenced := false
-
-			// Check SPO index: is this ID used as a predicate?
-			prefix := keys.EncodeTripleSPOPrefix(0, localID, 0)
-			it.Seek(prefix)
-			if it.ValidForPrefix(prefix) {
-				stillReferenced = true
-			}
-
-			if !stillReferenced {
-				// Check OPS index: is this ID used as an object?
-				opsPrefix := keys.EncodeTripleOPSPrefix(localID, 0, 0)
-				it.Seek(opsPrefix)
-				if it.ValidForPrefix(opsPrefix) {
-					stillReferenced = true
+		for _, pfx := range [][]byte{{keys.ChunkPrefix}, {keys.VectorFullPrefix}} {
+			it.Seek(pfx)
+			for ; it.ValidForPrefix(pfx); it.Next() {
+				key := it.Item().Key()
+				if len(key) != keys.ChunkKeySize {
+					continue
 				}
-			}
-
-			// Also check as a subject (SPO with subject = localID)
-			if !stillReferenced {
-				spoPrefix := keys.EncodeTripleSPOPrefix(localID, 0, 0)
-				it.Seek(spoPrefix)
-				if it.ValidForPrefix(spoPrefix) {
-					stillReferenced = true
-				}
-			}
-
-			if !stillReferenced && len(unreferenced) < maxOrphansPerCycle {
-				unreferenced = append(unreferenced, localID)
+				id := binary.BigEndian.Uint64(key[1:])
+				referencedSet[id] = true
 			}
 		}
 		return nil
 	})
+
+	unreferenced := make([]uint64, 0, maxOrphansPerCycle)
+	for _, localID := range candidateIDs {
+		if !referencedSet[localID] && len(unreferenced) < maxOrphansPerCycle {
+			unreferenced = append(unreferenced, localID)
+		}
+	}
 
 	cleaned := 0
 	for _, localID := range unreferenced {

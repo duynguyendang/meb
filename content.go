@@ -93,8 +93,6 @@ func (m *MEBStore) addDocumentWithTopic(topicID uint32, docKey string, content [
 			if err := txn.AddVector(id, vec); err != nil {
 				return fmt.Errorf("failed to add vector: %w", err)
 			}
-			// Also update in-memory registry for fast access
-			m.vectors.AddWithHash(id, vec, 0)
 		}
 
 		// Store content
