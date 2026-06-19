@@ -5,6 +5,8 @@ import (
 	"errors"
 	"iter"
 	"log/slog"
+	"sort"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/duynguyendang/meb/keys"
@@ -47,6 +49,40 @@ func visitCounterFromCtx(ctx context.Context) (*atomic.Int64, int64) {
 	return nil, 0
 }
 
+// LFTJResult is a deterministically ordered join result.
+// Variables are sorted alphabetically, making results comparable.
+type LFTJResult struct {
+	Vars   []string
+	Values []uint64
+}
+
+// Canonical returns a string representation suitable for ordering comparison.
+func (r LFTJResult) Canonical() string {
+	if len(r.Vars) == 0 {
+		return ""
+	}
+	type kv struct {
+		k string
+		v uint64
+	}
+	pairs := make([]kv, len(r.Vars))
+	for i, v := range r.Vars {
+		pairs[i] = kv{k: v, v: r.Values[i]}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
+
+	var buf []byte
+	for i, p := range pairs {
+		if i > 0 {
+			buf = append(buf, ';')
+		}
+		buf = append(buf, p.k...)
+		buf = append(buf, '=')
+		buf = strconv.AppendUint(buf, p.v, 10)
+	}
+	return string(buf)
+}
+
 // LFTJEngine provides worst-case optimal multi-way joins with constant memory.
 // Unlike nested-loop joins that materialize intermediate results,
 // LFTJ traverses all relations simultaneously via trie iterators,
@@ -81,6 +117,11 @@ func (e *LFTJEngine) Execute(
 		for i, rel := range relations {
 			iterators[i] = NewTrieIterator(txn, rel.Prefix, rel.BoundPositions)
 		}
+		defer func() {
+			for _, it := range iterators {
+				it.Close()
+			}
+		}()
 
 		// Collect all unbound variable positions across relations
 		allVarPositions := make(map[string][]varOccurrence)
@@ -166,6 +207,7 @@ func (e *LFTJEngine) leapfrogRecursive(
 	}
 
 	// Open and iterate
+	it.Close()
 	it.Open()
 	defer it.Close()
 

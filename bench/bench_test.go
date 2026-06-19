@@ -1,6 +1,7 @@
 package meb_test
 
 import (
+	"context"
 	"log/slog"
 	"math/rand"
 	"os"
@@ -73,7 +74,7 @@ func BenchmarkVectorSearch(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		count := 0
-		for _, err := range s.Vectors().Search(query, 10) {
+		for _, err := range s.Vectors().Search(context.Background(), query, 10) {
 			if err != nil {
 				b.Fatalf("Search failed: %v", err)
 			}
@@ -244,7 +245,7 @@ func BenchmarkHybridSearch(b *testing.B) {
 		results, err := s.Find().
 			SimilarTo(query).
 			Limit(10).
-			Execute()
+			Execute(context.Background())
 		if err != nil {
 			b.Fatalf("Find.Execute failed: %v", err)
 		}

@@ -3,6 +3,7 @@ package vector
 import (
 	"bytes"
 	"container/heap"
+	"context"
 	"encoding/binary"
 	"iter"
 	"log/slog"
@@ -41,17 +42,24 @@ const TopicIDMask = uint64(0xFFFFFF) << 40
 // Search returns an iterator of top-k most similar vectors.
 // Fast path: parallel mmap scan if vectors are loaded in RAM.
 // Fallback: streams from BadgerDB for cold start.
-func (r *VectorRegistry) Search(queryVec []float32, k int) iter.Seq2[SearchResult, error] {
-	return r.SearchWithFilter(queryVec, k, 0)
+func (r *VectorRegistry) Search(ctx context.Context, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+	return r.SearchWithFilter(ctx, queryVec, k, 0)
 }
 
 // SearchWithFilter returns an iterator of top-k most similar vectors matching a semantic hash.
 // Fast path: parallel mmap scan if vectors are loaded in RAM.
 // Fallback: streams from BadgerDB for cold start.
-func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
+func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
 			return
+		}
+
+		select {
+		case <-ctx.Done():
+			yield(SearchResult{}, ctx.Err())
+			return
+		default:
 		}
 
 		r.mu.RLock()
@@ -69,7 +77,7 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 
 		if !hasVectors {
 			// Cold start: stream from Badger
-			r.searchFromBadger(queryVec, k, filterHash, hybridCfg, fullDim, yield)
+			r.searchFromBadger(ctx, queryVec, k, filterHash, hybridCfg, fullDim, yield)
 			return
 		}
 
@@ -99,6 +107,13 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 				break
 			}
 
+			select {
+			case <-ctx.Done():
+				yield(SearchResult{}, ctx.Err())
+				return
+			default:
+			}
+
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
@@ -125,10 +140,17 @@ func (r *VectorRegistry) SearchWithFilter(queryVec []float32, k int, filterHash 
 
 // SearchInTopic returns an iterator of top-k most similar vectors within a specific topic.
 // Always uses Badger prefix scan — LSM-level filtering is faster than scanning all mmap vectors.
-func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+func (r *VectorRegistry) SearchInTopic(ctx context.Context, topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
 			return
+		}
+
+		select {
+		case <-ctx.Done():
+			yield(SearchResult{}, ctx.Err())
+			return
+		default:
 		}
 
 		slog.Debug("Badger-streaming topic-aware vector search started",
@@ -157,7 +179,19 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 		topicEnd := buildTopicVectorEnd(topicID)
 		h := make(scoreHeap, 0, k)
 
+		var count int
 		for it.Seek(topicPrefix); it.Valid(); it.Next() {
+			// Check ctx every 4096 vectors (same cadence as mmap fast path)
+			if count&4095 == 0 {
+				select {
+				case <-ctx.Done():
+					yield(SearchResult{}, ctx.Err())
+					return
+				default:
+				}
+			}
+			count++
+
 			key := it.Item().Key()
 			if bytes.Compare(key, topicEnd) >= 0 {
 				break
@@ -204,7 +238,7 @@ func (r *VectorRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int
 
 // searchFromBadger streams all vectors from Badger and maintains a top-k heap.
 // Used as fallback when mmap cache is empty (cold start).
-func (r *VectorRegistry) searchFromBadger(queryVec []float32, k int, filterHash uint8, hybridCfg *HybridConfig, fullDim int, yield func(SearchResult, error) bool) {
+func (r *VectorRegistry) searchFromBadger(ctx context.Context, queryVec []float32, k int, filterHash uint8, hybridCfg *HybridConfig, fullDim int, yield func(SearchResult, error) bool) {
 	slog.Debug("Badger-streaming vector search (cold start)",
 		"k", k,
 	)
@@ -223,7 +257,19 @@ func (r *VectorRegistry) searchFromBadger(queryVec []float32, k int, filterHash 
 	prefix := []byte{keys.VectorFullPrefix}
 	h := make(scoreHeap, 0, k)
 
+	var count int
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		// Check ctx every 4096 vectors (same cadence as mmap fast path)
+		if count&4095 == 0 {
+			select {
+			case <-ctx.Done():
+				yield(SearchResult{}, ctx.Err())
+				return
+			default:
+			}
+		}
+		count++
+
 		item := it.Item()
 		vecKey := item.Key()
 		if len(vecKey) != keys.ChunkKeySize {

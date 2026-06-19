@@ -1,12 +1,17 @@
 package meb
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/duynguyendang/meb/store"
+	"github.com/duynguyendang/meb/vector"
+	"go.uber.org/goleak"
 )
 
 func newTestStore(t *testing.T) *MEBStore {
@@ -673,7 +678,7 @@ func TestTransactionView(t *testing.T) {
 
 	var facts []Fact
 	err := s.View(func(txn *StoreTxn) error {
-		for f, err := range txn.Scan("alice", "", "") {
+		for f, err := range txn.Scan(context.Background(), "alice", "", "") {
 			if err != nil {
 				return err
 			}
@@ -923,6 +928,252 @@ func BenchmarkScanSingle(b *testing.B) {
 	}
 }
 
+func newTestStoreWithDir(t *testing.T) (*MEBStore, string) {
+	t.Helper()
+
+	dataDir := t.TempDir()
+	dictDir := filepath.Join(dataDir, "dict")
+	segDir := filepath.Join(dataDir, "vectors")
+
+	for _, d := range []string{dataDir, dictDir, segDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatalf("failed to create dir %s: %v", d, err)
+		}
+	}
+
+	cfg := &store.Config{
+		DataDir:        dataDir,
+		DictDir:        dictDir,
+		InMemory:       false,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+	}
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+	return s, dataDir
+}
+
+func reopenStore(t *testing.T, dataDir string) *MEBStore {
+	t.Helper()
+
+	dictDir := filepath.Join(dataDir, "dict")
+	segDir := filepath.Join(dataDir, "vectors")
+
+	cfg := &store.Config{
+		DataDir:        dataDir,
+		DictDir:        dictDir,
+		InMemory:       false,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+	}
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore (reopen): %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestInsertReopenScan(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s, dataDir := newTestStoreWithDir(t)
+
+	const n = 1000
+	rng := rand.New(rand.NewSource(42))
+
+	facts := make([]Fact, n)
+	for i := 0; i < n; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("s_%d", rng.Intn(n)),
+			Predicate: fmt.Sprintf("p_%d", rng.Intn(n)),
+			Object:    fmt.Sprintf("o_%d", rng.Intn(n)),
+		}
+	}
+
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+	if s.Count() != n {
+		t.Fatalf("expected count %d, got %d", n, s.Count())
+	}
+
+	s.Close()
+
+	s2 := reopenStore(t, dataDir)
+	if s2.Count() != n {
+		t.Fatalf("after reopen: expected count %d, got %d", n, s2.Count())
+	}
+
+	factSet := make(map[string]bool, n)
+	for f, err := range s2.Scan("", "", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		key := fmt.Sprintf("%v|%v|%v", f.Subject, f.Predicate, f.Object)
+		factSet[key] = true
+	}
+
+	for _, f := range facts {
+		key := fmt.Sprintf("%v|%v|%v", f.Subject, f.Predicate, f.Object)
+		if !factSet[key] {
+			t.Errorf("missing fact after reopen: %s", key)
+		}
+	}
+}
+
+func TestInsertReopenVector(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s, dataDir := newTestStoreWithDir(t)
+
+	const (
+		n   = 100
+		dim = 1536
+	)
+
+	rng := rand.New(rand.NewSource(99))
+	vectors := make([][]float32, n)
+	for i := 0; i < n; i++ {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		vectors[i] = vec
+	}
+
+	for i, vec := range vectors {
+		if err := s.Vectors().Add(uint64(i+1), vec); err != nil {
+			t.Fatalf("Vectors().Add(%d): %v", i+1, err)
+		}
+	}
+
+	s.Close()
+
+	s2 := reopenStore(t, dataDir)
+
+	queryVec := vectors[0]
+	var topResult *vector.SearchResult
+	for r, err := range s2.Vectors().Search(context.Background(), queryVec, 1) {
+		if err != nil {
+			t.Fatalf("search error: %v", err)
+		}
+		topResult = &r
+		break
+	}
+	if topResult == nil {
+		t.Fatal("expected at least one search result")
+	}
+	if topResult.ID != 1 {
+		t.Errorf("expected top-1 identity (id=1), got id=%d", topResult.ID)
+	}
+}
+
+func TestMixedLifecycle(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s, dataDir := newTestStoreWithDir(t)
+
+	const (
+		numFacts   = 1000
+		numVecs    = 100
+		numDocs    = 10
+		vecDim     = 1536
+	)
+
+	rng := rand.New(rand.NewSource(7))
+
+	facts := make([]Fact, numFacts)
+	for i := 0; i < numFacts; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("subj_%d", rng.Intn(numFacts)),
+			Predicate: fmt.Sprintf("pred_%d", rng.Intn(numFacts)),
+			Object:    fmt.Sprintf("obj_%d", rng.Intn(numFacts)),
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	vecIDs := make([]uint64, numVecs)
+	for i := 0; i < numVecs; i++ {
+		vec := make([]float32, vecDim)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		id := uint64(i + 1)
+		vecIDs[i] = id
+		if err := s.Vectors().Add(id, vec); err != nil {
+			t.Fatalf("Vectors().Add(%d): %v", id, err)
+		}
+	}
+
+	docKeys := make([]string, numDocs)
+	for i := 0; i < numDocs; i++ {
+		key := fmt.Sprintf("doc_%d", i)
+		docKeys[i] = key
+		content := []byte(fmt.Sprintf("document content %d", i))
+		vec := make([]float32, vecDim)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		meta := map[string]any{"index": int32(i)}
+		if err := s.AddDocument(key, content, vec, meta); err != nil {
+			t.Fatalf("AddDocument(%s): %v", key, err)
+		}
+	}
+
+	s.Close()
+
+	s2 := reopenStore(t, dataDir)
+
+	factCount := 0
+	for _, err := range s2.Scan("", "", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		factCount++
+	}
+	if factCount < numFacts {
+		t.Errorf("expected at least %d facts after reopen, got %d", numFacts, factCount)
+	}
+
+	queryVec := make([]float32, vecDim)
+	for j := range queryVec {
+		queryVec[j] = rng.Float32()
+	}
+	vecCount := 0
+	for _, err := range s2.Vectors().Search(context.Background(), queryVec, numVecs) {
+		if err != nil {
+			t.Fatalf("vector search error: %v", err)
+		}
+		vecCount++
+	}
+	if vecCount == 0 {
+		t.Error("expected at least one vector search result")
+	}
+
+	for _, key := range docKeys {
+		content, err := s2.GetContentByKey(key)
+		if err != nil {
+			t.Errorf("GetContentByKey(%s): %v", key, err)
+			continue
+		}
+		expected := []byte(fmt.Sprintf("document content %s", key[len("doc_"):]))
+		if string(content) != string(expected) {
+			t.Errorf("content mismatch for %s: got %s, want %s", key, content, expected)
+		}
+	}
+}
+
 func TestSetRetention(t *testing.T) {
 	s := newTestStore(t)
 
@@ -965,6 +1216,220 @@ func TestSetRetention(t *testing.T) {
 
 	if remaining != maxFacts {
 		t.Errorf("expected %d remaining facts (SPO index), got %d", maxFacts, remaining)
+	}
+}
+
+// H1 Reset tests are in reset_test.go
+
+// --- H5 Cancellation tests ---
+
+func TestSearchCancellation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	const numVecs = 5000
+	dim := 1536
+	rng := rand.New(rand.NewSource(42))
+	for i := 0; i < numVecs; i++ {
+		vec := make([]float32, dim)
+		for j := range vec {
+			vec[j] = rng.Float32()
+		}
+		if err := s.Vectors().Add(uint64(i+1), vec); err != nil {
+			t.Fatalf("Vectors().Add(%d): %v", i+1, err)
+		}
+	}
+
+	queryVec := make([]float32, dim)
+	for j := range queryVec {
+		queryVec[j] = rng.Float32()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	start := time.Now()
+	for _, err := range s.Vectors().Search(ctx, queryVec, 10) {
+		if err != nil {
+			if err == context.Canceled {
+				elapsed := time.Since(start)
+				if elapsed > 10*time.Second {
+					t.Errorf("pre-cancelled Search took %v, want < 10s", elapsed)
+				}
+				return
+			}
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	elapsed := time.Since(start)
+	if elapsed > 10*time.Second {
+		t.Errorf("pre-cancelled Search took %v, want < 10s", elapsed)
+	}
+}
+
+func TestScanWithPruningCancellation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	facts := make([]Fact, 5000)
+	for i := range facts {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("sub_%d", i%1000),
+			Predicate: "type",
+			Object:    "test",
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	start := time.Now()
+	for _, err := range s.ScanWithPruning(ctx, "", "", "", 0, false) {
+		if err != nil {
+			if err == context.Canceled {
+				elapsed := time.Since(start)
+				if elapsed > 10*time.Second {
+					t.Errorf("pre-cancelled ScanWithPruning took %v, want < 10s", elapsed)
+				}
+				return
+			}
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	// Scan may complete without checking ctx for small datasets — acceptable
+	elapsed := time.Since(start)
+	if elapsed > 10*time.Second {
+		t.Errorf("pre-cancelled ScanWithPruning took %v, want < 10s", elapsed)
+	}
+}
+
+func TestBuilderCancellation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	facts := make([]Fact, 5000)
+	for i := range facts {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("sub_%d", i%1000),
+			Predicate: "knows",
+			Object:    fmt.Sprintf("obj_%d", (i+1)%1000),
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	vec := make([]float32, 1536)
+	rng := rand.New(rand.NewSource(42))
+	for i := range vec {
+		vec[i] = rng.Float32()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	start := time.Now()
+	_, err := s.Find().SimilarTo(vec).Limit(10).Execute(ctx)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		// Error is acceptable for pre-cancelled context
+		t.Logf("Builder.Execute with cancelled ctx: %v (took %v)", err, elapsed)
+	} else {
+		t.Logf("Builder.Execute with cancelled ctx completed without error (took %v)", elapsed)
+	}
+
+	if elapsed > 10*time.Second {
+		t.Errorf("pre-cancelled Builder.Execute took %v, want < 10s", elapsed)
+	}
+}
+
+func TestStoreTxnCancellation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	facts := make([]Fact, 5000)
+	for i := range facts {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("sub_%d", i%1000),
+			Predicate: "type",
+			Object:    "test",
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel
+
+	start := time.Now()
+	err := s.View(func(txn *StoreTxn) error {
+		count := 0
+		for _, err := range txn.Scan(ctx, "", "", "") {
+			if err != nil {
+				return err
+			}
+			count++
+		}
+		return nil
+	})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		if err != context.Canceled {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+	} else {
+		t.Logf("StoreTxn.Scan with cancelled ctx completed without error (took %v)", elapsed)
+	}
+
+	if elapsed > 10*time.Second {
+		t.Errorf("pre-cancelled StoreTxn.Scan took %v, want < 10s", elapsed)
+	}
+}
+
+func TestPreCancelledCtxVectorSearch(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	vec := make([]float32, 1536)
+	for i := range vec {
+		vec[i] = 1.0
+	}
+	if err := s.Vectors().Add(1, vec); err != nil {
+		t.Fatalf("Vectors().Add: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	count := 0
+	var lastErr error
+	for _, err := range s.Vectors().Search(ctx, vec, 10) {
+		if err != nil {
+			lastErr = err
+			break
+		}
+		count++
+	}
+	elapsed := time.Since(start)
+
+	if lastErr != nil && lastErr != context.Canceled {
+		t.Errorf("expected context.Canceled, got %v", lastErr)
+	}
+	t.Logf("pre-cancelled vector search returned %d results in %v", count, elapsed)
+	if elapsed > 5*time.Second {
+		t.Errorf("pre-cancelled vector search took %v, want < 5s", elapsed)
 	}
 }
 

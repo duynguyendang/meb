@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"context"
 	"fmt"
 	"iter"
 	"sort"
@@ -91,24 +92,24 @@ func (p *PartitionedRegistry) HasVector(topicID uint32, id uint64) bool {
 }
 
 // Search searches vectors in a specific topic partition.
-func (p *PartitionedRegistry) Search(topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+func (p *PartitionedRegistry) Search(ctx context.Context, topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	p.mu.RLock()
 	part, ok := p.partitions[topicID]
 	p.mu.RUnlock()
 	if !ok {
 		return func(yield func(SearchResult, error) bool) {}
 	}
-	return part.Search(queryVec, k)
+	return part.Search(ctx, queryVec, k)
 }
 
 // SearchInTopic is an alias for Search (topic is already specified).
-func (p *PartitionedRegistry) SearchInTopic(topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
-	return p.Search(topicID, queryVec, k)
+func (p *PartitionedRegistry) SearchInTopic(ctx context.Context, topicID uint32, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+	return p.Search(ctx, topicID, queryVec, k)
 }
 
 // SearchAllTopics searches across all topic partitions in parallel and merges results.
 // Returns top-k results across all partitions.
-func (p *PartitionedRegistry) SearchAllTopics(queryVec []float32, k int) iter.Seq2[SearchResult, error] {
+func (p *PartitionedRegistry) SearchAllTopics(ctx context.Context, queryVec []float32, k int) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		p.mu.RLock()
 		partitions := make([]*VectorRegistry, 0, len(p.partitions))
@@ -122,7 +123,7 @@ func (p *PartitionedRegistry) SearchAllTopics(queryVec []float32, k int) iter.Se
 		}
 
 		if len(partitions) == 1 {
-			for result, err := range partitions[0].Search(queryVec, k) {
+			for result, err := range partitions[0].Search(ctx, queryVec, k) {
 				if err != nil {
 					yield(SearchResult{}, err)
 					return
@@ -143,7 +144,7 @@ func (p *PartitionedRegistry) SearchAllTopics(queryVec []float32, k int) iter.Se
 		ch := make(chan partitionResult, len(partitions))
 		for _, part := range partitions {
 			go func(p *VectorRegistry) {
-				results, err := collectSearchResults(p.Search(queryVec, k))
+				results, err := collectSearchResults(p.Search(ctx, queryVec, k))
 				ch <- partitionResult{results: results, err: err}
 			}(part)
 		}
@@ -151,12 +152,17 @@ func (p *PartitionedRegistry) SearchAllTopics(queryVec []float32, k int) iter.Se
 		// Merge results
 		allResults := make([]SearchResult, 0, k*len(partitions))
 		for i := 0; i < len(partitions); i++ {
-			pr := <-ch
-			if pr.err != nil {
-				yield(SearchResult{}, pr.err)
+			select {
+			case <-ctx.Done():
+				yield(SearchResult{}, ctx.Err())
 				return
+			case pr := <-ch:
+				if pr.err != nil {
+					yield(SearchResult{}, pr.err)
+					return
+				}
+				allResults = append(allResults, pr.results...)
 			}
-			allResults = append(allResults, pr.results...)
 		}
 
 		// Sort by score descending and return top-k

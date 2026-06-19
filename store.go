@@ -46,6 +46,7 @@ type MEBStore struct {
 
 	cleanupStop chan struct{}
 	cleanupDone chan struct{}
+	cleanupGen  atomic.Uint64
 
 	lftjEngine *query.LFTJEngine
 
@@ -263,6 +264,9 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 
 	vCfg := vector.DefaultConfig()
 	vCfg.SegmentDir = cfg.SegmentDir
+	if cfg.VectorFullDim > 0 {
+		vCfg.FullDim = cfg.VectorFullDim
+	}
 
 	wal, err := NewWAL(cfg.DataDir)
 	if err != nil {
@@ -317,34 +321,36 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 }
 
 func (m *MEBStore) Reset() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	slog.Info("resetting store", "factCount", m.numFacts.Load())
 
-	// Stop cleanup loop (guard against double-close)
-	select {
-	case <-m.cleanupStop:
-		// already closed, skip
-	default:
-		close(m.cleanupStop)
+	// Stage 1: resetStop — stop the cleanup loop without holding m.mu for long
+	if err := m.resetStop(); err != nil {
+		return err
 	}
-	<-m.cleanupDone
 
-	// Reset unified database (graph + dictionary + content + vectors)
+	// Stage 2: resetExecute — expensive operations (DropAll, dict/vector/WAL reset).
+	// m.mu is held here but released during the actual DropAll to avoid blocking reads.
+	m.mu.Lock()
+
+	// Release m.mu during DropAll so concurrent Scan/Search callers are not blocked for seconds.
+	m.mu.Unlock()
 	err := m.db.DropAll()
+	m.mu.Lock()
 	if err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("failed to reset database: %w", err)
 	}
 
 	// Reset dictionary encoder caches and allocator
 	if err := m.dict.Reset(); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("failed to reset dictionary: %w", err)
 	}
 
-	// Reset vector registry
+	// Reset vector registry (defers file IO with tombstone barrier)
 	if m.vectors != nil {
 		if err := m.vectors.Reset(); err != nil {
+			m.mu.Unlock()
 			return fmt.Errorf("failed to reset vector registry: %w", err)
 		}
 	}
@@ -361,14 +367,14 @@ func (m *MEBStore) Reset() error {
 	m.factsSinceLastPersist.Store(0)
 	m.factsSinceGC.Store(0)
 	m.lastGCTimeNano.Store(0)
-	m.topicID.Store(1) // 1 is the default valid topic ID (0 is reserved as invalid)
+	m.topicID.Store(1)
 	m.defaultEntityType = 0
 	m.defaultFlags = 0
 
-	// Restart cleanup loop
-	m.cleanupStop = make(chan struct{})
-	m.cleanupDone = make(chan struct{})
-	go m.runCleanupLoop()
+	m.mu.Unlock()
+
+	// Stage 3: resetRestart — recreate channels and spawn new cleanup goroutine
+	m.resetRestart()
 
 	slog.Info("store reset complete",
 		"dbDropped", true,
@@ -377,6 +383,27 @@ func (m *MEBStore) Reset() error {
 		"walCleared", true,
 	)
 	return nil
+}
+
+// resetStop stops the cleanup loop. Must be called without holding m.mu.
+func (m *MEBStore) resetStop() error {
+	m.cleanupGen.Add(1) // bump generation so old cleanup goroutines exit
+
+	select {
+	case <-m.cleanupStop:
+		// already closed
+	default:
+		close(m.cleanupStop)
+	}
+	<-m.cleanupDone
+	return nil
+}
+
+// resetRestart recreates cleanup channels and starts a new cleanup goroutine.
+func (m *MEBStore) resetRestart() {
+	m.cleanupStop = make(chan struct{})
+	m.cleanupDone = make(chan struct{})
+	go m.runCleanupLoop()
 }
 
 func (m *MEBStore) Close() error {
@@ -716,6 +743,7 @@ func (m *MEBStore) SetRetention(maxFacts uint64) error {
 }
 
 func (m *MEBStore) runCleanupLoop() {
+	myGen := m.cleanupGen.Load()
 	defer close(m.cleanupDone)
 
 	ticker := time.NewTicker(cleanupInterval)
@@ -726,6 +754,11 @@ func (m *MEBStore) runCleanupLoop() {
 		case <-m.cleanupStop:
 			return
 		case <-ticker.C:
+			// If cleanupGen has changed since we started, another Reset() is
+			// running — exit so the new goroutine can take over.
+			if m.cleanupGen.Load() != myGen {
+				return
+			}
 			m.runCleanup()
 		}
 	}

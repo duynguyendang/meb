@@ -37,6 +37,8 @@ type Config struct {
 
 	EnableAutoGC bool
 
+	PreserveObjectTypes bool
+
 	GCRatio float64
 
 	ValueLogFileSize int64
@@ -44,6 +46,8 @@ type Config struct {
 	Verbose bool
 
 	SegmentDir string
+
+	VectorFullDim int
 }
 
 func (c *Config) Validate() error {

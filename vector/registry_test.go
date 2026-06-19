@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"context"
 	"math"
 	"os"
 	"sync"
@@ -292,7 +293,7 @@ func TestNonPow2DimensionSearch(t *testing.T) {
 
 	// Search should return non-zero scores
 	results := make([]SearchResult, 0)
-	for sr, err := range r.Search(queryVec, 5) {
+	for sr, err := range r.Search(context.Background(), queryVec, 5) {
 		if err != nil {
 			t.Fatalf("Search failed: %v", err)
 		}

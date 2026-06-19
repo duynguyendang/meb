@@ -95,7 +95,8 @@ func (b *Builder) JoinWithLFTJ(relations []query.RelationPattern, resultVars []s
 	return b
 }
 
-func (b *Builder) Execute() ([]Result, error) {
+// Execute runs the query with the given context for cancellation support.
+func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 	if len(b.vectorQuery) == 0 {
 		return nil, fmt.Errorf("query must include SimilarTo() vector search")
 	}
@@ -107,15 +108,15 @@ func (b *Builder) Execute() ([]Result, error) {
 
 	var vecIter iter.Seq2[vector.SearchResult, error]
 	if b.topicID > 0 {
-		vecIter = b.store.Vectors().SearchInTopic(b.topicID, b.vectorQuery, candidateK)
+		vecIter = b.store.Vectors().SearchInTopic(ctx, b.topicID, b.vectorQuery, candidateK)
 	} else {
-		vecIter = b.store.Vectors().Search(b.vectorQuery, candidateK)
+		vecIter = b.store.Vectors().Search(ctx, b.vectorQuery, candidateK)
 	}
 
 	results := make([]Result, 0, b.limit)
 
 	if len(b.relations) > 0 {
-		return b.executeWithLFTJ(vecIter, results)
+		return b.executeWithLFTJ(ctx, vecIter, results)
 	}
 
 	for vecResult, err := range vecIter {
@@ -155,7 +156,7 @@ func (b *Builder) Execute() ([]Result, error) {
 	return results, nil
 }
 
-func (b *Builder) executeWithLFTJ(vecIter iter.Seq2[vector.SearchResult, error], results []Result) ([]Result, error) {
+func (b *Builder) executeWithLFTJ(ctx context.Context, vecIter iter.Seq2[vector.SearchResult, error], results []Result) ([]Result, error) {
 	engine := b.store.LFTJEngine()
 	if engine == nil {
 		return nil, fmt.Errorf("LFTJ engine not available")
@@ -205,7 +206,7 @@ func (b *Builder) executeWithLFTJ(vecIter iter.Seq2[vector.SearchResult, error],
 	}
 
 	for joinResult, err := range engine.ExecuteWithSeeds(
-		context.Background(),
+		ctx,
 		b.relations,
 		seedVar,
 		seedIDs,

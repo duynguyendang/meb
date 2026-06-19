@@ -7,7 +7,6 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/duynguyendang/meb/keys"
 
@@ -81,6 +80,10 @@ type VectorRegistry struct {
 
 	db *badger.DB
 	mu sync.RWMutex
+
+	// Tombstone support for deferred segment cleanup in Reset()
+	tombstoneSegments []*mmapSegment
+	tombstoneWG       sync.WaitGroup
 }
 
 const hashSize = 1 // 1 byte for semantic hash filter per vector entry
@@ -120,39 +123,62 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 }
 
 // Reset clears all vectors, mappings, and segment data from the registry.
-// This is used by MEBStore.Reset() to ensure a clean state.
+// Segment file IO (Munmap, Truncate, Close) is deferred for 5 seconds via a
+// tombstone barrier to allow in-flight Search() calls to drain their mmap reads.
+// Callers should wait 5s after Reset() before Close(), or use a synchronous
+// ResetNow(ctx) variant for immediate teardown.
 func (r *VectorRegistry) Reset() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	slog.Info("resetting vector registry",
 		"totalVectors", r.totalVectors,
 		"segments", len(r.segments),
 	)
 
+	// Move current segments to tombstone list
+	if len(r.segments) > 0 {
+		r.tombstoneSegments = append(r.tombstoneSegments, r.segments...)
+	}
+
 	// Clear mappings
 	r.idMap = make(map[uint64]uint32, r.config.InitialCapacity)
 	r.revMap.Store(&[]uint64{})
 	r.totalVectors = 0
-
-	// Unmap and close segments
-	for _, seg := range r.segments {
-		if seg.data != nil {
-			syscall.Munmap(seg.data)
-			seg.data = nil
-		}
-		if seg.file != nil {
-			// Truncate file to 0 and close
-			seg.file.Truncate(0)
-			seg.file.Close()
-		}
-	}
-
-	// Clear segment list
 	r.segments = r.segments[:0]
 
-	slog.Info("vector registry reset complete")
+	r.mu.Unlock()
+
+	// Spawn background cleanup for tombstoned segments (if any pending)
+	// If a previous cleanup is still running, it will handle these too
+	// since we appended to tombstoneSegments.
+	if len(r.tombstoneSegments) > 0 {
+		// Wait for previous cleanup to finish before starting new one
+		r.tombstoneWG.Wait()
+
+		segsToClean := r.tombstoneSegments
+
+		// Create new tombstone list for future resets
+		r.tombstoneSegments = nil
+
+		r.tombstoneWG.Add(1)
+		go cleanupTombstonedSegments(segsToClean, &r.tombstoneWG)
+	}
+
+	slog.Info("vector registry reset complete",
+		"tombstonedSegments", len(r.segments),
+	)
 	return nil
+}
+
+// ResetNow synchronously cleans up all tombstoned segments immediately.
+// Blocks until all deferred cleanup completes.
+func (r *VectorRegistry) ResetNow() {
+	r.tombstoneWG.Wait()
+}
+
+// WaitTombstones blocks until all tombstoned segment cleanup completes.
+func (r *VectorRegistry) WaitTombstones() {
+	r.tombstoneWG.Wait()
 }
 
 // ensureCapacity grows the segment list if needed to hold the required number of vectors.

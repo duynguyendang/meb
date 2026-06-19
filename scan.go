@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
 )
+
+var legacyCoercionWarnOnce sync.Once
 
 type PredicateFilterType string
 
@@ -265,8 +269,14 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 		if err != nil {
 			return Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", r.foundOID, err)
 		}
-		// Attempt to restore original type from dictionary string
-		object = restoreTypedValue(objectStr)
+		if m.config.PreserveObjectTypes {
+			object = objectStr
+		} else {
+			legacyCoercionWarnOnce.Do(func() {
+				slog.Warn("DEPRECATED: numeric strings from dictionary are coerced to int64/float64. Set PreserveObjectTypes=true to keep them as strings.")
+			})
+			object = restoreTypedValue(objectStr)
+		}
 	}
 
 	return Fact{
@@ -507,8 +517,8 @@ func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o 
 // ScanWithPruning scans facts with semantic hints pruning.
 // entityType: only yield triples matching this entity type (0 = no pruning).
 // wantPublic: if true, only yield triples with IsPublic flag.
-func (m *MEBStore) ScanWithPruning(s, p, o string, entityType uint16, wantPublic bool) iter.Seq2[Fact, error] {
-	opts, err := m.prepareScanWithContext(context.Background(), s, p, o)
+func (m *MEBStore) ScanWithPruning(ctx context.Context, s, p, o string, entityType uint16, wantPublic bool) iter.Seq2[Fact, error] {
+	opts, err := m.prepareScanWithContext(ctx, s, p, o)
 	if err != nil {
 		return func(yield func(Fact, error) bool) {
 			yield(Fact{}, err)

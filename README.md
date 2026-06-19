@@ -1,5 +1,7 @@
 # meb
 
+[![CI](https://github.com/duynguyendang/meb/actions/workflows/ci.yml/badge.svg)](https://github.com/duynguyendang/meb/actions/workflows/ci.yml)
+
 Mangle Extension for Badger — an embedded knowledge graph database combining triple-store semantics with Hybrid (FWHT + Block-wise) vector search.
 
 ## Features
@@ -16,7 +18,9 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 - **Datalog Integration**: Mangle `factstore.FactStore` interface for symbolic reasoning
 - **Neuro-Symbolic Search**: Hybrid vector + LFTJ graph query builder with streaming joins
 - **Circuit Breaker**: Configurable query timeout protection with push telemetry
-- **Write-Ahead Log**: Dual-DB atomicity guarantees via file-based WAL with crash recovery
+- **Write-Ahead Log**: Single-DB atomicity guarantees via WAL v2 (CRC32C integrity, auto-migrate v1→v2)
+- **Deterministic LFTJ Joins**: Canonical ordering + ExecuteOrdered for reproducible multi-way join results
+- **Object Type Preservation**: `PreserveObjectTypes` config flag to skip numeric coercion on scan
 - **Sharded Dictionary**: Configurable lock-striping for high-concurrent ingestion
 - **S2 Compression**: Fast content storage with Snappy-compatible compression
 
@@ -26,12 +30,14 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 package main
 
 import (
+    "context"
     "log"
     "github.com/duynguyendang/meb"
     "github.com/duynguyendang/meb/store"
 )
 
 func main() {
+    ctx := context.Background()
     cfg := store.DefaultConfig("./meb-data")
     s, err := meb.NewMEBStore(cfg)
     if err != nil {
@@ -61,7 +67,7 @@ func main() {
         InTopic(topicID).
         SimilarTo(embedding).
         Limit(5).
-        Execute()
+        Execute(ctx)
 
     // Scan (zero-copy streaming, constant memory)
     for f, err := range s.Scan("Alice", "", "") {
@@ -278,7 +284,7 @@ err := store.Update(func(txn *meb.StoreTxn) error {
 
 // Read-only transaction
 store.View(func(txn *meb.StoreTxn) error {
-    for f, err := range txn.Scan("entity:UserService", "", "") {
+    for f, err := range txn.Scan(ctx, "entity:UserService", "", "") {
         // ...
     }
     return nil
@@ -315,6 +321,8 @@ All cleanup operations are **throttled** (max 1000 orphans per cycle) to avoid l
 
 ```
 meb/
+├── .github/workflows/
+│   └── ci.yml            # CI: go test, goleak, race detector
 ├── keys/              # 25-byte triple key encoding (TopicID packing)
 ├── dict/              # String interning (thread-safe LRU + sharded allocator)
 ├── store/             # BadgerDB config with deployment profiles
@@ -324,18 +332,27 @@ meb/
 │   ├── registry.go    # Badger-native store + mmap cache, RCU revMap
 │   ├── search.go      # Dual-path: mmap parallel + Badger streaming
 │   └── math.go        # L2 normalize, dot product
+├── query/             # LFTJ engine (worst-case optimal multi-way joins)
+│   ├── lftj.go        # TrieIterator, LFTJResult, Canonical ordering
+│   └── engine.go      # Execute, ExecuteOrdered, WithBufferAndSort
 ├── circuit/           # Query timeout circuit breaker with state callbacks
 ├── utils/             # Zero-copy string/byte conversion
 ├── adapter/           # Mangle Datalog integration
-├── store.go           # MEBStore orchestrator
-├── tx.go              # Transaction API (View/Update, StoreTxn)
+├── bench/             # ANN benchmarks + perf benchmarks
+├── store.go           # MEBStore orchestrator (NewMEBStore, Reset, Close)
+├── tx.go              # Transaction API (View/Update, StoreTxn) — ctx-aware Scan
 ├── knowledge_store.go # SPO/OPS dual-index write, orphan cleanup
 ├── scan.go            # Index selection scan (iter.Seq2 streaming)
 ├── content.go         # S2-compressed content storage, atomic Add/DeleteDocument
-├── query_builder.go   # Neuro-symbolic query builder with LFTJ joins
+├── query_builder.go   # Neuro-symbolic query builder with LFTJ joins — Execute(ctx)
 ├── telemetry.go       # Push telemetry (TelemetrySink interface)
-├── wal.go             # Write-ahead log (mutex-free reads)
-└── fact_store.go      # factstore.FactStore implementation
+├── wal.go             # Write-ahead log v2 (CRC32C, mutex-guarded)
+├── fact_store.go      # factstore.FactStore implementation
+├── store_test.go      # H4 Lifecycle, H5 cancellation, H10 lifecycle
+├── reset_test.go      # H1 Reset no-deadlock, concurrent guards
+├── scan_test.go       # H9 PreserveObjectTypes deprecation warning
+├── wal_test.go        # H8 WAL v2 format, CRC32C, migration
+└── go.mod             # go.uber.org/goleak added for test goroutine leak detection
 ```
 
 ## Configuration
@@ -355,6 +372,12 @@ cfg.Verbose = true
 
 // Enable sharded dictionary (must be power of 2)
 cfg.NumDictShards = 4
+
+// Preserve original object types (skip numeric coercion)
+cfg.PreserveObjectTypes = true
+
+// Set vector default dimensionality (default: 1536)
+cfg.VectorFullDim = 1536
 ```
 
 ## Observability
@@ -472,7 +495,8 @@ go test ./vector/... -v -run "TestHybridQuantizationFidelity|TestRecallAtK|TestF
 
 ```bash
 go build ./...
-go test ./...
+go test -short ./...    # skip slow ANN benchmarks
+go test -race ./...     # race detector (except vector/ — FWHT timeout)
 go vet ./...
 ```
 
@@ -482,4 +506,5 @@ go vet ./...
 - `codeberg.org/TauCeti/mangle-go` — Datalog reasoning engine
 - `github.com/klauspost/compress` — S2 compression
 - `github.com/hashicorp/golang-lru/v2` — Dictionary caching
+- `go.uber.org/goleak` — Goroutine leak detection in tests
 - `golang.org/x/sys` — CPU feature detection (AVX2 dispatch)

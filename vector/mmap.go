@@ -2,16 +2,20 @@ package vector
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 // mmapSegment represents a single memory-mapped file segment.
 type mmapSegment struct {
-	file *os.File
-	data []byte
+	file       *os.File
+	data       []byte
+	tombstoned bool // if true, marked for deferred cleanup
 }
 
 // newMmapSegment creates a new mmap segment file of the given size.
@@ -64,4 +68,34 @@ func (seg *mmapSegment) sync() error {
 		return fmt.Errorf("msync failed: %v", errno)
 	}
 	return nil
+}
+
+// cleanupTombstonedSegments unmaps, truncates, and closes all tombstoned segments.
+// Called from a background goroutine after the tombstone barrier elapses.
+func cleanupTombstonedSegments(segs []*mmapSegment, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// 5-second barrier for in-flight Search calls to drain their mmap reads
+	time.Sleep(5 * time.Second)
+
+	for _, seg := range segs {
+		if seg == nil {
+			continue
+		}
+		if seg.data != nil {
+			if err := syscall.Munmap(seg.data); err != nil {
+				slog.Warn("tombstoned segment munmap failed", "error", err)
+			}
+			seg.data = nil
+		}
+		if seg.file != nil {
+			if err := seg.file.Truncate(0); err != nil {
+				slog.Warn("tombstoned segment truncate failed", "error", err)
+			}
+			if err := seg.file.Close(); err != nil {
+				slog.Warn("tombstoned segment close failed", "error", err)
+			}
+			seg.file = nil
+		}
+	}
 }

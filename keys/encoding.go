@@ -75,7 +75,7 @@ var KeyFactCount = []byte{SystemPrefix, 0x01}
 // Increment when bit layouts change (Inline ID, TopicID, Semantic Hints).
 var KeySchemaVersion = []byte{SystemPrefix, 0x02}
 
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 // Inline ID encoding: store primitive values directly in the 64-bit object ID.
 //

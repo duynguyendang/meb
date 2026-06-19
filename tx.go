@@ -1,6 +1,7 @@
 package meb
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 
@@ -87,14 +88,14 @@ func (m *MEBStore) Update(fn func(*StoreTxn) error) error {
 
 // Scan iterates over facts matching the given subject, predicate, object.
 // Uses the store's current topicID.
-func (t *StoreTxn) Scan(s, p, o string) iterSeq2FactError {
-	return t.store.scanWithTxn(t.txn, s, p, o, t.store.topicID.Load())
+func (t *StoreTxn) Scan(ctx context.Context, s, p, o string) iterSeq2FactError {
+	return t.store.scanWithTxn(ctx, t.txn, s, p, o, t.store.topicID.Load())
 }
 
 // ScanInTopic iterates over facts matching the given subject, predicate, object
 // within the specified topic.
-func (t *StoreTxn) ScanInTopic(topicID uint32, s, p, o string) iterSeq2FactError {
-	return t.store.scanWithTxn(t.txn, s, p, o, topicID)
+func (t *StoreTxn) ScanInTopic(ctx context.Context, topicID uint32, s, p, o string) iterSeq2FactError {
+	return t.store.scanWithTxn(ctx, t.txn, s, p, o, topicID)
 }
 
 // AddFact adds a single fact within the transaction.
@@ -277,7 +278,7 @@ func (t *StoreTxn) Exists(s, p, o string) bool {
 
 // --- Internal helpers that operate on a given badger.Txn ---
 
-func (m *MEBStore) scanWithTxn(txn *badger.Txn, s, p, o string, topicID uint32) iterSeq2FactError {
+func (m *MEBStore) scanWithTxn(ctx context.Context, txn *badger.Txn, s, p, o string, topicID uint32) iterSeq2FactError {
 	sID, pID, oID, sBound, pBound, oBound, err := m.resolveScanIDs(s, p, o)
 	if err != nil {
 		return func(yield func(Fact, error) bool) {
@@ -296,6 +297,7 @@ func (m *MEBStore) scanWithTxn(txn *badger.Txn, s, p, o string, topicID uint32) 
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
 
 	opts := &scanOptions{
+		ctx:      ctx,
 		s:        s,
 		p:        p,
 		o:        o,
@@ -319,7 +321,19 @@ func (m *MEBStore) scanImplWithTxn(txn *badger.Txn, opts *scanOptions) iterSeq2F
 		it := txn.NewIterator(itOpts)
 		defer it.Close()
 
+		scanCtx := opts.ctx
+		if scanCtx == nil {
+			scanCtx = context.Background()
+		}
+
 		for it.Seek(opts.strategy.prefix); it.ValidForPrefix(opts.strategy.prefix); it.Next() {
+			select {
+			case <-scanCtx.Done():
+				yield(Fact{}, scanCtx.Err())
+				return
+			default:
+			}
+
 			item := it.Item()
 			key := item.Key()
 
