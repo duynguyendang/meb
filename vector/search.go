@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"iter"
 	"log/slog"
+	"runtime"
 	"sort"
 
 	"github.com/dgraph-io/badger/v4"
@@ -68,7 +69,7 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 		vectorSize := r.vectorSize
 		hybridCfg := r.hybridCfg
 		fullDim := r.config.FullDim
-		numWorkers := r.config.NumWorkers
+		configuredWorkers := r.config.NumWorkers
 		revMap := *r.revMap.Load()
 
 		// Capture function to access vector slots
@@ -87,9 +88,22 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 		)
 
 		hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
+		queryBlockNorms := ComputeQueryBlockNorms(hybridQuery, fullDim, hybridCfg)
 
-		if numWorkers > numVectors {
-			numWorkers = numVectors
+		// Adaptive worker count: scale with CPU cores, cap by vector count
+		numWorkers := configuredWorkers
+		if numWorkers <= 0 {
+			numWorkers = 4
+		}
+		if ncpu := runtime.NumCPU(); ncpu > numWorkers {
+			numWorkers = ncpu
+		}
+		// Each worker should process at least 500 vectors to amortize goroutine overhead
+		if vectorsPerWorker := numVectors / numWorkers; vectorsPerWorker < 500 {
+			numWorkers = numVectors / 500
+			if numWorkers < 1 {
+				numWorkers = 1
+			}
 		}
 
 		vectorsPerWorker := (numVectors + numWorkers - 1) / numWorkers
@@ -117,7 +131,7 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 			actualWorkers++
 			go func(start, end int) {
 				defer func() { recover() }()
-				topK := scanChunkHybrid(getSlot, hybridQuery, start, end, k, vectorSize, revMap, filterHash, fullDim, hybridCfg)
+				topK := scanChunkHybrid(getSlot, hybridQuery, queryBlockNorms, start, end, k, vectorSize, revMap, filterHash, fullDim, hybridCfg)
 				resultCh <- topK
 			}(startIdx, endIdx)
 		}
@@ -165,6 +179,7 @@ func (r *VectorRegistry) SearchInTopic(ctx context.Context, topicID uint32, quer
 		r.mu.RUnlock()
 
 		hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
+		queryBlockNorms := ComputeQueryBlockNorms(hybridQuery, fullDim, hybridCfg)
 
 		txn := r.db.NewTransaction(false)
 		defer txn.Discard()
@@ -209,7 +224,11 @@ func (r *VectorRegistry) SearchInTopic(ctx context.Context, topicID uint32, quer
 					return nil
 				}
 				vecData := val[1:]
-				score = DotProductHybrid(vecData, hybridQuery, fullDim, hybridCfg)
+				var threshold float32
+				if len(h) >= k {
+					threshold = h[0].score
+				}
+				score = DotProductHybridWithPruning(vecData, hybridQuery, fullDim, hybridCfg, threshold, queryBlockNorms)
 				return nil
 			})
 			if err != nil {
@@ -244,6 +263,7 @@ func (r *VectorRegistry) searchFromBadger(ctx context.Context, queryVec []float3
 	)
 
 	hybridQuery := QuantizeHybrid(queryVec, hybridCfg)
+	queryBlockNorms := ComputeQueryBlockNorms(hybridQuery, fullDim, hybridCfg)
 
 	txn := r.db.NewTransaction(false)
 	defer txn.Discard()
@@ -289,7 +309,11 @@ func (r *VectorRegistry) searchFromBadger(ctx context.Context, queryVec []float3
 				return nil
 			}
 			vecData := val[1:]
-			score = DotProductHybrid(vecData, hybridQuery, fullDim, hybridCfg)
+			var threshold float32
+			if len(h) >= k {
+				threshold = h[0].score
+			}
+			score = DotProductHybridWithPruning(vecData, hybridQuery, fullDim, hybridCfg, threshold, queryBlockNorms)
 			return nil
 		})
 		if err != nil {
@@ -345,7 +369,7 @@ func extractResults(h scoreHeap) []SearchResult {
 }
 
 // scanChunkHybrid scans a chunk of Hybrid vectors using a slot accessor function.
-func scanChunkHybrid(getSlot func(int) []byte, query []byte, startIdx, endIdx, k int, vectorSize int, revMap []uint64, filterHash uint8, fullDim int, hybridCfg *HybridConfig) []SearchResult {
+func scanChunkHybrid(getSlot func(int) []byte, query []byte, queryBlockNorms []float32, startIdx, endIdx, k int, vectorSize int, revMap []uint64, filterHash uint8, fullDim int, hybridCfg *HybridConfig) []SearchResult {
 	h := make(scoreHeap, 0, k)
 
 	for idx := startIdx; idx < endIdx; idx++ {
@@ -357,7 +381,13 @@ func scanChunkHybrid(getSlot func(int) []byte, query []byte, startIdx, endIdx, k
 		}
 
 		vecData := slot[hashSize:vectorSize]
-		score := DotProductHybrid(vecData, query, fullDim, hybridCfg)
+
+		var score float32
+		if len(h) >= k {
+			score = DotProductHybridWithPruning(vecData, query, fullDim, hybridCfg, h[0].score, queryBlockNorms)
+		} else {
+			score = DotProductHybridWithPruning(vecData, query, fullDim, hybridCfg, 0, queryBlockNorms)
+		}
 
 		if len(h) < k {
 			h = append(h, scoreIndex{score: score, id: revMap[idx]})

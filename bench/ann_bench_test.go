@@ -26,6 +26,7 @@ func testBenchStore(t *testing.T) *meb.MEBStore {
 		LRUCacheSize:   10000,
 		Profile:        "Ingest-Heavy",
 		SegmentDir:     segDir,
+		VectorFullDim:  128,
 		Verbose:        false,
 	}
 	s, err := meb.NewMEBStore(cfg)

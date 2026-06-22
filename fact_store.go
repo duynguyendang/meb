@@ -69,10 +69,6 @@ func (m *MEBStore) GetFacts(atom ast.Atom, callback func(ast.Atom) error) error 
 }
 
 func (m *MEBStore) Add(atom ast.Atom) bool {
-	if m.Contains(atom) {
-		return false
-	}
-
 	subject, predicate, object := extractTripleFromAtom(atom)
 
 	fact := Fact{
@@ -81,12 +77,22 @@ func (m *MEBStore) Add(atom ast.Atom) bool {
 		Object:    object,
 	}
 
-	err := m.AddFactBatch([]Fact{fact})
+	// Use a single read-write transaction so Contains() + AddFactBatch are atomic
+	// with respect to other writers. BadgerDB has no unique-key constraint, so
+	// without this transaction two concurrent Add() calls with the same atom
+	// could both observe "not present" and produce duplicates.
+	added := false
+	err := m.Update(func(t *StoreTxn) error {
+		if t.Exists(subject, predicate, object) {
+			return nil
+		}
+		added = true
+		return t.AddFact(fact)
+	})
 	if err != nil {
 		return false
 	}
-
-	return true
+	return added
 }
 
 // Exists performs an efficient key-only existence check without decoding strings.
@@ -153,6 +159,45 @@ func (m *MEBStore) Merge(other factstore.ReadOnlyFactStore) error {
 			m.Add(atom)
 			return nil
 		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MergeBatch imports facts from another store in batches, avoiding the O(N²)
+// per-fact Exists() check. Existing facts are silently skipped.
+func (m *MEBStore) MergeBatch(other factstore.ReadOnlyFactStore, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	for _, pred := range other.ListPredicates() {
+		batch := make([]Fact, 0, batchSize)
+
+		flush := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			if err := m.AddFactBatch(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+			return nil
+		}
+
+		err := other.GetFacts(ast.NewQuery(pred), func(atom ast.Atom) error {
+			s, p, o := extractTripleFromAtom(atom)
+			batch = append(batch, Fact{Subject: s, Predicate: p, Object: o})
+			if len(batch) >= batchSize {
+				return flush()
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if err := flush(); err != nil {
 			return err
 		}
 	}

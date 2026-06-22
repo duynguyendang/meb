@@ -223,11 +223,15 @@ func (t *StoreTxn) deleteDocumentInTxnDeferred(docKey string, topicID uint32) er
 
 	// Delete content
 	contentKey := keys.EncodeChunkKey(id)
-	_ = t.txn.Delete(contentKey)
+	if err := t.txn.Delete(contentKey); err != nil {
+		return fmt.Errorf("failed to delete content key: %w", err)
+	}
 
 	// Delete vector from BadgerDB (defer in-memory delete)
 	vecKey := keys.EncodeVectorFullKey(id)
-	_ = t.txn.Delete(vecKey)
+	if err := t.txn.Delete(vecKey); err != nil {
+		return fmt.Errorf("failed to delete vector key: %w", err)
+	}
 	if t.store.vectors.HasVector(id) {
 		st := t.store
 		vid := id

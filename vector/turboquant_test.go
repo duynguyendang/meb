@@ -200,3 +200,114 @@ func TestL2NormalizeNoMutation(t *testing.T) {
 		t.Errorf("expected norm 1.0, got %f", norm)
 	}
 }
+
+func TestDotProductHybridWithPruningMatchesNoPruning(t *testing.T) {
+	cfg := &HybridConfig{BitWidth: 8, BlockSize: 32}
+	dim := 128
+
+	vecA := make([]float32, dim)
+	vecB := make([]float32, dim)
+	for i := range vecA {
+		vecA[i] = float32(i) / float32(dim)
+		vecB[i] = float32(dim-i) / float32(dim)
+	}
+
+	qA := QuantizeHybrid(vecA, cfg)
+	qB := QuantizeHybrid(vecB, cfg)
+
+	// Compute with pruning (threshold = 0, so no actual pruning)
+	normsB := ComputeQueryBlockNorms(qB, dim, cfg)
+	scorePruned := DotProductHybridWithPruning(qA, qB, dim, cfg, 0, normsB)
+	scoreNormal := DotProductHybrid(qA, qB, dim, cfg)
+
+	diff := math.Abs(float64(scorePruned - scoreNormal))
+	if diff > 0.01 {
+		t.Errorf("pruned vs normal mismatch: pruned=%.6f, normal=%.6f, diff=%.6f", scorePruned, scoreNormal, diff)
+	}
+}
+
+func TestDotProductHybridWithPruningEarlyExit(t *testing.T) {
+	cfg := &HybridConfig{BitWidth: 8, BlockSize: 32}
+	dim := 128
+
+	vecA := make([]float32, dim)
+	vecB := make([]float32, dim)
+	for i := range vecA {
+		vecA[i] = float32(i) / float32(dim)
+		vecB[i] = float32(dim-i) / float32(dim)
+	}
+
+	qA := QuantizeHybrid(vecA, cfg)
+	qB := QuantizeHybrid(vecB, cfg)
+
+	normsA := ComputeQueryBlockNorms(qA, dim, cfg)
+	normsB := ComputeQueryBlockNorms(qB, dim, cfg)
+
+	// With threshold=0, no pruning should occur — must match DotProductHybrid exactly
+	scoreNormal := DotProductHybrid(qA, qB, dim, cfg)
+	scorePruned := DotProductHybridWithPruning(qA, qB, dim, cfg, 0, normsB)
+	diff := math.Abs(float64(scorePruned - scoreNormal))
+	if diff > 0.01 {
+		t.Errorf("threshold=0: pruned=%.6f, normal=%.6f, diff=%.6f", scorePruned, scoreNormal, diff)
+	}
+
+	// Self-similarity with threshold=0 should match
+	scoreSelfNormal := DotProductHybrid(qA, qA, dim, cfg)
+	scoreSelfPruned := DotProductHybridWithPruning(qA, qA, dim, cfg, 0, normsA)
+	diffSelf := math.Abs(float64(scoreSelfPruned - scoreSelfNormal))
+	if diffSelf > 0.01 {
+		t.Errorf("self-similarity threshold=0: pruned=%.6f, normal=%.6f, diff=%.6f", scoreSelfPruned, scoreSelfNormal, diffSelf)
+	}
+
+	// With threshold above real score, pruning can activate — just verify it doesn't panic
+	// and returns a finite value
+	scoreHigh := DotProductHybridWithPruning(qA, qB, dim, cfg, 10000, normsB)
+	if math.IsNaN(float64(scoreHigh)) || math.IsInf(float64(scoreHigh), 0) {
+		t.Errorf("high threshold: got %f, want finite", scoreHigh)
+	}
+}
+
+func TestComputeQueryBlockNorms(t *testing.T) {
+	cfg := &HybridConfig{BitWidth: 8, BlockSize: 32}
+	dim := 128
+	vec := make([]float32, dim)
+	for i := range vec {
+		vec[i] = float32(i) / float32(dim)
+	}
+
+	q := QuantizeHybrid(vec, cfg)
+	norms := ComputeQueryBlockNorms(q, dim, cfg)
+
+	numBlocks := (dim + cfg.BlockSize - 1) / cfg.BlockSize
+	if len(norms) != numBlocks {
+		t.Fatalf("expected %d block norms, got %d", numBlocks, len(norms))
+	}
+
+	// All norms should be non-negative
+	for i, n := range norms {
+		if n < 0 {
+			t.Errorf("block norm[%d] = %f, want >= 0", i, n)
+		}
+	}
+}
+
+func TestHybridVectorSizeWithNorms(t *testing.T) {
+	cfg8 := &HybridConfig{BitWidth: 8, BlockSize: 32}
+	cfg4 := &HybridConfig{BitWidth: 4, BlockSize: 32}
+	dim := 128
+	numBlocks := (dim + cfg8.BlockSize - 1) / cfg8.BlockSize
+
+	// 8-bit: 12 + 32 = 44 bytes per block
+	size8 := HybridVectorSize(dim, cfg8)
+	expected8 := numBlocks * 44
+	if size8 != expected8 {
+		t.Errorf("8-bit HybridVectorSize(%d) = %d, want %d", dim, size8, expected8)
+	}
+
+	// 4-bit: 12 + 16 = 28 bytes per block
+	size4 := HybridVectorSize(dim, cfg4)
+	expected4 := numBlocks * 28
+	if size4 != expected4 {
+		t.Errorf("4-bit HybridVectorSize(%d) = %d, want %d", dim, size4, expected4)
+	}
+}

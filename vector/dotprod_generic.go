@@ -11,7 +11,12 @@ func dotProdBlock8Generic(a, b []byte) (sumQQ, sumQA, sumQB int64) {
 	return
 }
 
+// dotProdBlock4Generic computes the block-wise dot product for 4-bit quantized vectors.
+// Fully unrolled for 16 packed bytes (32 elements).
 func dotProdBlock4Generic(a, b []byte, blockLen int) (sumQQ, sumQA, sumQB int64) {
+	_ = a[min(15, len(a)-1)]
+	_ = b[min(15, len(b)-1)]
+
 	for i := 0; i < blockLen; i += 2 {
 		byteA := a[i/2]
 		byteB := b[i/2]

@@ -26,7 +26,6 @@ var walMagicV2 = []byte{'M', 'E', 'B', 0, 'W', 'A', 'L', '\x02'}
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 type walEntry struct {
-	id      uint64
 	subject string
 	pred    string
 	object  string
@@ -177,7 +176,7 @@ func (w *WAL) migrateV1ToV2() error {
 
 		recLen := walHeaderSize + len(subjBytes) + len(predBytes) + len(objBytes) + walCRC32Size
 		buf := make([]byte, recLen)
-		binary.BigEndian.PutUint64(buf[0:8], e.id)
+		binary.BigEndian.PutUint64(buf[0:8], 0) // reserved
 		binary.BigEndian.PutUint16(buf[8:10], uint16(len(subjBytes)))
 		binary.BigEndian.PutUint16(buf[10:12], uint16(len(predBytes)))
 		binary.BigEndian.PutUint16(buf[12:14], uint16(len(objBytes)))
@@ -219,15 +218,25 @@ func (w *WAL) migrateV1ToV2() error {
 }
 
 // parseV1WAL parses a v1 WAL byte slice (no magic, no CRC).
+// Validates each record's length fields to avoid huge allocations from
+// corrupted length values. A partial last record is treated as a torn write
+// (recovered records before it are returned).
 func parseV1WAL(data []byte) ([]walEntry, error) {
+	const maxEntryLen = 1 << 20 // 1 MiB sanity cap per field
+
 	var entries []walEntry
 	offset := 0
 	for offset+14 <= len(data) {
-		id := binary.BigEndian.Uint64(data[offset : offset+8])
 		subjLen := int(binary.BigEndian.Uint16(data[offset+8 : offset+10]))
 		predLen := int(binary.BigEndian.Uint16(data[offset+10 : offset+12]))
 		objLen := int(binary.BigEndian.Uint16(data[offset+12 : offset+14]))
 		offset += 14
+
+		// Validate per-field lengths against a sanity cap so a corrupted
+		// WAL can't trigger gigabyte allocations.
+		if subjLen > maxEntryLen || predLen > maxEntryLen || objLen > maxEntryLen {
+			return entries, fmt.Errorf("WAL v1 record at offset %d has implausible length (subj=%d, pred=%d, obj=%d)", offset-14, subjLen, predLen, objLen)
+		}
 
 		if offset+subjLen+predLen+objLen > len(data) {
 			// Partial last record — stop here (crash during write)
@@ -235,7 +244,6 @@ func parseV1WAL(data []byte) ([]walEntry, error) {
 		}
 
 		entry := walEntry{
-			id:      id,
 			subject: string(data[offset : offset+subjLen]),
 			pred:    string(data[offset+subjLen : offset+subjLen+predLen]),
 			object:  string(data[offset+subjLen+predLen : offset+subjLen+predLen+objLen]),
@@ -247,12 +255,18 @@ func parseV1WAL(data []byte) ([]walEntry, error) {
 }
 
 // Append writes a single entry to the WAL with CRC32C.
+// Returns nil if no WAL is configured (in-memory mode).
+// Returns ErrWALClosed if the WAL has been closed or is currently being cleared,
+// rather than silently dropping the entry.
 func (w *WAL) Append(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.file == nil {
+	if w.path == "" {
 		return nil
+	}
+	if w.file == nil {
+		return ErrWALClosed
 	}
 
 	subjBytes := []byte(entry.subject)
@@ -262,7 +276,7 @@ func (w *WAL) Append(entry walEntry) error {
 	payloadLen := len(subjBytes) + len(predBytes) + len(objBytes)
 	buf := make([]byte, walHeaderSize+payloadLen+walCRC32Size)
 
-	binary.BigEndian.PutUint64(buf[0:8], entry.id)
+	binary.BigEndian.PutUint64(buf[0:8], 0) // reserved (was walEntry.id; field removed)
 	binary.BigEndian.PutUint16(buf[8:10], uint16(len(subjBytes)))
 	binary.BigEndian.PutUint16(buf[10:12], uint16(len(predBytes)))
 	binary.BigEndian.PutUint16(buf[12:14], uint16(len(objBytes)))
@@ -335,12 +349,20 @@ func (w *WAL) readV2WAL() ([]walEntry, error) {
 	lastGoodCRC = true
 
 	for offset+walMinRecordLen <= len(data) {
-		id := binary.BigEndian.Uint64(data[offset : offset+8])
 		subjLen := int(binary.BigEndian.Uint16(data[offset+8 : offset+10]))
 		predLen := int(binary.BigEndian.Uint16(data[offset+10 : offset+12]))
 		objLen := int(binary.BigEndian.Uint16(data[offset+12 : offset+14]))
 		payloadLen := subjLen + predLen + objLen
 		recordLen := walHeaderSize + payloadLen + walCRC32Size
+
+		// Reject records with per-field lengths over the sanity cap (1 MiB)
+		// to prevent huge allocations on corrupted WAL data.
+		const maxEntryLen = 1 << 20
+		if subjLen > maxEntryLen || predLen > maxEntryLen || objLen > maxEntryLen {
+			slog.Warn("WAL v2 record has implausible length; stopping read", "offset", offset)
+			lastGoodCRC = false
+			break
+		}
 
 		if offset+recordLen > len(data) {
 			// Partial last record — expected after crash
@@ -360,7 +382,6 @@ func (w *WAL) readV2WAL() ([]walEntry, error) {
 		}
 
 		entry := walEntry{
-			id:      id,
 			subject: string(data[offset+14 : offset+14+subjLen]),
 			pred:    string(data[offset+14+subjLen : offset+14+subjLen+predLen]),
 			object:  string(data[offset+14+subjLen+predLen : offset+14+subjLen+predLen+objLen]),
@@ -384,8 +405,11 @@ func (w *WAL) Clear() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.file == nil {
+	if w.path == "" {
 		return nil
+	}
+	if w.file == nil {
+		return ErrWALClosed
 	}
 
 	// Close current file

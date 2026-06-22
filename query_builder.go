@@ -179,21 +179,19 @@ func (b *Builder) executeWithLFTJ(ctx context.Context, vecIter iter.Seq2[vector.
 
 	boundVars := map[string]uint64{}
 	for _, rel := range b.relations {
-		for pos, name := range rel.VariablePositions {
+		for _, name := range rel.VariablePositions {
 			if _, ok := boundVars[name]; !ok {
 				boundVars[name] = 0
 			}
-			_ = pos
 		}
 	}
 
 	seedVar := ""
 	for _, rel := range b.relations {
-		for pos, name := range rel.VariablePositions {
+		for _, name := range rel.VariablePositions {
 			if boundVars[name] == 0 {
 				seedVar = name
 				boundVars[name] = 0
-				_ = pos
 				break
 			}
 		}

@@ -31,7 +31,6 @@ func TestWALRoundTrip(t *testing.T) {
 	// Write 1000 entries
 	for i := 0; i < 1000; i++ {
 		entry := walEntry{
-			id:      uint64(i + 1),
 			subject: "sub_" + string(rune('A'+i%26)),
 			pred:    "pred",
 			object:  "obj_" + string(rune('A'+i%26)),
@@ -52,9 +51,6 @@ func TestWALRoundTrip(t *testing.T) {
 
 	// Verify entries are byte-identical (modulo header)
 	for i, e := range entries {
-		if e.id != uint64(i+1) {
-			t.Errorf("entry %d: id=%d, want %d", i, e.id, i+1)
-		}
 		if e.subject != "sub_"+string(rune('A'+i%26)) {
 			t.Errorf("entry %d: subject=%s", i, e.subject)
 		}
@@ -76,7 +72,6 @@ func TestWALPartialWrite(t *testing.T) {
 	// After 8-byte magic, records start at offset 8.
 	for i := 0; i < 10; i++ {
 		entry := walEntry{
-			id:      uint64(i + 1),
 			subject: "subject",   // 7 bytes
 			pred:    "predicate", // 9 bytes
 			object:  "object",    // 6 bytes → 22 payload
@@ -185,7 +180,6 @@ func TestWALAppendConcurrentWithRead(t *testing.T) {
 			j := 0
 			for time.Now().Before(deadline) {
 				entry := walEntry{
-					id:      uint64(id*100000 + j),
 					subject: "s",
 					pred:    "p",
 					object:  "o",
@@ -212,7 +206,7 @@ func TestWALAppendConcurrentWithRead(t *testing.T) {
 				}
 				// Validate no corrupted entries
 				for _, e := range entries {
-					if e.id == 0 && e.subject == "" && e.pred == "" && e.object == "" {
+					if e.subject == "" && e.pred == "" && e.object == "" {
 						continue
 					}
 				}
@@ -246,7 +240,6 @@ func TestWALClearConcurrentWithRead(t *testing.T) {
 		j := 0
 		for time.Now().Before(deadline) {
 			entry := walEntry{
-				id:      uint64(j),
 				subject: "s",
 				pred:    "p",
 				object:  "o",
@@ -346,7 +339,7 @@ func TestWALv2CorruptHeader(t *testing.T) {
 		t.Fatalf("NewWAL: %v", err)
 	}
 	for i := 0; i < 10; i++ {
-		if err := w.Append(walEntry{id: uint64(i + 1), subject: "s", pred: "p", object: "o"}); err != nil {
+		if err := w.Append(walEntry{subject: "s", pred: "p", object: "o"}); err != nil {
 			t.Fatalf("Append: %v", err)
 		}
 	}

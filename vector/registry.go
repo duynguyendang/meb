@@ -84,9 +84,26 @@ type VectorRegistry struct {
 	// Tombstone support for deferred segment cleanup in Reset()
 	tombstoneSegments []*mmapSegment
 	tombstoneWG       sync.WaitGroup
+
+	closed atomic.Bool
 }
 
 const hashSize = 1 // 1 byte for semantic hash filter per vector entry
+
+// appendRevMap extends the revMap by one entry. O(1) when pre-allocated capacity allows.
+// Must be called under mu.Lock().
+func (r *VectorRegistry) appendRevMap(id uint64) {
+	oldRev := r.revMap.Load()
+	if cap(*oldRev) > len(*oldRev) {
+		*oldRev = append(*oldRev, id)
+		r.revMap.Store(oldRev)
+	} else {
+		newRev := make([]uint64, len(*oldRev)+1, len(*oldRev)*2)
+		copy(newRev, *oldRev)
+		newRev[len(*oldRev)] = id
+		r.revMap.Store(&newRev)
+	}
+}
 
 func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 	if cfg == nil {
@@ -115,19 +132,30 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 		vectorSize:        vSize,
 		vectorsPerSegment: vectorsPerSeg,
 		idMap:             make(map[uint64]uint32, cfg.InitialCapacity),
-		revMap:            func() *atomic.Pointer[[]uint64] { p := &atomic.Pointer[[]uint64]{}; p.Store(new([]uint64)); return p }(),
-		db:                db,
+		revMap: func() *atomic.Pointer[[]uint64] {
+			p := &atomic.Pointer[[]uint64]{}
+			// Pre-allocate to VectorCapacity to avoid O(n²) copies during bulk load
+			rev := make([]uint64, 0, cfg.VectorCapacity)
+			p.Store(&rev)
+			return p
+		}(),
+		db: db,
 	}
 
 	return r
 }
 
 // Reset clears all vectors, mappings, and segment data from the registry.
-// Segment file IO (Munmap, Truncate, Close) is deferred for 5 seconds via a
-// tombstone barrier to allow in-flight Search() calls to drain their mmap reads.
-// Callers should wait 5s after Reset() before Close(), or use a synchronous
-// ResetNow(ctx) variant for immediate teardown.
+// Segment file IO (Munmap, Truncate, Close) is deferred for tombstoneBarrier
+// (5 seconds) via a tombstone barrier to allow in-flight Search() calls to
+// drain their mmap reads. Callers should wait 5s after Reset() before Close(),
+// or use a synchronous ResetNow(ctx) variant for immediate teardown.
+// Returns ErrClosed if the registry has already been closed.
 func (r *VectorRegistry) Reset() error {
+	if r.closed.Load() {
+		return ErrClosed
+	}
+
 	r.mu.Lock()
 
 	slog.Info("resetting vector registry",
@@ -225,6 +253,10 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.closed.Load() {
+		return ErrClosed
+	}
+
 	if idx, exists := r.idMap[id]; exists {
 		slot := r.getVectorSlice(int(idx))
 		slot[0] = semanticHash
@@ -239,11 +271,7 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 
 	idx := uint32(r.totalVectors)
 	r.idMap[id] = idx
-	oldRev := r.revMap.Load()
-	newRev := make([]uint64, len(*oldRev)+1)
-	copy(newRev, *oldRev)
-	newRev[len(*oldRev)] = id
-	r.revMap.Store(&newRev)
+	r.appendRevMap(id)
 
 	slot := r.getVectorSlice(int(idx))
 	slot[0] = semanticHash
@@ -282,7 +310,48 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		return fmt.Errorf("failed to persist vector to BadgerDB: %w", err)
 	}
 
-	return r.AddToMmapCache(id, fullVec, semanticHash)
+	return r.addMmapOnly(id, hybridData, semanticHash)
+}
+
+// addMmapOnly writes pre-quantized hybrid data directly to the mmap cache.
+// Skips re-quantization — called from AddWithHash where hybridData is already computed.
+func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash uint8) error {
+	hybridSize := len(hybridData)
+
+	if hashSize+hybridSize > r.vectorSize {
+		panic(fmt.Sprintf("vector slot too small: need %d, have %d (dim=%d, padded=%d)",
+			hashSize+hybridSize, r.vectorSize, r.config.FullDim, nextPow2(r.config.FullDim)))
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.closed.Load() {
+		return ErrClosed
+	}
+
+	if idx, exists := r.idMap[id]; exists {
+		slot := r.getVectorSlice(int(idx))
+		slot[0] = semanticHash
+		copy(slot[hashSize:hashSize+hybridSize], hybridData)
+		return nil
+	}
+
+	newTotal := r.totalVectors + 1
+	if err := r.ensureCapacity(newTotal); err != nil {
+		return err
+	}
+
+	idx := uint32(r.totalVectors)
+	r.idMap[id] = idx
+	r.appendRevMap(id)
+
+	slot := r.getVectorSlice(int(idx))
+	slot[0] = semanticHash
+	copy(slot[hashSize:hashSize+hybridSize], hybridData)
+
+	r.totalVectors = newTotal
+	return nil
 }
 
 func (r *VectorRegistry) Count() int {
@@ -290,16 +359,37 @@ func (r *VectorRegistry) Count() int {
 }
 
 func (r *VectorRegistry) Close() error {
+	r.closed.Store(true)
+
+	// Close current segments without holding the lock during IO.
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	segments := r.segments
+	r.segments = nil
+	r.mu.Unlock()
 
 	var lastErr error
-	for _, seg := range r.segments {
+	for _, seg := range segments {
 		if err := seg.close(); err != nil {
 			lastErr = err
 		}
 	}
-	r.segments = nil
+
+	// Wait for any in-flight tombstone cleanup goroutine. We release the
+	// lock during Wait so the goroutine can access tombstoneSegments.
+	r.tombstoneWG.Wait()
+
+	// After Wait, the goroutine has finished. Close any segments that
+	// were never processed (e.g. from a concurrent Reset that completed
+	// after Wait started).
+	r.mu.Lock()
+	for _, seg := range r.tombstoneSegments {
+		if err := seg.close(); err != nil && lastErr == nil {
+			lastErr = err
+		}
+	}
+	r.tombstoneSegments = nil
+	r.mu.Unlock()
+
 	return lastErr
 }
 
@@ -394,6 +484,7 @@ func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
 
 // snapshotChunkSize is the maximum number of vectors per snapshot chunk key.
 // This avoids allocating one giant contiguous buffer for all vectors.
+// BadgerDB has a 1MB value limit per key, so we cap at 900KB / vectorSize.
 const snapshotChunkSize = 10000
 
 func (r *VectorRegistry) SaveSnapshot() error {
@@ -413,12 +504,19 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		}
 	}
 
+	// Compute safe chunk size to stay under BadgerDB 1MB value limit.
+	// Reserve headroom for key overhead.
+	chunkSize := snapshotChunkSize
+	if maxBytes := 900000 / r.vectorSize; maxBytes > 0 && maxBytes < chunkSize {
+		chunkSize = maxBytes
+	}
+
 	batch := r.db.NewWriteBatch()
 	defer batch.Cancel()
 
 	// Save vectors in chunked keys to avoid a single giant allocation
-	for start := 0; start < numVectors; start += snapshotChunkSize {
-		end := start + snapshotChunkSize
+	for start := 0; start < numVectors; start += chunkSize {
+		end := start + chunkSize
 		if end > numVectors {
 			end = numVectors
 		}
@@ -429,16 +527,16 @@ func (r *VectorRegistry) SaveSnapshot() error {
 			off := (i - start) * r.vectorSize
 			copy(buf[off:off+r.vectorSize], slot)
 		}
-		key := fmt.Appendf(nil, "sys:tq:vectors:%d", start/snapshotChunkSize)
+		key := fmt.Appendf(nil, "sys:tq:vectors:%d", start/chunkSize)
 		if err := batch.Set(key, buf); err != nil {
-			return fmt.Errorf("failed to save TQ vector chunk %d: %w", start/snapshotChunkSize, err)
+			return fmt.Errorf("failed to save TQ vector chunk %d: %w", start/chunkSize, err)
 		}
 	}
 
 	// Save IDs in chunked keys
 	revMap := *r.revMap.Load()
-	for start := 0; start < numVectors; start += snapshotChunkSize {
-		end := start + snapshotChunkSize
+	for start := 0; start < numVectors; start += chunkSize {
+		end := start + chunkSize
 		if end > numVectors {
 			end = numVectors
 		}
@@ -446,15 +544,16 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		for i := start; i < end; i++ {
 			binary.BigEndian.PutUint64(idsBytes[(i-start)*8:(i-start+1)*8], revMap[i])
 		}
-		key := fmt.Appendf(nil, "sys:tq:ids:%d", start/snapshotChunkSize)
+		key := fmt.Appendf(nil, "sys:tq:ids:%d", start/chunkSize)
 		if err := batch.Set(key, idsBytes); err != nil {
-			return fmt.Errorf("failed to save TQ id chunk %d: %w", start/snapshotChunkSize, err)
+			return fmt.Errorf("failed to save TQ id chunk %d: %w", start/chunkSize, err)
 		}
 	}
 
-	// Save metadata: total count
-	metaBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(metaBuf, uint64(numVectors))
+	// Save metadata: total count + vector size for validation on load
+	metaBuf := make([]byte, 16)
+	binary.BigEndian.PutUint64(metaBuf[0:], uint64(numVectors))
+	binary.BigEndian.PutUint64(metaBuf[8:], uint64(r.vectorSize))
 	if err := batch.Set([]byte("sys:tq:meta"), metaBuf); err != nil {
 		return fmt.Errorf("failed to save TQ snapshot meta: %w", err)
 	}
@@ -510,11 +609,20 @@ func (r *VectorRegistry) LoadSnapshot() error {
 
 func (r *VectorRegistry) loadChunkedSnapshot(txn *badger.Txn, metaItem *badger.Item) error {
 	var numTotal uint64
+	var savedVectorSize uint64
 	if err := metaItem.Value(func(val []byte) error {
 		numTotal = binary.BigEndian.Uint64(val)
+		if len(val) >= 16 {
+			savedVectorSize = binary.BigEndian.Uint64(val[8:])
+		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to read snapshot meta: %w", err)
+	}
+
+	// Validate vector size matches current config (clean break format change)
+	if savedVectorSize > 0 && uint64(r.vectorSize) != savedVectorSize {
+		return fmt.Errorf("snapshot vector size mismatch: saved=%d, current=%d (clean break: recreate snapshot)", savedVectorSize, r.vectorSize)
 	}
 
 	numVectors := int(numTotal)
@@ -628,10 +736,7 @@ func (r *VectorRegistry) loadFromBadger(txn *badger.Txn) error {
 			}
 
 			r.idMap[id] = idx
-			newRev := make([]uint64, len(*r.revMap.Load())+1)
-			copy(newRev, *r.revMap.Load())
-			newRev[len(newRev)-1] = id
-			r.revMap.Store(&newRev)
+			r.appendRevMap(id)
 
 			slot := r.getVectorSlice(int(idx))
 			slot[0] = hashByte

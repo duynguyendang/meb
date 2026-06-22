@@ -131,31 +131,56 @@ func (m *MEBStore) replayWAL() error {
 
 	slog.Info("replaying WAL", "entries", len(entries))
 
-	// Build set of existing facts to prevent duplicates on replay
-	existingFacts, err := m.buildExistingFactSet()
-	if err != nil {
-		return fmt.Errorf("failed to build existing fact set: %w", err)
-	}
+	// Dedup threshold: beyond this, skip the in-memory fact set and
+	// replay all WAL entries (AddFactBatch is idempotent at the KV
+	// level since BadgerDB keys encode the full triple, so overwrites
+	// are harmless). This avoids hoarding a multi-GB map when the
+	// database or WAL is very large.
+	const dedupMaxEntries = 100000
+	skipDedup := len(entries) > dedupMaxEntries
 
-	facts := make([]Fact, 0, len(entries))
+	var facts []Fact
 	duplicatesSkipped := 0
-	for _, e := range entries {
-		fact := Fact{
-			Subject:   e.subject,
-			Predicate: e.pred,
-			Object:    e.object,
+
+	if skipDedup {
+		slog.Info("WAL replay skipping dedup (exceeded threshold)", "threshold", dedupMaxEntries)
+		facts = make([]Fact, 0, len(entries))
+		for _, e := range entries {
+			fact := Fact{
+				Subject:   e.subject,
+				Predicate: e.pred,
+				Object:    e.object,
+			}
+			if fact.Object == nil && fact.Predicate != "" {
+				fact.Object = ""
+			}
+			facts = append(facts, fact)
 		}
-		if fact.Object == nil && fact.Predicate != "" {
-			fact.Object = ""
+	} else {
+		// Build set of existing facts to prevent duplicates on replay
+		existingFacts, err := m.buildExistingFactSet()
+		if err != nil {
+			return fmt.Errorf("failed to build existing fact set: %w", err)
 		}
 
-		// Check if fact already exists (idempotent replay)
-		factKey := factKeyString(fact)
-		if existingFacts[factKey] {
-			duplicatesSkipped++
-			continue
+		facts = make([]Fact, 0, len(entries))
+		for _, e := range entries {
+			fact := Fact{
+				Subject:   e.subject,
+				Predicate: e.pred,
+				Object:    e.object,
+			}
+			if fact.Object == nil && fact.Predicate != "" {
+				fact.Object = ""
+			}
+
+			factKey := factKeyString(fact)
+			if existingFacts[factKey] {
+				duplicatesSkipped++
+				continue
+			}
+			facts = append(facts, fact)
 		}
-		facts = append(facts, fact)
 	}
 
 	if len(facts) > 0 {
@@ -760,6 +785,12 @@ func (m *MEBStore) runCleanupLoop() {
 				return
 			}
 			m.runCleanup()
+			// Check generation again after runCleanup completes — a Reset()
+			// that started during runCleanup() increments cleanupGen, and
+			// without this check we'd continue with stale state.
+			if m.cleanupGen.Load() != myGen {
+				return
+			}
 		}
 	}
 }

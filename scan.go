@@ -314,6 +314,9 @@ func restoreTypedValue(s string) any {
 }
 
 // decodeInlineID converts an inline ID back to its Go primitive value.
+// The caller must have already verified IsInline(id) — if called on a
+// non-inline ID the result is undefined. If the type bits (bits 38-37)
+// are in an unexpected state, bool is returned as a safe default.
 func decodeInlineID(id uint64) any {
 	if id&keys.InlineIsNum != 0 {
 		// Number type
@@ -322,7 +325,7 @@ func decodeInlineID(id uint64) any {
 		}
 		return keys.UnpackInlineInt32(id)
 	}
-	// Bool type
+	// Bool type (or unrecognized — fall through to bool as safe default)
 	return keys.UnpackInlineBool(id)
 }
 

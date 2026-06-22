@@ -10,6 +10,11 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
+// DefaultMaxPartitions limits the number of topic partitions retained in a
+// PartitionedRegistry. Beyond this threshold, new GetPartition calls return
+// the existing partition without creating new ones.
+const DefaultMaxPartitions = 1000
+
 // PartitionedRegistry shards vectors by TopicID for distributed scale.
 // Each topic gets its own independent VectorRegistry with separate mmap segments.
 // Searches can be scoped to a single topic or broadcast across all topics.
@@ -17,8 +22,9 @@ type PartitionedRegistry struct {
 	db     *badger.DB
 	config *Config
 
-	mu         sync.RWMutex
-	partitions map[uint32]*VectorRegistry
+	mu            sync.RWMutex
+	partitions    map[uint32]*VectorRegistry
+	maxPartitions int
 }
 
 // NewPartitionedRegistry creates a sharded vector registry.
@@ -28,14 +34,29 @@ func NewPartitionedRegistry(db *badger.DB, cfg *Config) *PartitionedRegistry {
 		cfg = DefaultConfig()
 	}
 	return &PartitionedRegistry{
-		db:         db,
-		config:     cfg,
-		partitions: make(map[uint32]*VectorRegistry),
+		db:            db,
+		config:        cfg,
+		partitions:    make(map[uint32]*VectorRegistry),
+		maxPartitions: DefaultMaxPartitions,
 	}
 }
 
+// SetMaxPartitions sets the maximum number of topic partitions. Calls to
+// GetPartition beyond this limit return the last accessed partition instead
+// of creating a new one.
+func (p *PartitionedRegistry) SetMaxPartitions(n int) {
+	if n <= 0 {
+		n = DefaultMaxPartitions
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.maxPartitions = n
+}
+
 // GetPartition returns the VectorRegistry for a specific topic.
-// Creates a new partition if it doesn't exist.
+// Creates a new partition if it doesn't exist, subject to the max
+// partitions limit. Once the limit is reached, calls for unknown topics
+// return nil — callers should use an overflow/default partition.
 func (p *PartitionedRegistry) GetPartition(topicID uint32) *VectorRegistry {
 	p.mu.RLock()
 	part, ok := p.partitions[topicID]
@@ -52,9 +73,44 @@ func (p *PartitionedRegistry) GetPartition(topicID uint32) *VectorRegistry {
 		return part
 	}
 
+	if len(p.partitions) >= p.maxPartitions {
+		return nil
+	}
+
 	part = NewRegistry(p.db, p.config)
 	p.partitions[topicID] = part
 	return part
+}
+
+// RemovePartition closes and removes the partition for the given topicID.
+// After calling this, GetPartition(topicID) will create a fresh registry.
+func (p *PartitionedRegistry) RemovePartition(topicID uint32) error {
+	p.mu.Lock()
+	part, ok := p.partitions[topicID]
+	if !ok {
+		p.mu.Unlock()
+		return nil
+	}
+	delete(p.partitions, topicID)
+	p.mu.Unlock()
+
+	return part.Close()
+}
+
+// ClearPartitions removes and closes all partitions.
+func (p *PartitionedRegistry) ClearPartitions() error {
+	p.mu.Lock()
+	parts := p.partitions
+	p.partitions = make(map[uint32]*VectorRegistry)
+	p.mu.Unlock()
+
+	var firstErr error
+	for _, part := range parts {
+		if err := part.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Add adds a vector to the partition for the given topicID.

@@ -11,6 +11,10 @@ import (
 	"unsafe"
 )
 
+// tombstoneBarrier is the delay before tombstoned mmap segments are unmapped.
+// This allows in-flight Search() calls to drain their mmap reads.
+const tombstoneBarrier = 5 * time.Second
+
 // mmapSegment represents a single memory-mapped file segment.
 type mmapSegment struct {
 	file       *os.File
@@ -75,8 +79,8 @@ func (seg *mmapSegment) sync() error {
 func cleanupTombstonedSegments(segs []*mmapSegment, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// 5-second barrier for in-flight Search calls to drain their mmap reads
-	time.Sleep(5 * time.Second)
+	// tombstoneBarrier delay for in-flight Search calls to drain their mmap reads
+	time.Sleep(tombstoneBarrier)
 
 	for _, seg := range segs {
 		if seg == nil {

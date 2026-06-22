@@ -2,6 +2,7 @@ package keys
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"sync"
@@ -202,9 +203,7 @@ func EncodeTripleKey(prefix byte, s, p, o uint64) []byte {
 		binary.BigEndian.PutUint64(key[9:17], p)
 		binary.BigEndian.PutUint64(key[17:25], s)
 	default:
-		binary.BigEndian.PutUint64(key[1:9], s)
-		binary.BigEndian.PutUint64(key[9:17], p)
-		binary.BigEndian.PutUint64(key[17:25], o)
+		panic(fmt.Sprintf("EncodeTripleKey: unknown prefix 0x%02x", prefix))
 	}
 
 	return key
@@ -324,9 +323,7 @@ func EncodeTripleKeyInto(buf []byte, prefix byte, s, p, o uint64) []byte {
 		binary.BigEndian.PutUint64(buf[9:17], p)
 		binary.BigEndian.PutUint64(buf[17:25], s)
 	default:
-		binary.BigEndian.PutUint64(buf[1:9], s)
-		binary.BigEndian.PutUint64(buf[9:17], p)
-		binary.BigEndian.PutUint64(buf[17:25], o)
+		panic(fmt.Sprintf("EncodeTripleKeyInto: unknown prefix 0x%02x", prefix))
 	}
 
 	return buf
