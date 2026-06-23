@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"log/slog"
 
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/query"
@@ -40,6 +41,7 @@ type Builder struct {
 	topicID             uint32
 	relations           []query.RelationPattern
 	resultVars          []string
+	filterFirst         bool // predicate pushdown: evaluate filters before vector search
 }
 
 func NewBuilder(store Store) *Builder {
@@ -79,6 +81,22 @@ func (b *Builder) CandidateMultiplier(multiplier int) *Builder {
 	return b
 }
 
+// FilterFirst enables candidate-set pre-filtering for this query.
+// When enabled, filters are evaluated against the graph index FIRST,
+// building a set of matching subject IDs. Vector search results that
+// aren't in this set are then skipped in the result loop (post-filter).
+//
+// Important: This is NOT true predicate pushdown — vector search still
+// scans all vectors and computes similarities for all candidates. The
+// benefit comes from skipping dictionary lookups and content fetches
+// for non-matching vectors. Most effective when:
+//   - Filters are highly selective (< 10% match rate)
+//   - Content fetch or dict lookup is expensive relative to vector search
+func (b *Builder) FilterFirst() *Builder {
+	b.filterFirst = true
+	return b
+}
+
 // InTopic restricts the search to a specific topic.
 // The TopicID is used for topic-aware vector search and scan operations.
 func (b *Builder) InTopic(topicID uint32) *Builder {
@@ -96,6 +114,8 @@ func (b *Builder) JoinWithLFTJ(relations []query.RelationPattern, resultVars []s
 }
 
 // Execute runs the query with the given context for cancellation support.
+// When filters are present and filter-first is enabled, filters are evaluated
+// against the graph index FIRST, then vector search runs only on matching candidates.
 func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 	if len(b.vectorQuery) == 0 {
 		return nil, fmt.Errorf("query must include SimilarTo() vector search")
@@ -104,6 +124,20 @@ func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 	candidateK := b.limit * b.candidateMultiplier
 	if candidateK < 100 {
 		candidateK = 100
+	}
+
+	// Predicate pushdown: if filters are present and filter-first is enabled,
+	// build a candidate set from the graph index first, then restrict vector search.
+	var filterCandidateSet map[uint64]struct{}
+	usePushdown := b.filterFirst && len(b.filters) > 0
+
+	if usePushdown {
+		filterCandidateSet = b.buildFilterCandidateSet(ctx)
+		slog.Debug("predicate pushdown",
+			"filters", len(b.filters),
+			"candidates", len(filterCandidateSet),
+			"candidateK", candidateK,
+		)
 	}
 
 	var vecIter iter.Seq2[vector.SearchResult, error]
@@ -126,6 +160,13 @@ func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 
 		if b.threshold > 0 && vecResult.Score < b.threshold {
 			continue
+		}
+
+		// If using predicate pushdown, skip candidates not in the set
+		if usePushdown {
+			if _, ok := filterCandidateSet[vecResult.ID]; !ok {
+				continue
+			}
 		}
 
 		candidateKey, err := b.store.ResolveID(vecResult.ID)
@@ -154,6 +195,54 @@ func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 	}
 
 	return results, nil
+}
+
+// buildFilterCandidateSet scans the graph index to find all subject IDs
+// that match the query's filters. Uses prefix-scanned SPO/OPS lookups
+// for efficiency. Returns nil if no filter is specified.
+func (b *Builder) buildFilterCandidateSet(ctx context.Context) map[uint64]struct{} {
+	if len(b.filters) == 0 {
+		return nil
+	}
+
+	// Use the first filter to build the initial candidate set.
+	// Using Scan with bound predicate + object is an OPS index prefix
+	// scan — the most efficient lookup.
+	filter := b.filters[0]
+	candidates := make(map[uint64]struct{})
+
+	scanIter := b.store.Scan("", filter.Predicate, fmt.Sprintf("%v", filter.Object))
+	for fact, err := range scanIter {
+		if err != nil {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			break
+		}
+
+		// Resolve the subject to an ID
+		id, err := b.store.Dict().GetID(fact.Subject)
+		if err != nil {
+			continue
+		}
+		candidates[id] = struct{}{}
+	}
+
+	// Apply remaining filters — narrow down the candidate set
+	for _, f := range b.filters[1:] {
+		for id := range candidates {
+			key, err := b.store.ResolveID(id)
+			if err != nil {
+				delete(candidates, id)
+				continue
+			}
+			if !b.store.Exists(key, f.Predicate, fmt.Sprintf("%v", f.Object)) {
+				delete(candidates, id)
+			}
+		}
+	}
+
+	return candidates
 }
 
 func (b *Builder) executeWithLFTJ(ctx context.Context, vecIter iter.Seq2[vector.SearchResult, error], results []Result) ([]Result, error) {

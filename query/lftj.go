@@ -88,16 +88,46 @@ func (r LFTJResult) Canonical() string {
 // LFTJ traverses all relations simultaneously via trie iterators,
 // yielding results one-by-one at the deepest level.
 type LFTJEngine struct {
-	db *badger.DB
+	db        *badger.DB
+	planCache *QueryPlanCache // per-engine plan cache, lazy-init
 }
 
 func NewLFTJEngine(db *badger.DB) *LFTJEngine {
 	return &LFTJEngine{db: db}
 }
 
-// Execute runs a multi-way join query. A shared *atomic.Int64 in ctx limits
-// total BadgerDB operations (protects against runaway joins).
+// Execute runs a multi-way join query. Uses CBO (Cost-Based Optimization)
+// by default to reorder relations for minimal join effort.
+// The join order is determined by estimated cardinality — smallest-first.
 func (e *LFTJEngine) Execute(
+	ctx context.Context,
+	relations []RelationPattern,
+	boundVars map[string]uint64,
+	resultVars []string,
+	opts ...ExecuteOption,
+) iter.Seq2[map[string]uint64, error] {
+	cfg := executeConfig{enableCBO: true}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	// Apply CBO if enabled
+	optimizedRelations := relations
+	if cfg.enableCBO && len(relations) > 1 {
+		if optimized, estimatedCount := e.OptimizeRelationsWithCache(ctx, relations, boundVars); optimized != nil && estimatedCount > 0 {
+			optimizedRelations = optimized
+			slog.Debug("LFTJ: using CBO-optimized join order",
+				"original", len(relations),
+				"estimated", estimatedCount,
+			)
+		}
+	}
+
+	return e.executeInternal(ctx, optimizedRelations, boundVars, resultVars)
+}
+
+// executeInternal is the core LFTJ join implementation (no CBO wrapping).
+func (e *LFTJEngine) executeInternal(
 	ctx context.Context,
 	relations []RelationPattern,
 	boundVars map[string]uint64,
