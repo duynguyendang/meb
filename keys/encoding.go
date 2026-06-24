@@ -14,6 +14,12 @@ const (
 
 	ChunkPrefix      byte = 0x10
 	VectorFullPrefix byte = 0x11
+	HNSWPrefix       byte = 0x12
+
+	IVFCentroidPrefix  byte = 0x13
+	IVFPostingPrefix   byte = 0x14
+	IVFCodebookPrefix  byte = 0x15
+	IVFRawVectorPrefix byte = 0x16
 
 	ForwardDictPrefix byte = 0x80
 	ReverseDictPrefix byte = 0x81
@@ -288,6 +294,14 @@ func EncodeVectorFullKey(id uint64) []byte {
 	return k
 }
 
+// EncodeIVFRawVectorKey returns the key for a raw float32 vector in the IVF-PQ index.
+func EncodeIVFRawVectorKey(topicID uint32, localID uint64) []byte {
+	k := make([]byte, ChunkKeySize)
+	k[0] = IVFRawVectorPrefix
+	binary.BigEndian.PutUint64(k[1:], PackID(topicID, localID))
+	return k
+}
+
 // TripleValueSize is the size of a triple value in bytes (exported for pools).
 const TripleValueSize = 16
 
@@ -336,5 +350,102 @@ func EncodeTripleValueWithHintsInto(buf []byte, vectorID uint64, contentOffset u
 	packed := (uint64(hints) << 48) | (contentOffset & ((1 << 48) - 1))
 	binary.BigEndian.PutUint64(buf[0:8], vectorID)
 	binary.BigEndian.PutUint64(buf[8:16], packed)
+	return buf
+}
+
+// --- IVF-PQ Key Encoding ---
+
+// EncodeIVFCentroidKey builds a 9-byte key:
+// [0x13][TopicID:24][CentroidID:4]
+func EncodeIVFCentroidKey(topicID uint32, centroidID uint32) []byte {
+	buf := make([]byte, 9)
+	buf[0] = IVFCentroidPrefix
+	binary.BigEndian.PutUint32(buf[1:5], topicID)
+	binary.BigEndian.PutUint32(buf[5:9], centroidID)
+	return buf
+}
+
+// EncodeIVFPostingKey builds a 14-byte key:
+// [0x14][TopicID:24][CentroidID:4][LocalID:40]
+func EncodeIVFPostingKey(topicID uint32, centroidID uint32, localID uint64) []byte {
+	buf := make([]byte, 14)
+	buf[0] = IVFPostingPrefix
+	binary.BigEndian.PutUint32(buf[1:5], topicID)
+	binary.BigEndian.PutUint32(buf[5:9], centroidID)
+	buf[9] = byte(localID >> 32)
+	binary.BigEndian.PutUint32(buf[10:14], uint32(localID))
+	return buf
+}
+
+// IVFPostingPrefixByTopic returns the prefix to scan all postings for a topic:
+// [0x14][TopicID:24] — 5 bytes
+func IVFPostingPrefixByTopic(topicID uint32) []byte {
+	buf := make([]byte, 5)
+	buf[0] = IVFPostingPrefix
+	binary.BigEndian.PutUint32(buf[1:5], topicID)
+	return buf
+}
+
+// IVFPostingPrefixByCentroid returns the prefix to scan all postings for a centroid:
+// [0x14][TopicID:24][CentroidID:4] — 9 bytes
+func IVFPostingPrefixByCentroid(topicID uint32, centroidID uint32) []byte {
+	return EncodeIVFPostingKey(topicID, centroidID, 0)[:9]
+}
+
+// ExtractLocalIDFromPostingKey extracts the 40-bit LocalID from a posting key.
+func ExtractLocalIDFromPostingKey(key []byte) uint64 {
+	if len(key) < 14 {
+		return 0
+	}
+	return (uint64(key[9]) << 32) | uint64(binary.BigEndian.Uint32(key[10:14]))
+}
+
+// ExtractCentroidIDFromPostingKey extracts the 32-bit CentroidID from a posting key.
+func ExtractCentroidIDFromPostingKey(key []byte) uint32 {
+	if len(key) < 9 {
+		return 0
+	}
+	return binary.BigEndian.Uint32(key[5:9])
+}
+
+// --- HNSW Key Encoding ---
+
+// EncodeHNSWKey builds a 10-byte HNSW key: [0x12][packedNodeID:8][level:1]
+func EncodeHNSWKey(packedNodeID uint64, level int) []byte {
+	buf := make([]byte, 10)
+	buf[0] = HNSWPrefix
+	binary.BigEndian.PutUint64(buf[1:9], packedNodeID)
+	buf[9] = byte(level)
+	return buf
+}
+
+// EncodeHNSWTombstoneKey builds a 10-byte tombstone key: [0x12][0xFF][packedNodeID:8]
+func EncodeHNSWTombstoneKey(packedNodeID uint64) []byte {
+	buf := make([]byte, 10)
+	buf[0] = HNSWPrefix
+	buf[1] = 0xFF // tombstone marker
+	binary.BigEndian.PutUint64(buf[2:10], packedNodeID)
+	return buf
+}
+
+// HNSWTopicPrefix returns the topic-scoped prefix for prefix-scan.
+// HNSW key = [0x12][packedNodeID:8][level:1]. packedNodeID = PackID(topicID, localID)
+// where topicID is in the upper 24 bits (bytes 0-2 of the uint64 in big-endian).
+// Prefix = [0x12][topicID bytes 0-2] = 4 bytes.
+func HNSWTopicPrefix(topicID uint32) []byte {
+	buf := make([]byte, 4)
+	buf[0] = HNSWPrefix
+	buf[1] = byte(topicID >> 16)
+	buf[2] = byte(topicID >> 8)
+	buf[3] = byte(topicID)
+	return buf
+}
+
+// HNSWNodePrefix returns the prefix for all levels of a node:
+// [0x12][packedNodeID:8] (9 bytes)
+func HNSWNodePrefix(packedNodeID uint64) []byte {
+	buf := make([]byte, 9)
+	buf[0] = HNSWPrefix
+	binary.BigEndian.PutUint64(buf[1:9], packedNodeID)
 	return buf
 }

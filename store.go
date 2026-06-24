@@ -35,6 +35,9 @@ type MEBStore struct {
 	vectors *vector.VectorRegistry
 	breaker *circuit.Breaker
 
+	ivfpq *vector.IVFPQIndex
+	hnsw  *vector.HNSWIndex
+
 	// TopicID for symmetric bit-packing (24-bit, supports 16M topics)
 	topicID atomic.Uint32
 
@@ -531,6 +534,23 @@ func (m *MEBStore) RecalculateStats() (uint64, error) {
 
 func (m *MEBStore) Vectors() *vector.VectorRegistry {
 	return m.vectors
+}
+
+func (st *MEBStore) EnableIVFPQ(cfg *vector.IVFPQConfig) error {
+	st.ivfpq = vector.NewIVFPQIndex(st.db, cfg, st.vectors.FullDim())
+	return nil
+}
+
+func (st *MEBStore) EnableHNSW(cfg *vector.HNSWConfig) error {
+	st.hnsw = vector.NewHNSWIndex(st.db, cfg, st.vectors.FullDim())
+	return nil
+}
+
+func (st *MEBStore) TrainIVFPQ(topicID uint32) error {
+	if st.ivfpq == nil {
+		return fmt.Errorf("IVF-PQ not configured")
+	}
+	return st.ivfpq.Train(topicID, 0)
 }
 
 func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
@@ -1051,6 +1071,19 @@ func (m *MEBStore) FindSubjectsByObject(ctx context.Context, predicate, object s
 			}
 		}
 	}
+}
+
+// FilterOpt is a filter option for hybrid search.
+type FilterOpt struct {
+	Predicate string
+	Object    interface{}
+}
+
+func estimateSelectivity(filters []FilterOpt) float64 {
+	if len(filters) == 0 {
+		return 1.0
+	}
+	return 0.1
 }
 
 // hasPrefix checks if s starts with prefix.

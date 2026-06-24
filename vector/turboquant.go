@@ -59,6 +59,20 @@ func HybridVectorSize(dim int, cfg *HybridConfig) int {
 	}
 }
 
+// PadAndTransform pads fullVec to paddedDim, applies FWHT, and normalizes.
+// Returns a transformed vector suitable for downstream quantization or distance
+// computation. The output is always paddedDim float32 values.
+func PadAndTransform(fullVec []float32, paddedDim int) []float32 {
+	x := make([]float32, paddedDim)
+	copy(x, fullVec)
+	FWHT(x)
+	norm := 1.0 / float32(math.Sqrt(float64(paddedDim)))
+	for i := range x {
+		x[i] *= norm
+	}
+	return x
+}
+
 func QuantizeHybrid(vec []float32, cfg *HybridConfig) []byte {
 	if cfg == nil {
 		cfg = DefaultHybridConfig()
@@ -68,15 +82,7 @@ func QuantizeHybrid(vec []float32, cfg *HybridConfig) []byte {
 	cfg.ensureDerived(dim)
 	paddedDim := cfg.paddedDim
 
-	padded := make([]float32, paddedDim)
-	copy(padded, vec)
-
-	FWHT(padded)
-
-	invNorm := 1.0 / float32(math.Sqrt(float64(paddedDim)))
-	for i := range padded {
-		padded[i] *= invNorm
-	}
+	padded := PadAndTransform(vec, paddedDim)
 
 	blockSize := cfg.BlockSize
 	numBlocks := cfg.numBlocks

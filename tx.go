@@ -7,6 +7,7 @@ import (
 
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
+	"github.com/duynguyendang/meb/query"
 	"github.com/duynguyendang/meb/vector"
 
 	"github.com/dgraph-io/badger/v4"
@@ -273,6 +274,80 @@ func (t *StoreTxn) deleteDocumentInTxnDeferred(docKey string, topicID uint32) er
 	})
 
 	return nil
+}
+
+// AddIVFVector adds a vector to the IVF-PQ index.
+func (t *StoreTxn) AddIVFVector(topicID uint32, localID uint64, fullVec []float32) error {
+	if t.store.ivfpq == nil {
+		return fmt.Errorf("IVF-PQ index not configured")
+	}
+	return t.store.ivfpq.AddVector(t.txn, topicID, localID, fullVec)
+}
+
+// SearchHybrid uses the RBO to select the optimal search strategy.
+func (t *StoreTxn) SearchHybrid(ctx context.Context, queryVec []float32, k int) ([]Result, error) {
+	return t.SearchHybridWithFilters(ctx, queryVec, k, nil)
+}
+
+// SearchHybridWithFilters is like SearchHybrid but accepts optional FilterOpt filters.
+func (t *StoreTxn) SearchHybridWithFilters(ctx context.Context, queryVec []float32, k int, filters []FilterOpt) ([]Result, error) {
+	plan := query.Optimize(len(queryVec) > 0, len(filters), estimateSelectivity(filters))
+
+	switch plan.Type {
+	case query.PureVectorSearch:
+		return t.executeVectorSearch(ctx, queryVec, k)
+	case query.PureLFTJ:
+		return t.executeLFTJSearch(ctx, filters, k)
+	case query.GraphFirst, query.VectorFirst, query.IntersectionFirst:
+		return t.executeHybridSearch(ctx, queryVec, k, filters, plan)
+	default:
+		return t.executeVectorSearch(ctx, queryVec, k)
+	}
+}
+
+func (t *StoreTxn) executeVectorSearch(ctx context.Context, queryVec []float32, k int) ([]Result, error) {
+	var results []Result
+	for sr, err := range t.store.Vectors().Search(ctx, queryVec, k) {
+		if err != nil {
+			return nil, err
+		}
+		key, err := t.store.Dict().GetString(keys.UnpackLocalID(sr.ID))
+		if err != nil {
+			continue
+		}
+		results = append(results, Result{
+			ID:    sr.ID,
+			Key:   key,
+			Score: sr.Score,
+		})
+	}
+	return results, nil
+}
+
+func (t *StoreTxn) executeLFTJSearch(ctx context.Context, filters []FilterOpt, k int) ([]Result, error) {
+	if len(filters) == 0 {
+		return nil, nil
+	}
+	b := NewBuilder(t.store)
+	for _, f := range filters {
+		b = b.Where(f.Predicate, f.Object)
+	}
+	b.Limit(k)
+	return b.Execute(ctx)
+}
+
+func (t *StoreTxn) executeHybridSearch(ctx context.Context, queryVec []float32, k int, filters []FilterOpt, plan query.ExecutionPlan) ([]Result, error) {
+	if len(filters) == 0 {
+		return t.executeVectorSearch(ctx, queryVec, k)
+	}
+
+	b := NewBuilder(t.store).
+		SimilarTo(queryVec).
+		Limit(k)
+	for _, f := range filters {
+		b = b.Where(f.Predicate, f.Object)
+	}
+	return b.Execute(ctx)
 }
 
 // Exists checks if a fact exists within the transaction.

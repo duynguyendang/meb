@@ -489,6 +489,154 @@ func TestInlineNoCollisionWithTopicIDBoundary(t *testing.T) {
 	}
 }
 
+func TestEncodeIVFCentroidKey(t *testing.T) {
+	tests := []struct {
+		topicID    uint32
+		centroidID uint32
+	}{
+		{1, 0},
+		{1, 255},
+		{100, 1023},
+		{0xFFFFFF, 0xFFFFFFFF},
+	}
+	for _, tt := range tests {
+		key := EncodeIVFCentroidKey(tt.topicID, tt.centroidID)
+		if len(key) != 9 {
+			t.Fatalf("key size = %d, want 9", len(key))
+		}
+		if key[0] != IVFCentroidPrefix {
+			t.Errorf("prefix = 0x%02x, want 0x%02x", key[0], IVFCentroidPrefix)
+		}
+		gotTopic := binary.BigEndian.Uint32(key[1:5])
+		if gotTopic != tt.topicID {
+			t.Errorf("topicID = %d, want %d", gotTopic, tt.topicID)
+		}
+		gotCentroid := binary.BigEndian.Uint32(key[5:9])
+		if gotCentroid != tt.centroidID {
+			t.Errorf("centroidID = %d, want %d", gotCentroid, tt.centroidID)
+		}
+	}
+}
+
+func TestEncodeIVFPostingKey(t *testing.T) {
+	topicID := uint32(1)
+	centroidID := uint32(42)
+	localID := uint64(0xABCDEF1234)
+
+	key := EncodeIVFPostingKey(topicID, centroidID, localID)
+	if len(key) != 14 {
+		t.Fatalf("key size = %d, want 14", len(key))
+	}
+	if key[0] != IVFPostingPrefix {
+		t.Errorf("prefix = 0x%02x, want 0x%02x", key[0], IVFPostingPrefix)
+	}
+
+	gotLocal := ExtractLocalIDFromPostingKey(key)
+	if gotLocal != localID {
+		t.Errorf("localID = 0x%x, want 0x%x", gotLocal, localID)
+	}
+
+	gotCentroid := ExtractCentroidIDFromPostingKey(key)
+	if gotCentroid != centroidID {
+		t.Errorf("centroidID = %d, want %d", gotCentroid, centroidID)
+	}
+}
+
+func TestIVFPostingPrefixes(t *testing.T) {
+	topicID := uint32(42)
+	centroidID := uint32(7)
+
+	topicPrefix := IVFPostingPrefixByTopic(topicID)
+	if len(topicPrefix) != 5 {
+		t.Fatalf("topic prefix size = %d, want 5", len(topicPrefix))
+	}
+	if topicPrefix[0] != IVFPostingPrefix {
+		t.Errorf("prefix = 0x%02x", topicPrefix[0])
+	}
+
+	centroidPrefix := IVFPostingPrefixByCentroid(topicID, centroidID)
+	if len(centroidPrefix) != 9 {
+		t.Fatalf("centroid prefix size = %d, want 9", len(centroidPrefix))
+	}
+	if centroidPrefix[0] != IVFPostingPrefix {
+		t.Errorf("prefix = 0x%02x", centroidPrefix[0])
+	}
+}
+
+func TestExtractIDsFromShortKey(t *testing.T) {
+	short := []byte{IVFPostingPrefix, 0, 0, 0, 1}
+	if id := ExtractLocalIDFromPostingKey(short); id != 0 {
+		t.Errorf("expected 0 for short key, got %d", id)
+	}
+	if id := ExtractCentroidIDFromPostingKey(short); id != 0 {
+		t.Errorf("expected 0 for short key, got %d", id)
+	}
+}
+
+func TestEncodeHNSWKey(t *testing.T) {
+	packedID := PackID(1, 42)
+	level := 3
+
+	key := EncodeHNSWKey(packedID, level)
+	if len(key) != 10 {
+		t.Fatalf("key size = %d, want 10", len(key))
+	}
+	if key[0] != HNSWPrefix {
+		t.Errorf("prefix = 0x%02x, want 0x%02x", key[0], HNSWPrefix)
+	}
+	gotPacked := binary.BigEndian.Uint64(key[1:9])
+	if gotPacked != packedID {
+		t.Errorf("packedID = %d, want %d", gotPacked, packedID)
+	}
+	if key[9] != byte(level) {
+		t.Errorf("level = %d, want %d", key[9], level)
+	}
+}
+
+func TestEncodeHNSWTombstoneKey(t *testing.T) {
+	packedID := PackID(1, 42)
+	key := EncodeHNSWTombstoneKey(packedID)
+	if len(key) != 10 {
+		t.Fatalf("tombstone key size = %d, want 10", len(key))
+	}
+	if key[0] != HNSWPrefix {
+		t.Errorf("prefix = 0x%02x", key[0])
+	}
+	if key[1] != 0xFF {
+		t.Errorf("tombstone marker = 0x%02x, want 0xFF", key[1])
+	}
+}
+
+func TestHNSWTopicPrefix(t *testing.T) {
+	topicID := uint32(42)
+	prefix := HNSWTopicPrefix(topicID)
+	if len(prefix) != 4 {
+		t.Fatalf("prefix size = %d, want 4", len(prefix))
+	}
+	if prefix[0] != HNSWPrefix {
+		t.Errorf("prefix = 0x%02x", prefix[0])
+	}
+	// Verify the prefix matches the first 4 bytes of HNSWNodePrefix for the same topic.
+	packedID := PackID(topicID, 42)
+	nodePrefix := HNSWNodePrefix(packedID)
+	for i := 0; i < 4; i++ {
+		if prefix[i] != nodePrefix[i] {
+			t.Errorf("byte %d: topicPrefix=0x%02x, nodePrefix=0x%02x", i, prefix[i], nodePrefix[i])
+		}
+	}
+}
+
+func TestHNSWNodePrefix(t *testing.T) {
+	packedID := PackID(1, 42)
+	prefix := HNSWNodePrefix(packedID)
+	if len(prefix) != 9 {
+		t.Fatalf("prefix size = %d, want 9", len(prefix))
+	}
+	if prefix[0] != HNSWPrefix {
+		t.Errorf("prefix = 0x%02x", prefix[0])
+	}
+}
+
 func TestEncodeSPOByTopicRoundtrip(t *testing.T) {
 	topicIDs := []uint32{0, 1, 100, 0xFFFFFF, 0xABCDEF}
 	for _, topicID := range topicIDs {

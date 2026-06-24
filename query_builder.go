@@ -113,21 +113,47 @@ func (b *Builder) JoinWithLFTJ(relations []query.RelationPattern, resultVars []s
 	return b
 }
 
-// Execute runs the query with the given context for cancellation support.
-// When filters are present and filter-first is enabled, filters are evaluated
-// against the graph index FIRST, then vector search runs only on matching candidates.
+// Execute runs the query using RBO to automatically select the optimal strategy.
+// FilterFirst() is kept as an explicit override for manual control.
 func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 	if len(b.vectorQuery) == 0 {
 		return nil, fmt.Errorf("query must include SimilarTo() vector search")
 	}
 
+	plan := query.Optimize(
+		b.hasVectorQuery(),
+		b.filterCount(),
+		b.estimatedSelectivity(),
+	)
+
+	if b.filterFirst {
+		plan.Type = query.GraphFirst
+	}
+
+	return b.executePlan(ctx, plan)
+}
+
+func (b *Builder) hasVectorQuery() bool {
+	return len(b.vectorQuery) > 0
+}
+
+func (b *Builder) filterCount() int {
+	return len(b.filters)
+}
+
+func (b *Builder) estimatedSelectivity() float64 {
+	if len(b.filters) == 0 {
+		return 1.0
+	}
+	return 0.1
+}
+
+func (b *Builder) executePlan(ctx context.Context, plan query.ExecutionPlan) ([]Result, error) {
 	candidateK := b.limit * b.candidateMultiplier
 	if candidateK < 100 {
 		candidateK = 100
 	}
 
-	// Predicate pushdown: if filters are present and filter-first is enabled,
-	// build a candidate set from the graph index first, then restrict vector search.
 	var filterCandidateSet map[uint64]struct{}
 	usePushdown := b.filterFirst && len(b.filters) > 0
 
@@ -162,7 +188,6 @@ func (b *Builder) Execute(ctx context.Context) ([]Result, error) {
 			continue
 		}
 
-		// If using predicate pushdown, skip candidates not in the set
 		if usePushdown {
 			if _, ok := filterCandidateSet[vecResult.ID]; !ok {
 				continue
