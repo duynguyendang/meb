@@ -37,8 +37,6 @@ type Config struct {
 
 	EnableAutoGC bool
 
-	PreserveObjectTypes bool
-
 	GCRatio float64
 
 	ValueLogFileSize int64
@@ -112,7 +110,7 @@ func DefaultConfig(dataDir string) *Config {
 		IndexCacheSize: 2 << 30,
 		LRUCacheSize:   100000,
 		Compression:    true,
-		SyncWrites:     false,
+		SyncWrites:     true,
 		NumDictShards:  0,
 		Profile:        "Ingest-Heavy",
 		EnableAutoGC:   true,

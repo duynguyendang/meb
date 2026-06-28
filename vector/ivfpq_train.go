@@ -83,6 +83,11 @@ func (idx *IVFPQIndex) Train(topicID uint32, sampleSize int) error {
 		return fmt.Errorf("writing codebook: %w", err)
 	}
 
+	// Re-index all existing vectors with the new centroids/codebook
+	if err := idx.reindexAllVectors(topicID, centroids, codebook); err != nil {
+		return fmt.Errorf("re-indexing vectors: %w", err)
+	}
+
 	return nil
 }
 
@@ -343,4 +348,61 @@ func squaredDist(a, b []float32) float32 {
 		sum += diff * diff
 	}
 	return sum
+}
+
+func (idx *IVFPQIndex) reindexAllVectors(topicID uint32, centroids, codebook []float32) error {
+	return idx.db.Update(func(txn *badger.Txn) error {
+		prefix := keys.EncodeIVFRawVectorKey(topicID, 0)[:5]
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		opts.PrefetchValues = true
+		opts.PrefetchSize = 1000
+
+		iter := txn.NewIterator(opts)
+		defer iter.Close()
+
+		for iter.Rewind(); iter.Valid(); iter.Next() {
+			item := iter.Item()
+			key := item.Key()
+			if len(key) < 9 {
+				continue
+			}
+			localID := binary.BigEndian.Uint64(key[1:9])
+
+			var fullVec []float32
+			err := item.Value(func(val []byte) error {
+				if len(val) < idx.fullDim*4 {
+					return nil
+				}
+				fullVec = make([]float32, idx.fullDim)
+				for i := 0; i < idx.fullDim; i++ {
+					fullVec[i] = math.Float32frombits(binary.LittleEndian.Uint32(val[i*4:]))
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if fullVec == nil {
+				continue
+			}
+
+			// Encode and add to posting list
+			transformed := PadAndTransform(fullVec, idx.paddedDim)
+			centroidID := idx.findClosestCentroid(transformed, centroids)
+
+			residual := make([]float32, idx.paddedDim)
+			centroidBase := int(centroidID) * idx.paddedDim
+			for i := 0; i < idx.paddedDim; i++ {
+				residual[i] = transformed[i] - centroids[centroidBase+i]
+			}
+
+			pqCodes := idx.quantizeResidual(residual, codebook)
+			postingKey := keys.EncodeIVFPostingKey(topicID, centroidID, localID)
+			if err := txn.Set(postingKey, pqCodes); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

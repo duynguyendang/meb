@@ -38,7 +38,7 @@ func testBenchStore(t *testing.T) *meb.MEBStore {
 }
 
 func benchmarkVectorSearch(b *testing.B, numVectors int) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	dim := 128
 
 	rng := rand.New(rand.NewSource(42))
@@ -104,7 +104,7 @@ func BenchmarkVectorSearch_100K(b *testing.B) {
 }
 
 func BenchmarkVectorAdd_Sustained(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	dim := 128
 	rng := rand.New(rand.NewSource(42))
 
@@ -134,7 +134,7 @@ func BenchmarkVectorAdd_Sustained(b *testing.B) {
 }
 
 func BenchmarkFactInsertion_Single(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	b.ResetTimer()
 	b.ReportAllocs()
 
@@ -151,7 +151,7 @@ func BenchmarkFactInsertion_Single(b *testing.B) {
 }
 
 func BenchmarkFactInsertion_Batch100(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	batchSize := 100
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -173,7 +173,7 @@ func BenchmarkFactInsertion_Batch100(b *testing.B) {
 }
 
 func BenchmarkLFTJ_3Atom(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	subjects := make([]string, 100)
 	for i := 0; i < 1000; i++ {
 		sub := fmt.Sprintf("s_%d", i%len(subjects))
@@ -201,7 +201,7 @@ func BenchmarkLFTJ_3Atom(b *testing.B) {
 }
 
 func BenchmarkLFTJ_5Atom(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 128)
 	subjects := make([]string, 50)
 	predicates := []string{"knows", "works_at", "lives_in", "created", "likes"}
 	objects := make([]string, 100)

@@ -43,16 +43,28 @@ func main() {
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	// Vector search benchmarks
+	// Brute-force vector search benchmarks
 	for _, n := range []int{1000, 10000} {
 		scenario := benchVectorSearch(n)
+		report.Scenarios = append(report.Scenarios, scenario)
+	}
+
+	// IVF-PQ benchmarks
+	for _, n := range []int{10000} {
+		scenario := benchIVFPQSearch(n)
+		report.Scenarios = append(report.Scenarios, scenario)
+	}
+
+	// HNSW benchmarks
+	for _, n := range []int{10000} {
+		scenario := benchHNSWSearch(n)
 		report.Scenarios = append(report.Scenarios, scenario)
 	}
 
 	// Vector add throughput
 	report.Scenarios = append(report.Scenarios, benchVectorAdd())
 
-	// Recall@10
+	// Recall@10 (brute-force)
 	report.Scenarios = append(report.Scenarios, benchRecall())
 
 	enc := json.NewEncoder(os.Stdout)
@@ -76,10 +88,36 @@ func newBenchStore() *meb.MEBStore {
 		LRUCacheSize:   10000,
 		Profile:        "Ingest-Heavy",
 		SegmentDir:     segDir,
+		VectorFullDim:  128,
 	}
 	s, err := meb.NewMEBStore(cfg)
 	if err != nil {
 		log.Fatalf("NewMEBStore: %v", err)
+	}
+	return s
+}
+
+func newBenchStoreWithIVFPQ() *meb.MEBStore {
+	s := newBenchStore()
+	cfg := vector.DefaultIVFPQConfig()
+	cfg.NumCentroids = 256
+	cfg.NumSubSpaces = 32
+	cfg.NProbe = 16
+	cfg.BatchSize = 1000
+	if err := s.EnableIVFPQ(cfg); err != nil {
+		log.Fatalf("EnableIVFPQ: %v", err)
+	}
+	return s
+}
+
+func newBenchStoreWithHNSW() *meb.MEBStore {
+	s := newBenchStore()
+	cfg := vector.DefaultHNSWConfig()
+	cfg.M = 16
+	cfg.EfConstruction = 100
+	cfg.EfSearch = 32
+	if err := s.EnableHNSW(cfg); err != nil {
+		log.Fatalf("EnableHNSW: %v", err)
 	}
 	return s
 }
@@ -158,6 +196,156 @@ func benchVectorAdd() ScenarioResult {
 	return ScenarioResult{
 		Name:      "VectorAdd_Sustained",
 		OpsPerSec: throughput,
+	}
+}
+
+func benchIVFPQSearch(numVectors int) ScenarioResult {
+	s := newBenchStoreWithIVFPQ()
+	defer s.Close()
+
+	dim := 128
+	rng := rand.New(rand.NewSource(42))
+
+	topicID := uint32(1)
+
+	// Add vectors via IVF-PQ
+	vectors := make([][]float32, numVectors)
+	if err := s.Update(func(txn *meb.StoreTxn) error {
+		for i := 0; i < numVectors; i++ {
+			vec := randomUnitVector(rng, dim)
+			vectors[i] = vec
+			if err := txn.AddIVFVector(topicID, uint64(i+1), vec); err != nil {
+				return fmt.Errorf("AddIVFVector failed: %v", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Fatalf("Update failed: %v", err)
+	}
+
+	// Train IVF-PQ
+	log.Printf("Training IVF-PQ on %d vectors...", numVectors)
+	if err := s.TrainIVFPQ(topicID); err != nil {
+		log.Fatalf("TrainIVFPQ failed: %v", err)
+	}
+
+	query := randomUnitVector(rng, dim)
+	time.Sleep(100 * time.Millisecond)
+
+	const numTrials = 50
+	var latencies []float64
+	for i := 0; i < numTrials; i++ {
+		start := time.Now()
+		var count int
+		if err := s.View(func(txn *meb.StoreTxn) error {
+			results, err := txn.SearchIVFPQ(context.Background(), topicID, query, 10)
+			if err != nil {
+				return fmt.Errorf("Search failed: %v", err)
+			}
+			count = len(results)
+			return nil
+		}); err != nil {
+			log.Fatalf("View failed: %v", err)
+		}
+		if count == 0 {
+			log.Fatal("expected results")
+		}
+		latencies = append(latencies, float64(time.Since(start).Microseconds())/1000.0)
+	}
+
+	sort.Float64s(latencies)
+
+	totalTime := time.Duration(0)
+	for _, l := range latencies {
+		totalTime += time.Duration(l * float64(time.Millisecond))
+	}
+	avgTimePerQuery := totalTime / time.Duration(numTrials)
+	throughput := float64(numVectors) / avgTimePerQuery.Seconds()
+
+	return ScenarioResult{
+		Name:       fmt.Sprintf("IVFPQSearch_%dK", numVectors/1000),
+		OpsPerSec:  throughput,
+		P50Ms:      percentile(latencies, 50),
+		P95Ms:      percentile(latencies, 95),
+		P99Ms:      percentile(latencies, 99),
+	}
+}
+
+func benchHNSWSearch(numVectors int) ScenarioResult {
+	s := newBenchStoreWithHNSW()
+	defer s.Close()
+
+	dim := 128
+	rng := rand.New(rand.NewSource(42))
+
+	topicID := uint32(1)
+
+	vectors := make([][]float32, numVectors)
+	// Add vectors via HNSW
+	if err := s.Update(func(txn *meb.StoreTxn) error {
+		for i := 0; i < numVectors; i++ {
+			vec := randomUnitVector(rng, dim)
+			vectors[i] = vec
+			if err := txn.AddHNSWVector(topicID, uint64(i+1), vec); err != nil {
+				return fmt.Errorf("AddHNSWVector failed: %v", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		log.Fatalf("Update failed: %v", err)
+	}
+
+	query := randomUnitVector(rng, dim)
+	time.Sleep(100 * time.Millisecond)
+
+	// Debug: search with first indexed vector
+	if err := s.View(func(txn *meb.StoreTxn) error {
+		results, err := txn.SearchHNSW(context.Background(), topicID, vectors[0], 10)
+		if err != nil {
+			return fmt.Errorf("Search failed: %v", err)
+		}
+		log.Printf("HNSW search with indexed vector returned %d results", len(results))
+		return nil
+	}); err != nil {
+		log.Fatalf("Debug HNSW failed: %v", err)
+	}
+
+	const numTrials = 50
+	var latencies []float64
+	for i := 0; i < numTrials; i++ {
+		start := time.Now()
+		var count int
+		if err := s.View(func(txn *meb.StoreTxn) error {
+			results, err := txn.SearchHNSW(context.Background(), topicID, query, 10)
+			if err != nil {
+				return fmt.Errorf("Search failed: %v", err)
+			}
+			count = len(results)
+			return nil
+		}); err != nil {
+			log.Fatalf("View failed: %v", err)
+		}
+		if count == 0 {
+			log.Fatal("expected results")
+		}
+		latencies = append(latencies, float64(time.Since(start).Microseconds())/1000.0)
+	}
+
+	sort.Float64s(latencies)
+
+	totalTime := time.Duration(0)
+	for _, l := range latencies {
+		totalTime += time.Duration(l * float64(time.Millisecond))
+	}
+	avgTimePerQuery := totalTime / time.Duration(numTrials)
+	throughput := float64(numVectors) / avgTimePerQuery.Seconds()
+
+	return ScenarioResult{
+		Name:       fmt.Sprintf("HNSWSearch_%dK", numVectors/1000),
+		OpsPerSec:  throughput,
+		P50Ms:      percentile(latencies, 50),
+		P95Ms:      percentile(latencies, 95),
+		P99Ms:      percentile(latencies, 99),
 	}
 }
 

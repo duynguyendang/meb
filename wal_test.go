@@ -1,7 +1,6 @@
 package meb
 
 import (
-	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sync"
@@ -268,65 +267,6 @@ func TestWALClearConcurrentWithRead(t *testing.T) {
 	wg.Wait()
 }
 
-func TestWALv1ToV2Migration(t *testing.T) {
-	t.Cleanup(func() { goleak.VerifyNone(t) })
-
-	dir := testWALDir(t)
-
-	// Manually create a v1 WAL file (no magic, raw records)
-	v1Path := filepath.Join(dir, walFileName)
-
-	// Write 100 v1 records
-	f, err := os.OpenFile(v1Path, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		t.Fatalf("create v1: %v", err)
-	}
-	for i := 0; i < 100; i++ {
-		subj := []byte("sub_" + string(rune('A'+i%26)))
-		pred := []byte("pred")
-		obj := []byte("obj_" + string(rune('A'+i%26)))
-		buf := make([]byte, 14+len(subj)+len(pred)+len(obj))
-		binary.BigEndian.PutUint64(buf[0:8], uint64(i+1))
-		binary.BigEndian.PutUint16(buf[8:10], uint16(len(subj)))
-		binary.BigEndian.PutUint16(buf[10:12], uint16(len(pred)))
-		binary.BigEndian.PutUint16(buf[12:14], uint16(len(obj)))
-		copy(buf[14:], subj)
-		copy(buf[14+len(subj):], pred)
-		copy(buf[14+len(subj)+len(pred):], obj)
-		if _, err := f.Write(buf); err != nil {
-			f.Close()
-			t.Fatalf("write v1 record %d: %v", i, err)
-		}
-	}
-	f.Close()
-
-	// Open with NewWAL — should migrate to v2
-	w, err := NewWAL(dir)
-	if err != nil {
-		t.Fatalf("NewWAL with v1 file: %v", err)
-	}
-
-	// Read all — should get 100 entries
-	entries, err := w.ReadAll()
-	if err != nil {
-		t.Fatalf("ReadAll after migration: %v", err)
-	}
-	if len(entries) != 100 {
-		t.Fatalf("got %d entries after migration, want 100", len(entries))
-	}
-
-	// Verify v2 format
-	detected, err := detectWALVersion(w.path)
-	if err != nil {
-		t.Fatalf("detectWALVersion: %v", err)
-	}
-	if detected != WALVersion2 {
-		t.Fatalf("after migration, version=%d, want %d", detected, WALVersion2)
-	}
-
-	w.Close()
-}
-
 func TestWALv2CorruptHeader(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 
@@ -350,31 +290,10 @@ func TestWALv2CorruptHeader(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// detectWALVersion should not return v2
-	version, err := detectWALVersion(path)
-	if err != nil {
-		t.Fatalf("detectWALVersion: %v", err)
-	}
-	if version == WALVersion2 {
-		t.Fatalf("expected non-v2 version for garbage header, got v2")
-	}
-
-	// Reopening the WAL with a corrupt header: the code treats it as v1 and
-	// attempts migration. The v1 parser silently drops garbage records, so the
-	// WAL opens successfully but with data loss.
-	w2, err := NewWAL(dir)
-	if err != nil {
-		t.Fatalf("NewWAL with corrupt header: %v", err)
-	}
-	defer w2.Close()
-
-	entries, err := w2.ReadAll()
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	// The 10 original records should be lost because the header was corrupted
-	if len(entries) != 0 {
-		t.Errorf("expected 0 entries after header corruption, got %d", len(entries))
+	// Reopening the WAL with a corrupt header should fail
+	_, err = NewWAL(dir)
+	if err == nil {
+		t.Fatal("expected error opening WAL with corrupt header, got nil")
 	}
 }
 
@@ -393,4 +312,148 @@ func (c *cancelCtx) Err() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.err
+}
+
+// TestWALWriteBatchRecovery verifies that facts written via AddFactBatch()
+// (WriteBatch path) are logged to WAL and recovered on restart.
+// The transaction path uses BadgerDB SyncWrites: true for durability.
+func TestWALWriteBatchRecovery(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	dir := testWALDir(t)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	segDir := filepath.Join(dir, "vectors")
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		t.Fatalf("MkdirAll vectors: %v", err)
+	}
+
+	cfg := &store.Config{
+		DataDir:        dataDir,
+		DictDir:        filepath.Join(dir, "dict"),
+		InMemory:       false,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+	}
+
+	// Create store
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+
+	// Add facts via WriteBatch path (AddFactBatch on MEBStore)
+	facts := []Fact{
+		{Subject: "alice", Predicate: "knows", Object: "bob"},
+		{Subject: "alice", Predicate: "works_at", Object: "acme"},
+		{Subject: "bob", Predicate: "lives_in", Object: "nyc"},
+	}
+
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	// Verify facts were added
+	if count := s.Count(); count != 3 {
+		t.Fatalf("expected 3 facts, got %d", count)
+	}
+
+	// Close store
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen store — WAL should be empty (cleared after AddFactBatch)
+	s2, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore (reopen): %v", err)
+	}
+	defer s2.Close()
+
+	// Verify facts persisted
+	if count := s2.Count(); count != 3 {
+		t.Fatalf("expected 3 facts after reopen, got %d", count)
+	}
+}
+
+// TestWALWriteBatchCrashRecovery simulates a crash after WAL write but before
+// WriteBatch commit, verifying that facts are recovered on restart.
+func TestWALWriteBatchCrashRecovery(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	dir := testWALDir(t)
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	segDir := filepath.Join(dir, "vectors")
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		t.Fatalf("MkdirAll vectors: %v", err)
+	}
+
+	cfg := &store.Config{
+		DataDir:        dataDir,
+		DictDir:        filepath.Join(dir, "dict"),
+		InMemory:       false,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+	}
+
+	// Create store and add initial facts
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+
+	// Add initial facts via WriteBatch
+	if err := s.AddFactBatch([]Fact{
+		{Subject: "alice", Predicate: "knows", Object: "bob"},
+	}); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	// Now simulate crash: manually write to WAL without committing to BadgerDB
+	// This simulates what would happen if the process crashed after WAL write
+	// but before WriteBatch commit.
+	w, err := NewWAL(dataDir)
+	if err != nil {
+		t.Fatalf("NewWAL: %v", err)
+	}
+
+	// Write entries to WAL (simulating what AddFactBatch would do before commit)
+	if err := w.Append(walEntry{subject: "bob", pred: "knows", object: "alice"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := w.Append(walEntry{subject: "charlie", pred: "works_at", object: "acme"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	// Close WAL without committing to BadgerDB (simulating crash)
+	w.Close()
+
+	// Close the store (don't commit the simulated transaction)
+	s.Close()
+
+	// Reopen store — WAL replay should recover the facts
+	s2, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore (reopen): %v", err)
+	}
+	defer s2.Close()
+
+	// Verify facts were recovered via WAL replay
+	count := s2.Count()
+	if count < 2 {
+		t.Errorf("expected at least 2 facts after WAL replay, got %d", count)
+	}
 }

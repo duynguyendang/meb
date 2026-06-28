@@ -12,7 +12,6 @@ import (
 
 const (
 	walFileName     = "meb.wal"
-	walMagicSize    = 8
 	walHeaderSize   = 8 + 2 + 2 + 2 // id:8 + subjLen:2 + predLen:2 + objLen:2
 	walCRC32Size    = 4
 	walMinRecordLen = walHeaderSize + walCRC32Size // 18 bytes minimum
@@ -31,50 +30,30 @@ type walEntry struct {
 	object  string
 }
 
-// WALVersion describes the on-disk WAL format.
-type WALVersion int
-
-const (
-	WALVersionUnknown WALVersion = 0
-	WALVersion1       WALVersion = 1 // no magic, no CRC
-	WALVersion2       WALVersion = 2 // magic header + CRC32C per record
-)
-
 type WAL struct {
-	mu      sync.Mutex
-	file    *os.File
-	path    string
-	version WALVersion
+	mu   sync.Mutex
+	file *os.File
+	path string
 }
 
-// NewWAL opens or creates a WAL file. If a v1 WAL exists, it is migrated
-// to v2 format on open. The v1 file is only deleted after the v2 file is fsynced.
+// NewWAL opens or creates a v2 WAL file. Returns an error if an existing WAL
+// file has an unsupported format (e.g. v1) — the caller should delete the file.
 func NewWAL(dataDir string) (*WAL, error) {
 	if dataDir == "" {
-		return &WAL{version: WALVersion2}, nil
+		return &WAL{}, nil
 	}
 	path := filepath.Join(dataDir, walFileName)
 
 	w := &WAL{path: path}
 
-	// Check if v1 or v2 WAL exists
+	// Check if WAL file exists
 	if _, err := os.Stat(path); err == nil {
-		// File exists — detect version
-		version, err := detectWALVersion(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to detect WAL version: %w", err)
-		}
-		w.version = version
-
-		if version == WALVersion1 {
-			// Migrate v1 → v2
-			if err := w.migrateV1ToV2(); err != nil {
-				return nil, fmt.Errorf("WAL v1→v2 migration failed: %w", err)
-			}
+		// File exists — validate v2 magic header
+		if err := validateWALMagic(path); err != nil {
+			return nil, fmt.Errorf("unsupported WAL format: %w; delete the file and retry", err)
 		}
 	} else if os.IsNotExist(err) {
-		// No WAL exists — create new v2
-		w.version = WALVersion2
+		// No WAL exists — will create new v2 below
 	} else {
 		return nil, err
 	}
@@ -106,152 +85,26 @@ func NewWAL(dataDir string) (*WAL, error) {
 	return w, nil
 }
 
-// detectWALVersion reads the first bytes of a WAL file to determine its format.
-func detectWALVersion(path string) (WALVersion, error) {
+// validateWALMagic reads the first bytes of a WAL file to verify it has the v2 magic header.
+func validateWALMagic(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return WALVersionUnknown, err
+		return err
 	}
 	defer f.Close()
 
 	magic := make([]byte, len(walMagicV2))
 	n, err := f.Read(magic)
 	if err != nil || n < len(walMagicV2) {
-		// File too short for magic — treat as v1 (or empty)
-		return WALVersion1, nil
+		return fmt.Errorf("WAL file too short for v2 header")
 	}
 
-	// Check for v2 magic
-	match := true
 	for i := 0; i < len(walMagicV2); i++ {
 		if magic[i] != walMagicV2[i] {
-			match = false
-			break
+			return fmt.Errorf("invalid WAL magic header")
 		}
 	}
-	if match {
-		return WALVersion2, nil
-	}
-
-	// No magic header — v1 format
-	return WALVersion1, nil
-}
-
-// migrateV1ToV2 reads the v1 WAL, rewrites it as v2, fsyncs the v2 file,
-// then deletes the v1 file.
-func (w *WAL) migrateV1ToV2() error {
-	slog.Info("migrating WAL from v1 to v2 format", "path", w.path)
-
-	// Read v1 entries
-	v1Data, err := os.ReadFile(w.path)
-	if err != nil {
-		return fmt.Errorf("failed to read v1 WAL: %w", err)
-	}
-
-	entries, err := parseV1WAL(v1Data)
-	if err != nil {
-		// Leave v1 WAL in place; refuse to open
-		return fmt.Errorf("failed to parse v1 WAL (data not lost): %w", err)
-	}
-
-	// Write v2 file to a temp path
-	tmpPath := w.path + ".v2tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create v2 temp file: %w", err)
-	}
-
-	// Write magic header
-	if _, err := f.Write(walMagicV2); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("failed to write v2 header: %w", err)
-	}
-
-	// Write each entry in v2 format
-	for _, e := range entries {
-		subjBytes := []byte(e.subject)
-		predBytes := []byte(e.pred)
-		objBytes := []byte(e.object)
-
-		recLen := walHeaderSize + len(subjBytes) + len(predBytes) + len(objBytes) + walCRC32Size
-		buf := make([]byte, recLen)
-		binary.BigEndian.PutUint64(buf[0:8], 0) // reserved
-		binary.BigEndian.PutUint16(buf[8:10], uint16(len(subjBytes)))
-		binary.BigEndian.PutUint16(buf[10:12], uint16(len(predBytes)))
-		binary.BigEndian.PutUint16(buf[12:14], uint16(len(objBytes)))
-		copy(buf[14:], subjBytes)
-		copy(buf[14+len(subjBytes):], predBytes)
-		copy(buf[14+len(subjBytes)+len(predBytes):], objBytes)
-
-		// CRC32C over header + payload
-		crc := crc32.Checksum(buf[:14+len(subjBytes)+len(predBytes)+len(objBytes)], crc32cTable)
-		copy(buf[len(buf)-walCRC32Size:], crc32Bytes(crc))
-
-		if _, err := f.Write(buf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("failed to write v2 record: %w", err)
-		}
-	}
-
-	// fsync the v2 file before replacing the v1 file
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("failed to fsync v2 file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	// Rename v2 over v1 (atomic on same filesystem)
-	if err := os.Rename(tmpPath, w.path); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("failed to rename v2 over v1: %w", err)
-	}
-
-	w.version = WALVersion2
-	slog.Info("WAL migration complete", "entries", len(entries))
 	return nil
-}
-
-// parseV1WAL parses a v1 WAL byte slice (no magic, no CRC).
-// Validates each record's length fields to avoid huge allocations from
-// corrupted length values. A partial last record is treated as a torn write
-// (recovered records before it are returned).
-func parseV1WAL(data []byte) ([]walEntry, error) {
-	const maxEntryLen = 1 << 20 // 1 MiB sanity cap per field
-
-	var entries []walEntry
-	offset := 0
-	for offset+14 <= len(data) {
-		subjLen := int(binary.BigEndian.Uint16(data[offset+8 : offset+10]))
-		predLen := int(binary.BigEndian.Uint16(data[offset+10 : offset+12]))
-		objLen := int(binary.BigEndian.Uint16(data[offset+12 : offset+14]))
-		offset += 14
-
-		// Validate per-field lengths against a sanity cap so a corrupted
-		// WAL can't trigger gigabyte allocations.
-		if subjLen > maxEntryLen || predLen > maxEntryLen || objLen > maxEntryLen {
-			return entries, fmt.Errorf("WAL v1 record at offset %d has implausible length (subj=%d, pred=%d, obj=%d)", offset-14, subjLen, predLen, objLen)
-		}
-
-		if offset+subjLen+predLen+objLen > len(data) {
-			// Partial last record — stop here (crash during write)
-			break
-		}
-
-		entry := walEntry{
-			subject: string(data[offset : offset+subjLen]),
-			pred:    string(data[offset+subjLen : offset+subjLen+predLen]),
-			object:  string(data[offset+subjLen+predLen : offset+subjLen+predLen+objLen]),
-		}
-		entries = append(entries, entry)
-		offset += subjLen + predLen + objLen
-	}
-	return entries, nil
 }
 
 // Append writes a single entry to the WAL with CRC32C.
@@ -302,30 +155,7 @@ func (w *WAL) ReadAll() ([]walEntry, error) {
 		return nil, nil
 	}
 
-	w.mu.Lock()
-	version := w.version
-	w.mu.Unlock()
-
-	switch version {
-	case WALVersion2:
-		return w.readV2WAL()
-	case WALVersion1:
-		return w.readV1WAL()
-	default:
-		return nil, nil
-	}
-}
-
-// readV1WAL reads a v1-format WAL file (no magic, no CRC).
-func (w *WAL) readV1WAL() ([]walEntry, error) {
-	data, err := os.ReadFile(w.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return parseV1WAL(data)
+	return w.readV2WAL()
 }
 
 // readV2WAL reads a v2-format WAL file with magic header and CRC validation.
@@ -440,7 +270,6 @@ func (w *WAL) Clear() error {
 	}
 
 	w.file = f
-	w.version = WALVersion2
 	return nil
 }
 

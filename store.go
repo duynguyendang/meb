@@ -553,6 +553,10 @@ func (st *MEBStore) TrainIVFPQ(topicID uint32) error {
 	return st.ivfpq.Train(topicID, 0)
 }
 
+func (st *MEBStore) IVFPQIndex() *vector.IVFPQIndex {
+	return st.ivfpq
+}
+
 func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
 	return m.lftjEngine
 }

@@ -351,3 +351,10 @@ func (idx *IVFPQIndex) loadCodebook(txn *badger.Txn, topicID uint32) ([]float32,
 
 	return codebook, nil
 }
+
+// LoadCentroidsForDebug loads centroids for debugging purposes.
+func (idx *IVFPQIndex) LoadCentroidsForDebug(txn *badger.Txn, topicID uint32) ([]float32, error) {
+	return idx.loadCentroids(txn, topicID)
+}
+
+

@@ -4,18 +4,14 @@ import (
 	"context"
 	"fmt"
 	"iter"
-	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
 )
-
-var legacyCoercionWarnOnce sync.Once
 
 type PredicateFilterType string
 
@@ -269,14 +265,7 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 		if err != nil {
 			return Fact{}, fmt.Errorf("failed to resolve object ID %d: %w", r.foundOID, err)
 		}
-		if m.config.PreserveObjectTypes {
-			object = objectStr
-		} else {
-			legacyCoercionWarnOnce.Do(func() {
-				slog.Warn("DEPRECATED: numeric strings from dictionary are coerced to int64/float64. Set PreserveObjectTypes=true to keep them as strings.")
-			})
-			object = restoreTypedValue(objectStr)
-		}
+		object = objectStr
 	}
 
 	return Fact{
@@ -284,33 +273,6 @@ func (m *MEBStore) resolveFactStrings(opts *scanOptions, r *scanResult) (Fact, e
 		Predicate: predicate,
 		Object:    object,
 	}, nil
-}
-
-// restoreTypedValue attempts to restore the original Go type from a dictionary string.
-// Tries int64 first (matches "%d" format), then float64 (matches "%.17g" format),
-// then falls back to string.
-//
-// NOTE: This means strings that parse as numbers (e.g., "42", "3.14") will be
-// returned as int64/float64 rather than string. If exact type preservation is
-// required, use inline types (bool, int32, float32) which bypass the dictionary.
-func restoreTypedValue(s string) any {
-	// Fast-path: skip parsing for obviously non-numeric strings.
-	// Most dictionary values are strings, so this avoids two expensive
-	// parse attempts per fact in the common case.
-	if len(s) == 0 {
-		return s
-	}
-	c := s[0]
-	if c >= '0' && c <= '9' || c == '-' || c == '+' || c == '.' {
-		// Could be numeric — try parsing.
-		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return i
-		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return f
-		}
-	}
-	return s
 }
 
 // decodeInlineID converts an inline ID back to its Go primitive value.

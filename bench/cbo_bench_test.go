@@ -15,7 +15,7 @@ import (
 // for a 3-atom join where relation order matters.
 // Pattern: (?a, knows, ?b) ∧ (?b, works_at, "Acme") ∧ (?a, lives_in, "NYC")
 func BenchmarkLFTJ_3Atom_CBO(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 
 	// Insert facts with skewed cardinality:
 	// - "knows" has few distinct objects (100)
@@ -184,7 +184,7 @@ func BenchmarkHybridSearchWithFilters(b *testing.B) {
 // BenchmarkPlanCache measures the performance improvement from caching
 // optimized query plans for repeated queries.
 func BenchmarkPlanCache(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 
 	// Insert facts
 	for i := 0; i < 500; i++ {

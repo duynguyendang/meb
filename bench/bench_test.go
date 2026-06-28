@@ -15,7 +15,7 @@ func init() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 }
 
-func setupBenchStore(b *testing.B) *meb.MEBStore {
+func setupBenchStore(b *testing.B, dim int) *meb.MEBStore {
 	b.Helper()
 	segDir := b.TempDir()
 	cfg := &store.Config{
@@ -27,6 +27,7 @@ func setupBenchStore(b *testing.B) *meb.MEBStore {
 		LRUCacheSize:   10000,
 		Profile:        "Ingest-Heavy",
 		SegmentDir:     segDir,
+		VectorFullDim:  dim,
 		Verbose:        false,
 	}
 	s, err := meb.NewMEBStore(cfg)
@@ -46,7 +47,7 @@ func randomVector(dim int) []float32 {
 }
 
 func BenchmarkVectorAdd(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	vec := randomVector(1536)
 
 	b.ResetTimer()
@@ -59,7 +60,7 @@ func BenchmarkVectorAdd(b *testing.B) {
 }
 
 func BenchmarkVectorSearch(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	numVectors := 10000
 	vectors := make([][]float32, numVectors)
 
@@ -87,7 +88,7 @@ func BenchmarkVectorSearch(b *testing.B) {
 }
 
 func BenchmarkFactInsertion(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	subjects := make([]string, 1000)
 	predicates := []string{"knows", "works_at", "lives_in", "created"}
 	objects := make([]string, 500)
@@ -112,7 +113,7 @@ func BenchmarkFactInsertion(b *testing.B) {
 }
 
 func BenchmarkFactInsertionBatch(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	batchSize := 100
 
 	subjects := make([]string, 1000)
@@ -145,7 +146,7 @@ func BenchmarkFactInsertionBatch(b *testing.B) {
 }
 
 func BenchmarkScan(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	numFacts := 10000
 
 	for i := 0; i < numFacts; i++ {
@@ -174,7 +175,7 @@ func BenchmarkScan(b *testing.B) {
 }
 
 func BenchmarkScanKeyOnly(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	numFacts := 100000
 
 	for i := 0; i < numFacts; i++ {
@@ -203,7 +204,7 @@ func BenchmarkScanKeyOnly(b *testing.B) {
 }
 
 func BenchmarkDocumentAdd(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	content := []byte("This is a test document with some content for benchmarking purposes.")
 	vec := randomVector(1536)
 	metadata := map[string]any{
@@ -221,7 +222,7 @@ func BenchmarkDocumentAdd(b *testing.B) {
 }
 
 func BenchmarkHybridSearch(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	numDocs := 1000
 
 	for i := 0; i < numDocs; i++ {
@@ -256,7 +257,7 @@ func BenchmarkHybridSearch(b *testing.B) {
 }
 
 func BenchmarkDictionaryGetOrCreate(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	words := make([]string, 10000)
 	for i := range words {
 		words[i] = "word_" + string(rune('A'+i%26))
@@ -270,7 +271,7 @@ func BenchmarkDictionaryGetOrCreate(b *testing.B) {
 }
 
 func BenchmarkDeleteFactsBySubject(b *testing.B) {
-	s := setupBenchStore(b)
+	s := setupBenchStore(b, 1536)
 	numSubjects := 100
 	factsPerSubject := 100
 

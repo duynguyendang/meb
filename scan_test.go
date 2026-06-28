@@ -3,10 +3,8 @@ package meb
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"github.com/duynguyendang/meb/store"
@@ -42,49 +40,10 @@ func newTestStoreForScan(t *testing.T) *MEBStore {
 	return newTestStoreWithConfig(t, cfg)
 }
 
-func TestScanLegacyCoercion(t *testing.T) {
+func TestScanStringPreserved(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 
 	s := newTestStoreForScan(t)
-
-	err := s.AddFact(Fact{Subject: "doc", Predicate: "age", Object: "42"})
-	if err != nil {
-		t.Fatalf("AddFact failed: %v", err)
-	}
-
-	for f, err := range s.Scan("doc", "age", "") {
-		if err != nil {
-			t.Fatalf("scan error: %v", err)
-		}
-		v, ok := f.Object.(int64)
-		if !ok {
-			t.Fatalf("expected int64, got %T (%v)", f.Object, f.Object)
-		}
-		if v != 42 {
-			t.Errorf("expected 42, got %d", v)
-		}
-	}
-}
-
-func TestScanPreserveTypes(t *testing.T) {
-	t.Cleanup(func() { goleak.VerifyNone(t) })
-
-	segDir := filepath.Join(t.TempDir(), "vectors")
-	if err := os.MkdirAll(segDir, 0755); err != nil {
-		t.Fatalf("failed to create segment dir: %v", err)
-	}
-	cfg := &store.Config{
-		DataDir:             "",
-		DictDir:             "",
-		InMemory:            true,
-		BlockCacheSize:      1 << 20,
-		IndexCacheSize:      1 << 20,
-		LRUCacheSize:        100,
-		Profile:             "Ingest-Heavy",
-		SegmentDir:          segDir,
-		PreserveObjectTypes: true,
-	}
-	s := newTestStoreWithConfig(t, cfg)
 
 	err := s.AddFact(Fact{Subject: "doc", Predicate: "age", Object: "42"})
 	if err != nil {
@@ -108,118 +67,146 @@ func TestScanPreserveTypes(t *testing.T) {
 func TestInlineFloat32Unaffected(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 
-	for _, preserveTypes := range []bool{false, true} {
-		t.Run(fmt.Sprintf("preserve=%v", preserveTypes), func(t *testing.T) {
-			t.Cleanup(func() { goleak.VerifyNone(t) })
-
-			segDir := filepath.Join(t.TempDir(), "vectors")
-			if err := os.MkdirAll(segDir, 0755); err != nil {
-				t.Fatalf("failed to create segment dir: %v", err)
-			}
-			cfg := &store.Config{
-				DataDir:             "",
-				DictDir:             "",
-				InMemory:            true,
-				BlockCacheSize:      1 << 20,
-				IndexCacheSize:      1 << 20,
-				LRUCacheSize:        100,
-				Profile:             "Ingest-Heavy",
-				SegmentDir:          segDir,
-				PreserveObjectTypes: preserveTypes,
-			}
-			s := newTestStoreWithConfig(t, cfg)
-
-			err := s.AddFact(Fact{Subject: "pi", Predicate: "value", Object: float32(3.14)})
-			if err != nil {
-				t.Fatalf("AddFact failed: %v", err)
-			}
-
-			for f, err := range s.Scan("pi", "value", "") {
-				if err != nil {
-					t.Fatalf("scan error: %v", err)
-				}
-				v, ok := f.Object.(float32)
-				if !ok {
-					t.Fatalf("expected float32, got %T (%v)", f.Object, f.Object)
-				}
-				diff := v - float32(3.14)
-				if diff < 0 {
-					diff = -diff
-				}
-				if diff >= 0.01 {
-					t.Errorf("expected ~3.14, got %f", v)
-				}
-			}
-		})
+	segDir := filepath.Join(t.TempDir(), "vectors")
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		t.Fatalf("failed to create segment dir: %v", err)
 	}
-}
-
-func TestDeprecationWarningLoggedOnce(t *testing.T) {
-	t.Cleanup(func() { goleak.VerifyNone(t) })
-
-	// Reset the sync.Once so the warning can fire in this process.
-	// NOTE: This modifies a package-level var. Safe only because Go tests
-	// within a package run sequentially (not in parallel). If tests ever
-	// use t.Parallel(), this will race.
-	legacyCoercionWarnOnce = sync.Once{}
-
-	var warnCount int
-	var mu sync.Mutex
-	h := &countingHandler{
-		inner: slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}),
-		onWarn: func() {
-			mu.Lock()
-			warnCount++
-			mu.Unlock()
-		},
+	cfg := &store.Config{
+		DataDir:        "",
+		DictDir:        "",
+		InMemory:       true,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
 	}
-	orig := slog.Default()
-	slog.SetDefault(slog.New(h))
-	t.Cleanup(func() { slog.SetDefault(orig) })
+	s := newTestStoreWithConfig(t, cfg)
 
-	s := newTestStoreForScan(t)
-
-	err := s.AddFact(Fact{Subject: "doc", Predicate: "val", Object: "100"})
+	err := s.AddFact(Fact{Subject: "pi", Predicate: "value", Object: float32(3.14)})
 	if err != nil {
 		t.Fatalf("AddFact failed: %v", err)
 	}
 
-	for i := 0; i < 100; i++ {
-		for _, err := range s.Scan("doc", "val", "") {
-			if err != nil {
-				t.Fatalf("scan error on iteration %d: %v", i, err)
-			}
+	for f, err := range s.Scan("pi", "value", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		v, ok := f.Object.(float32)
+		if !ok {
+			t.Fatalf("expected float32, got %T (%v)", f.Object, f.Object)
+		}
+		diff := v - float32(3.14)
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff >= 0.01 {
+			t.Errorf("expected ~3.14, got %f", v)
+		}
+	}
+}
+
+func TestInlineInt32Unaffected(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	err := s.AddFact(Fact{Subject: "num", Predicate: "value", Object: int32(99)})
+	if err != nil {
+		t.Fatalf("AddFact failed: %v", err)
+	}
+
+	for f, err := range s.Scan("num", "value", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		v, ok := f.Object.(int32)
+		if !ok {
+			t.Fatalf("expected int32, got %T (%v)", f.Object, f.Object)
+		}
+		if v != 99 {
+			t.Errorf("expected 99, got %d", v)
+		}
+	}
+}
+
+func TestInlineBoolUnaffected(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	err := s.AddFact(Fact{Subject: "flag", Predicate: "value", Object: true})
+	if err != nil {
+		t.Fatalf("AddFact failed: %v", err)
+	}
+
+	for f, err := range s.Scan("flag", "value", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		v, ok := f.Object.(bool)
+		if !ok {
+			t.Fatalf("expected bool, got %T (%v)", f.Object, f.Object)
+		}
+		if !v {
+			t.Errorf("expected true, got false")
+		}
+	}
+}
+
+func TestScanPredicateFilter(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	facts := []Fact{
+		{Subject: "alice", Predicate: "knows", Object: "bob"},
+		{Subject: "alice", Predicate: "knows", Object: "charlie"},
+		{Subject: "alice", Predicate: "works_at", Object: "acme"},
+	}
+	for _, f := range facts {
+		if err := s.AddFact(f); err != nil {
+			t.Fatalf("AddFact: %v", err)
 		}
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if warnCount != 1 {
-		t.Errorf("expected warn called exactly once, got %d", warnCount)
+	count := 0
+	for f, err := range s.Scan("alice", "knows", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		if f.Predicate != "knows" {
+			t.Errorf("expected predicate 'knows', got %q", f.Predicate)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 facts, got %d", count)
 	}
 }
 
-// countingHandler wraps a slog.Handler and calls onWarn for each Warn-level Record.
-type countingHandler struct {
-	inner slog.Handler
-	onWarn func()
-}
+func TestScanContextCancellation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
 
-func (h *countingHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.inner.Enabled(ctx, level)
-}
+	s := newTestStoreForScan(t)
 
-func (h *countingHandler) Handle(ctx context.Context, r slog.Record) error {
-	if r.Level >= slog.LevelWarn {
-		h.onWarn()
+	for i := 0; i < 100; i++ {
+		s.AddFact(Fact{Subject: "sub", Predicate: "pred", Object: fmt.Sprintf("obj_%d", i)})
 	}
-	return h.inner.Handle(ctx, r)
-}
 
-func (h *countingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &countingHandler{inner: h.inner.WithAttrs(attrs), onWarn: h.onWarn}
-}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	count := 0
+	for _, err := range s.ScanContext(ctx, "sub", "pred", "") {
+		if err != nil {
+			t.Fatalf("scan error: %v", err)
+		}
+		count++
+		if count >= 10 {
+			cancel()
+			break
+		}
+	}
 
-func (h *countingHandler) WithGroup(name string) slog.Handler {
-	return &countingHandler{inner: h.inner.WithGroup(name), onWarn: h.onWarn}
+	_ = ctx.Err() // may be Canceled
 }

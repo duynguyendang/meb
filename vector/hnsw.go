@@ -302,7 +302,9 @@ func (idx *HNSWIndex) SearchInTopic(ctx context.Context, topicID uint32, queryVe
 		transformed := PadAndTransform(queryVec, idx.paddedDim)
 
 		entryPoint := idx.getEntryPoint(topicID)
+		slog.Debug("HNSW entry", "entryPoint", entryPoint, "maxLevel", idx.getMaxLevel(topicID))
 		if entryPoint == 0 {
+			slog.Debug("HNSW: no entry point")
 			return
 		}
 
@@ -310,6 +312,7 @@ func (idx *HNSWIndex) SearchInTopic(ctx context.Context, topicID uint32, queryVe
 		currEntry := entryPoint
 		for l := maxLevel; l > 0; l-- {
 			nearest := idx.searchLayer(transformed, currEntry, 1, l)
+			slog.Debug("HNSW level", "level", l, "nearestCount", len(nearest))
 			if len(nearest) > 0 {
 				currEntry = nearest[0].id
 			}
@@ -320,6 +323,7 @@ func (idx *HNSWIndex) SearchInTopic(ctx context.Context, topicID uint32, queryVe
 			ef = k
 		}
 		candidates := idx.searchLayer(transformed, currEntry, ef, 0)
+		slog.Debug("HNSW candidates", "count", len(candidates))
 
 		count := 0
 		for _, c := range candidates {

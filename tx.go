@@ -28,6 +28,11 @@ type StoreTxn struct {
 	postCommitFns []func()
 }
 
+// BadgerTxn returns the underlying Badger transaction (for debugging).
+func (t *StoreTxn) BadgerTxn() *badger.Txn {
+	return t.txn
+}
+
 // addPostCommit registers a function to run after the transaction commits successfully.
 func (t *StoreTxn) addPostCommit(fn func()) {
 	t.postCommitFns = append(t.postCommitFns, fn)
@@ -62,6 +67,7 @@ func (m *MEBStore) View(fn func(*StoreTxn) error) error {
 // Update executes a read-write transaction with automatic commit/rollback.
 // In-memory side effects (counters, mmap caches, dict caches) are applied only
 // after the Badger transaction commits successfully, using accumulated deltas.
+// BadgerDB SyncWrites: true ensures durability for the transaction path.
 func (m *MEBStore) Update(fn func(*StoreTxn) error) error {
 	txn := m.db.NewTransaction(true)
 	st := &StoreTxn{txn: txn, store: m}
@@ -106,6 +112,7 @@ func (t *StoreTxn) AddFact(fact Fact) error {
 
 // AddFactBatch adds multiple facts within the transaction.
 // Uses the store's current topicID.
+// Durability is provided by BadgerDB SyncWrites: true (no WAL needed for txn path).
 func (t *StoreTxn) AddFactBatch(facts []Fact) error {
 	added, err := t.store.addFactBatchInTxnCounted(t.txn, facts, t.store.topicID.Load())
 	t.factDelta += int64(added)
@@ -113,6 +120,7 @@ func (t *StoreTxn) AddFactBatch(facts []Fact) error {
 }
 
 // AddFactBatchWithTopic adds multiple facts within the transaction using a specific topicID.
+// Durability is provided by BadgerDB SyncWrites: true (no WAL needed for txn path).
 func (t *StoreTxn) AddFactBatchWithTopic(facts []Fact, topicID uint32) error {
 	added, err := t.store.addFactBatchInTxnCounted(t.txn, facts, topicID)
 	t.factDelta += int64(added)
@@ -282,6 +290,60 @@ func (t *StoreTxn) AddIVFVector(topicID uint32, localID uint64, fullVec []float3
 		return fmt.Errorf("IVF-PQ index not configured")
 	}
 	return t.store.ivfpq.AddVector(t.txn, topicID, localID, fullVec)
+}
+
+// AddHNSWVector adds a vector to the HNSW index.
+func (t *StoreTxn) AddHNSWVector(topicID uint32, localID uint64, fullVec []float32) error {
+	if t.store.hnsw == nil {
+		return fmt.Errorf("HNSW index not configured")
+	}
+	return t.store.hnsw.Insert(context.Background(), topicID, localID, fullVec)
+}
+
+// SearchIVFPQ searches the IVF-PQ index directly (bypassing RBO).
+func (t *StoreTxn) SearchIVFPQ(ctx context.Context, topicID uint32, queryVec []float32, k int) ([]Result, error) {
+	if t.store.ivfpq == nil {
+		return nil, fmt.Errorf("IVF-PQ index not configured")
+	}
+	var results []Result
+	for sr, err := range t.store.ivfpq.SearchInTopic(ctx, t.txn, topicID, queryVec, k) {
+		if err != nil {
+			return nil, err
+		}
+		key, err := t.store.Dict().GetString(keys.UnpackLocalID(sr.ID))
+		if err != nil {
+			key = fmt.Sprintf("localID:%d", keys.UnpackLocalID(sr.ID))
+		}
+		results = append(results, Result{
+			ID:    sr.ID,
+			Key:   key,
+			Score: sr.Score,
+		})
+	}
+	return results, nil
+}
+
+// SearchHNSW searches the HNSW index directly (bypassing RBO).
+func (t *StoreTxn) SearchHNSW(ctx context.Context, topicID uint32, queryVec []float32, k int) ([]Result, error) {
+	if t.store.hnsw == nil {
+		return nil, fmt.Errorf("HNSW index not configured")
+	}
+	var results []Result
+	for sr, err := range t.store.hnsw.SearchInTopic(ctx, topicID, queryVec, k) {
+		if err != nil {
+			return nil, err
+		}
+		key, err := t.store.Dict().GetString(keys.UnpackLocalID(sr.ID))
+		if err != nil {
+			continue
+		}
+		results = append(results, Result{
+			ID:    sr.ID,
+			Key:   key,
+			Score: sr.Score,
+		})
+	}
+	return results, nil
 }
 
 // SearchHybrid uses the RBO to select the optimal search strategy.

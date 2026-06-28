@@ -19,9 +19,8 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 - **Datalog Integration**: Mangle `factstore.FactStore` interface for symbolic reasoning
 - **Neuro-Symbolic Search**: Hybrid vector + LFTJ graph query builder with streaming joins
 - **Circuit Breaker**: Configurable query timeout protection with push telemetry
-- **Write-Ahead Log**: Single-DB atomicity guarantees via WAL v2 (CRC32C integrity, auto-migrate v1→v2)
+- **Hybrid WAL Approach**: Transactions use BadgerDB `SyncWrites: true` for durability; WriteBatch path uses WAL v2 (CRC32C) for crash recovery
 - **Deterministic LFTJ Joins**: Canonical ordering + ExecuteOrdered for reproducible multi-way join results
-- **Object Type Preservation**: `PreserveObjectTypes` config flag to skip numeric coercion on scan
 - **Sharded Dictionary**: Configurable lock-striping for high-concurrent ingestion
 - **S2 Compression**: Fast content storage with Snappy-compatible compression
 
@@ -320,6 +319,29 @@ store.View(func(txn *meb.StoreTxn) error {
 | Conditional writes | | ✅ |
 | Rollback on error | | ✅ |
 
+### Hybrid WAL Approach
+
+MEB uses a **hybrid WAL strategy** to balance durability with performance:
+
+| Write Path | Durability Mechanism | Reason |
+|------------|---------------------|--------|
+| **Transactions** (`Update()`/`View()`) | BadgerDB `SyncWrites: true` | BadgerDB handles transaction durability natively; WAL is redundant |
+| **WriteBatch** (`AddFactBatch()`) | WAL v2 (CRC32C) | BadgerDB `WriteBatch` lacks `SyncWrites`; WAL provides crash recovery |
+
+**Configuration:**
+- `DefaultConfig()` → `SyncWrites: true` (ingest-heavy, durability-focused)
+- `SafeServingConfig()` → `SyncWrites: false` (read-only/serve)
+- `ReadOnlyConfig()` → `SyncWrites: false` (read-only)
+
+**WAL features:**
+- CRC32C checksums for corruption detection
+- `replayWAL()` for WriteBatch crash recovery (not used for transactions)
+- `TruncateIncompleteWAL()` for cleaning up partial writes
+
+**When WAL is used:**
+- WriteBatch path (e.g., bulk ingestion with `AddFactBatch`)
+- Transactions use BadgerDB's native durability (no WAL)
+
 ### Background Orphan Cleanup
 
 MEB runs periodic cleanup of orphaned data during `runCleanup()`:
@@ -360,12 +382,12 @@ meb/
 ├── content.go         # S2-compressed content storage, atomic Add/DeleteDocument
 ├── query_builder.go   # Neuro-symbolic query builder with LFTJ joins — Execute(ctx)
 ├── telemetry.go       # Push telemetry (TelemetrySink interface)
-├── wal.go             # Write-ahead log v2 (CRC32C, mutex-guarded)
+├── wal.go             # Write-ahead log v2 (CRC32C, WriteBatch crash recovery only)
 ├── fact_store.go      # factstore.FactStore implementation
 ├── store_test.go      # H4 Lifecycle, H5 cancellation, H10 lifecycle
 ├── reset_test.go      # H1 Reset no-deadlock, concurrent guards
 ├── scan_test.go       # H9 PreserveObjectTypes deprecation warning
-├── wal_test.go        # H8 WAL v2 format, CRC32C, migration
+├── wal_test.go        # H8 WAL v2 format, CRC32C, WriteBatch recovery tests
 └── go.mod             # go.uber.org/goleak added for test goroutine leak detection
 ```
 
@@ -374,21 +396,21 @@ meb/
 ```go
 // Default (Ingest-Heavy)
 cfg := store.DefaultConfig("./data")
+// SyncWrites: true (transactions use BadgerDB durability)
 
 // Cloud Run optimized
 cfg := store.SafeServingConfig("./data")
+// SyncWrites: false (read-only/serve mode)
 
 // Read-only
 cfg := store.ReadOnlyConfig("./data")
+// SyncWrites: false (read-only mode)
 
 // Enable verbose debug logging
 cfg.Verbose = true
 
 // Enable sharded dictionary (must be power of 2)
 cfg.NumDictShards = 4
-
-// Preserve original object types (skip numeric coercion)
-cfg.PreserveObjectTypes = true
 
 // Set vector default dimensionality (default: 1536)
 cfg.VectorFullDim = 1536
