@@ -1,6 +1,9 @@
 package adapter
 
 import (
+	"fmt"
+	"strconv"
+
 	"codeberg.org/TauCeti/mangle-go/ast"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
@@ -59,7 +62,7 @@ func (bit *BadgerIterator) Next() (ast.Atom, bool) {
 	}
 
 	if !bit.it.Valid() {
-		bit.it.Seek(bit.prefix)
+		return ast.Atom{}, false
 	}
 
 	if !bit.it.ValidForPrefix(bit.prefix) {
@@ -103,7 +106,7 @@ func (bit *BadgerIterator) Close() error {
 
 func (bit *BadgerIterator) decodeKey(key []byte) (subject, predicate, object string, err error) {
 	if len(key) != keys.TripleKeySize {
-		return "", "", "", nil
+		return "", "", "", fmt.Errorf("badger adapter: unexpected key length %d (want %d)", len(key), keys.TripleKeySize)
 	}
 
 	sID, pID, oID := keys.DecodeTripleKey(key)
@@ -131,5 +134,5 @@ func (bit *BadgerIterator) decodeKey(key []byte) (subject, predicate, object str
 }
 
 func uint64ToString(id uint64) string {
-	return "id:" + string(rune(id))
+	return "id:" + strconv.FormatUint(id, 10)
 }

@@ -8,7 +8,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 // tombstoneBarrier is the delay before tombstoned mmap segments are unmapped.
@@ -62,17 +61,7 @@ func (seg *mmapSegment) close() error {
 	return err
 }
 
-func (seg *mmapSegment) sync() error {
-	if seg.data == nil || len(seg.data) == 0 {
-		return nil
-	}
-	dataPtr := unsafe.Pointer(&seg.data[0])
-	_, _, errno := syscall.Syscall(syscall.SYS_MSYNC, uintptr(dataPtr), uintptr(len(seg.data)), uintptr(syscall.MS_SYNC))
-	if errno != 0 {
-		return fmt.Errorf("msync failed: %v", errno)
-	}
-	return nil
-}
+// sync is platform-specific — see mmap_linux.go and mmap_other.go.
 
 // cleanupTombstonedSegments unmaps, truncates, and closes all tombstoned segments.
 // Called from a background goroutine after the tombstone barrier elapses.

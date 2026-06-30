@@ -74,7 +74,7 @@ func main() {
 	}
 }
 
-func newBenchStore() *meb.MEBStore {
+func newBenchStore() (*meb.MEBStore, func()) {
 	segDir, err := os.MkdirTemp("", "meb-bench-*")
 	if err != nil {
 		log.Fatalf("TempDir: %v", err)
@@ -94,11 +94,14 @@ func newBenchStore() *meb.MEBStore {
 	if err != nil {
 		log.Fatalf("NewMEBStore: %v", err)
 	}
-	return s
+	return s, func() {
+		s.Close()
+		os.RemoveAll(segDir)
+	}
 }
 
-func newBenchStoreWithIVFPQ() *meb.MEBStore {
-	s := newBenchStore()
+func newBenchStoreWithIVFPQ() (*meb.MEBStore, func()) {
+	s, cleanup := newBenchStore()
 	cfg := vector.DefaultIVFPQConfig()
 	cfg.NumCentroids = 256
 	cfg.NumSubSpaces = 32
@@ -107,11 +110,11 @@ func newBenchStoreWithIVFPQ() *meb.MEBStore {
 	if err := s.EnableIVFPQ(cfg); err != nil {
 		log.Fatalf("EnableIVFPQ: %v", err)
 	}
-	return s
+	return s, cleanup
 }
 
-func newBenchStoreWithHNSW() *meb.MEBStore {
-	s := newBenchStore()
+func newBenchStoreWithHNSW() (*meb.MEBStore, func()) {
+	s, cleanup := newBenchStore()
 	cfg := vector.DefaultHNSWConfig()
 	cfg.M = 16
 	cfg.EfConstruction = 100
@@ -119,12 +122,12 @@ func newBenchStoreWithHNSW() *meb.MEBStore {
 	if err := s.EnableHNSW(cfg); err != nil {
 		log.Fatalf("EnableHNSW: %v", err)
 	}
-	return s
+	return s, cleanup
 }
 
 func benchVectorSearch(numVectors int) ScenarioResult {
-	s := newBenchStore()
-	defer s.Close()
+	s, cleanup := newBenchStore()
+	defer cleanup()
 
 	dim := 128
 	rng := rand.New(rand.NewSource(42))
@@ -163,8 +166,7 @@ func benchVectorSearch(numVectors int) ScenarioResult {
 	for _, l := range latencies {
 		totalTime += time.Duration(l * float64(time.Millisecond))
 	}
-	avgTimePerQuery := totalTime / time.Duration(numTrials)
-	throughput := float64(numVectors) / avgTimePerQuery.Seconds()
+	throughput := float64(numTrials) / totalTime.Seconds()
 
 	return ScenarioResult{
 		Name:       fmt.Sprintf("VectorSearch_%dK", numVectors/1000),
@@ -176,8 +178,8 @@ func benchVectorSearch(numVectors int) ScenarioResult {
 }
 
 func benchVectorAdd() ScenarioResult {
-	s := newBenchStore()
-	defer s.Close()
+	s, cleanup := newBenchStore()
+	defer cleanup()
 
 	dim := 128
 	rng := rand.New(rand.NewSource(42))
@@ -200,8 +202,8 @@ func benchVectorAdd() ScenarioResult {
 }
 
 func benchIVFPQSearch(numVectors int) ScenarioResult {
-	s := newBenchStoreWithIVFPQ()
-	defer s.Close()
+	s, cleanup := newBenchStoreWithIVFPQ()
+	defer cleanup()
 
 	dim := 128
 	rng := rand.New(rand.NewSource(42))
@@ -259,8 +261,7 @@ func benchIVFPQSearch(numVectors int) ScenarioResult {
 	for _, l := range latencies {
 		totalTime += time.Duration(l * float64(time.Millisecond))
 	}
-	avgTimePerQuery := totalTime / time.Duration(numTrials)
-	throughput := float64(numVectors) / avgTimePerQuery.Seconds()
+	throughput := float64(numTrials) / totalTime.Seconds()
 
 	return ScenarioResult{
 		Name:       fmt.Sprintf("IVFPQSearch_%dK", numVectors/1000),
@@ -272,8 +273,8 @@ func benchIVFPQSearch(numVectors int) ScenarioResult {
 }
 
 func benchHNSWSearch(numVectors int) ScenarioResult {
-	s := newBenchStoreWithHNSW()
-	defer s.Close()
+	s, cleanup := newBenchStoreWithHNSW()
+	defer cleanup()
 
 	dim := 128
 	rng := rand.New(rand.NewSource(42))
@@ -337,8 +338,7 @@ func benchHNSWSearch(numVectors int) ScenarioResult {
 	for _, l := range latencies {
 		totalTime += time.Duration(l * float64(time.Millisecond))
 	}
-	avgTimePerQuery := totalTime / time.Duration(numTrials)
-	throughput := float64(numVectors) / avgTimePerQuery.Seconds()
+	throughput := float64(numTrials) / totalTime.Seconds()
 
 	return ScenarioResult{
 		Name:       fmt.Sprintf("HNSWSearch_%dK", numVectors/1000),
@@ -350,8 +350,8 @@ func benchHNSWSearch(numVectors int) ScenarioResult {
 }
 
 func benchRecall() ScenarioResult {
-	s := newBenchStore()
-	defer s.Close()
+	s, cleanup := newBenchStore()
+	defer cleanup()
 
 	dim := 128
 	numVectors := 10000

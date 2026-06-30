@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	TripleSPOPrefix byte = 0x20
-	TripleOPSPrefix byte = 0x21
+	TripleSPOPrefix byte = 0x20 // SPO: subject || predicate || object
+	TripleOPSPrefix byte = 0x21 // OPS: object || predicate || subject
 
 	ChunkPrefix      byte = 0x10
 	VectorFullPrefix byte = 0x11
@@ -148,8 +148,22 @@ func UnpackInlineFloat32(id uint64) float32 {
 
 // PackID combines a 24-bit TopicID and 40-bit LocalID into a single 64-bit ID.
 // ID = (TopicID << 40) | LocalID
+// Callers must ensure topicID fits in 24 bits and localID fits in 40 bits.
+// Out-of-range values are silently masked to avoid data corruption.
 func PackID(topicID uint32, localID uint64) uint64 {
 	return (uint64(topicID) << TopicIDShift) | (localID & LocalIDMask)
+}
+
+// ValidatePackedIDComponents checks that topicID and localID fit in their
+// respective bit widths. Returns an error if either overflows.
+func ValidatePackedIDComponents(topicID uint32, localID uint64) error {
+	if topicID != (topicID & (1<<TopicIDBits - 1)) {
+		return fmt.Errorf("topicID %d exceeds %d bits", topicID, TopicIDBits)
+	}
+	if localID != (localID & LocalIDMask) {
+		return fmt.Errorf("localID %d exceeds %d bits", localID, LocalIDBits)
+	}
+	return nil
 }
 
 // UnpackTopicID extracts the 24-bit TopicID from a packed 64-bit ID.
@@ -169,8 +183,15 @@ func TopicMask() uint64 {
 
 // NextTopicID returns the first ID in the next TopicID range.
 // Used by LFTJ to leapfrog over unrelated topics.
+// Returns math.MaxUint64 if currentID is already at the maximum topic boundary
+// to prevent wrapping.
 func NextTopicID(currentID uint64) uint64 {
-	return (currentID & TopicIDMask) + (1 << TopicIDShift)
+	next := (currentID & TopicIDMask) + (1 << TopicIDShift)
+	// Saturate instead of wrapping when topicID would overflow 24 bits.
+	if next < currentID {
+		return math.MaxUint64
+	}
+	return next
 }
 
 // EncodeSemanticHints packs EntityType, SemanticHash, and Flags into a 16-bit value.
@@ -238,7 +259,11 @@ func DecodeTripleKey(key []byte) (s, p, o uint64) {
 	return
 }
 
-// EncodeTripleSPOPrefix builds a partial SPO prefix for scan operations.
+// buildTriplePrefix builds a partial prefix for scan operations.
+// A zero component means "unbound" — the prefix is truncated at that position
+// so it matches all values for subsequent components. This is safe because
+// packed IDs with topicID ≥ 1 are always non-zero, and dictionary IDs
+// are allocated starting from 1.
 func buildTriplePrefix(prefix byte, components ...uint64) []byte {
 	result := []byte{prefix}
 	buf := make([]byte, IDSize)

@@ -49,11 +49,23 @@ func (m *MEBStore) GetFacts(atom ast.Atom, callback func(ast.Atom) error) error 
 		resultArgs[0] = ast.Constant{Type: ast.StringType, Symbol: fact.Subject}
 		resultArgs[1] = ast.Constant{Type: ast.StringType, Symbol: fact.Predicate}
 
-		objectStr, ok := fact.Object.(string)
-		if !ok {
-			objectStr = fmt.Sprintf("%v", fact.Object)
+		switch v := fact.Object.(type) {
+		case string:
+			resultArgs[2] = ast.Constant{Type: ast.StringType, Symbol: v}
+		case bool:
+			if v {
+				resultArgs[2] = ast.Number(1)
+			} else {
+				resultArgs[2] = ast.Number(0)
+			}
+		case int32:
+			resultArgs[2] = ast.Number(int64(v))
+		case float32:
+			resultArgs[2] = ast.Float64(float64(v))
+		default:
+			objStr := fmt.Sprintf("%v", fact.Object)
+			resultArgs[2] = ast.Constant{Type: ast.StringType, Symbol: objStr}
 		}
-		resultArgs[2] = ast.Constant{Type: ast.StringType, Symbol: objectStr}
 
 		resultAtom := ast.Atom{
 			Predicate: atom.Predicate,

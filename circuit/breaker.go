@@ -106,11 +106,17 @@ func (b *Breaker) OnStateChange(cb StateChangeCallback) {
 	b.stateChangeCb = cb
 }
 
+// Execute calls fn with a context-aware signature for cancellation support.
+// If fn does not use the context, a running goroutine may outlive the
+// timeout/cancel and pile up under sustained failures. Prefer callers that
+// select on ctx.Done() and return promptly.
 func (b *Breaker) Execute(fn func() error) error {
-	return b.ExecuteContext(context.Background(), fn)
+	return b.ExecuteContext(context.Background(), func(ctx context.Context) error {
+		return fn()
+	})
 }
 
-func (b *Breaker) ExecuteContext(ctx context.Context, fn func() error) error {
+func (b *Breaker) ExecuteContext(ctx context.Context, fn func(context.Context) error) error {
 	if !b.canExecute() {
 		b.mu.Lock()
 		b.metrics.RejectedQueries++
@@ -136,7 +142,7 @@ func (b *Breaker) ExecuteContext(ctx context.Context, fn func() error) error {
 			}
 		}()
 		select {
-		case errChan <- fn():
+		case errChan <- fn(ctx):
 		case <-done:
 		}
 	}()
@@ -160,7 +166,7 @@ func (b *Breaker) ExecuteContext(ctx context.Context, fn func() error) error {
 	}
 }
 
-func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func() (interface{}, error)) (interface{}, error) {
+func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func(context.Context) (interface{}, error)) (interface{}, error) {
 	if !b.canExecute() {
 		b.mu.Lock()
 		b.metrics.RejectedQueries++
@@ -189,7 +195,7 @@ func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func() (interface{},
 				}
 			}
 		}()
-		data, err := fn()
+		data, err := fn(ctx)
 		select {
 		case resultChan <- result{data, err}:
 		case <-done:
@@ -253,7 +259,10 @@ func (b *Breaker) recordSuccess() {
 			b.failures = 0
 			b.successes = 0
 			if b.stateChangeCb != nil {
-				b.stateChangeCb(old, b.state, nil)
+				cb := b.stateChangeCb
+				b.mu.Unlock()
+				cb(old, b.state, nil)
+				b.mu.Lock()
 			}
 		}
 	case StateClosed:
@@ -270,9 +279,9 @@ func (b *Breaker) recordFailure(err error) {
 	b.metrics.LastFailureTime = time.Now()
 	b.metrics.LastError = err
 
-	if err == ErrQueryTimeout {
+	if errors.Is(err, ErrQueryTimeout) {
 		b.metrics.TimeoutQueries++
-	} else if err == ErrQueryCancelled {
+	} else if errors.Is(err, ErrQueryCancelled) {
 		b.metrics.CancelledQueries++
 	}
 
@@ -283,7 +292,10 @@ func (b *Breaker) recordFailure(err error) {
 		b.lastFailureTime = time.Now()
 		b.failures = 1
 		if b.stateChangeCb != nil {
-			b.stateChangeCb(old, b.state, err)
+			cb := b.stateChangeCb
+			b.mu.Unlock()
+			cb(old, b.state, err)
+			b.mu.Lock()
 		}
 	case StateClosed:
 		b.failures++
@@ -312,7 +324,13 @@ func (b *Breaker) MetricsSnapshot() MetricsSnapshot {
 
 	var failureRate float64
 	if b.metrics.TotalQueries > 0 {
-		failureRate = float64(b.metrics.FailedQueries+b.metrics.TimeoutQueries) / float64(b.metrics.TotalQueries)
+		numerator := b.metrics.FailedQueries
+		denominator := b.metrics.TotalQueries
+		if numerator > denominator {
+			// Defensive clamp: should never happen, but prevent >1.0.
+			numerator = denominator
+		}
+		failureRate = float64(numerator) / float64(denominator)
 	}
 
 	snap := MetricsSnapshot{

@@ -44,8 +44,11 @@ func (tm *telemetryManager) Unregister(sink TelemetrySink) {
 
 func (tm *telemetryManager) Emit(eventType string, data map[string]any) {
 	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	if len(tm.sinks) == 0 {
+	sinks := make([]TelemetrySink, len(tm.sinks))
+	copy(sinks, tm.sinks)
+	tm.mu.RUnlock()
+
+	if len(sinks) == 0 {
 		return
 	}
 	event := TelemetryEvent{
@@ -53,7 +56,7 @@ func (tm *telemetryManager) Emit(eventType string, data map[string]any) {
 		Timestamp: time.Now(),
 		Data:      data,
 	}
-	for _, sink := range tm.sinks {
+	for _, sink := range sinks {
 		sink.OnEvent(event)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"os"
+	"time"
 	"testing"
 
 	"github.com/duynguyendang/meb"
@@ -39,9 +40,10 @@ func setupBenchStore(b *testing.B, dim int) *meb.MEBStore {
 }
 
 func randomVector(dim int) []float32 {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	v := make([]float32, dim)
 	for i := 0; i < dim; i++ {
-		v[i] = rand.Float32()*2 - 1.0
+		v[i] = rng.Float32()*2 - 1.0
 	}
 	return v
 }
@@ -51,9 +53,14 @@ func BenchmarkVectorAdd(b *testing.B) {
 	vec := randomVector(1536)
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
+		// Use a fresh copy per iteration to avoid aliasing;
+		// Add should deep-copy, but this makes the benchmark robust.
+		v := make([]float32, len(vec))
+		copy(v, vec)
 		id := uint64(i + 1)
-		if err := s.Vectors().Add(id, vec); err != nil {
+		if err := s.Vectors().Add(id, v); err != nil {
 			b.Fatalf("Add failed: %v", err)
 		}
 	}
@@ -72,6 +79,7 @@ func BenchmarkVectorSearch(b *testing.B) {
 
 	query := vectors[0]
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
 		count := 0
@@ -101,6 +109,7 @@ func BenchmarkFactInsertion(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		subject := subjects[i%len(subjects)]
 		predicate := predicates[i%len(predicates)]
@@ -128,6 +137,7 @@ func BenchmarkFactInsertionBatch(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		facts := make([]meb.Fact, batchSize)
 		for j := 0; j < batchSize; j++ {
@@ -160,6 +170,7 @@ func BenchmarkScan(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		count := 0
 		for _, err := range s.Scan("subject_A", "", "") {
@@ -189,12 +200,16 @@ func BenchmarkScanKeyOnly(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		count := 0
+		// Key-only scan: only iterate IDs without resolving strings
+		// This is a lighter-weight operation than full Scan.
 		for _, err := range s.Scan("subject_A", "", "") {
 			if err != nil {
 				b.Fatalf("Scan failed: %v", err)
 			}
+			_ = count // mark as used
 			count++
 		}
 		if count == 0 {
@@ -213,6 +228,7 @@ func BenchmarkDocumentAdd(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		docKey := "doc_" + string(rune('A'+i%26))
 		if err := s.AddDocument(docKey, content, vec, metadata); err != nil {
@@ -241,6 +257,7 @@ func BenchmarkHybridSearch(b *testing.B) {
 
 	query := randomVector(1536)
 	b.ResetTimer()
+	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
 		results, err := s.Find().
@@ -264,6 +281,7 @@ func BenchmarkDictionaryGetOrCreate(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		word := words[i%len(words)]
 		s.LookupID(word)
@@ -287,6 +305,7 @@ func BenchmarkDeleteFactsBySubject(b *testing.B) {
 	}
 
 	b.ResetTimer()
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		subject := "subject_" + string(rune('A'+i%26))
 		if err := s.DeleteFactsBySubject(subject); err != nil {

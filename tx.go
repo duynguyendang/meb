@@ -3,7 +3,6 @@ package meb
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
@@ -25,7 +24,7 @@ type StoreTxn struct {
 	factDelta int64
 
 	// Post-commit side effects: applied only after txn.Commit() succeeds.
-	postCommitFns []func()
+	postCommitFns []func() error
 }
 
 // BadgerTxn returns the underlying Badger transaction (for debugging).
@@ -34,7 +33,9 @@ func (t *StoreTxn) BadgerTxn() *badger.Txn {
 }
 
 // addPostCommit registers a function to run after the transaction commits successfully.
-func (t *StoreTxn) addPostCommit(fn func()) {
+// Returning an error marks the post-commit phase as failed, which is reported
+// to the caller as a committed-but-inconsistent state.
+func (t *StoreTxn) addPostCommit(fn func() error) {
 	t.postCommitFns = append(t.postCommitFns, fn)
 }
 
@@ -68,6 +69,8 @@ func (m *MEBStore) View(fn func(*StoreTxn) error) error {
 // In-memory side effects (counters, mmap caches, dict caches) are applied only
 // after the Badger transaction commits successfully, using accumulated deltas.
 // BadgerDB SyncWrites: true ensures durability for the transaction path.
+// If a post-commit side effect fails the committed transaction is NOT rolled back;
+// the error is returned so callers can detect the inconsistency.
 func (m *MEBStore) Update(fn func(*StoreTxn) error) error {
 	txn := m.db.NewTransaction(true)
 	st := &StoreTxn{txn: txn, store: m}
@@ -78,15 +81,23 @@ func (m *MEBStore) Update(fn func(*StoreTxn) error) error {
 	if err := txn.Commit(); err != nil {
 		return err
 	}
+
 	// Apply fact count delta
 	if st.factDelta > 0 {
 		m.numFacts.Add(uint64(st.factDelta))
 	} else if st.factDelta < 0 {
 		m.numFacts.Add(^uint64(-st.factDelta - 1))
 	}
+
 	// Apply post-commit side effects (mmap cache updates, dict cache finalization, etc.)
+	var postErr error
 	for _, fn := range st.postCommitFns {
-		fn()
+		if err := fn(); err != nil && postErr == nil {
+			postErr = err
+		}
+	}
+	if postErr != nil {
+		return fmt.Errorf("commit succeeded but post-commit side effect failed: %w", postErr)
 	}
 	return nil
 }
@@ -114,6 +125,9 @@ func (t *StoreTxn) AddFact(fact Fact) error {
 // Uses the store's current topicID.
 // Durability is provided by BadgerDB SyncWrites: true (no WAL needed for txn path).
 func (t *StoreTxn) AddFactBatch(facts []Fact) error {
+	if t.store.config.ReadOnly {
+		return fmt.Errorf("cannot add facts in read-only mode")
+	}
 	added, err := t.store.addFactBatchInTxnCounted(t.txn, facts, t.store.topicID.Load())
 	t.factDelta += int64(added)
 	return err
@@ -128,8 +142,9 @@ func (t *StoreTxn) AddFactBatchWithTopic(facts []Fact, topicID uint32) error {
 }
 
 // DeleteFactsBySubject deletes all facts for the given subject within the transaction.
+// Uses the store's current topicID.
 func (t *StoreTxn) DeleteFactsBySubject(subject string) error {
-	deleted, err := t.store.deleteFactsBySubjectInTxn(t.txn, subject)
+	deleted, err := t.store.deleteFactsBySubjectInTxn(t.txn, subject, t.store.topicID.Load())
 	t.factDelta -= int64(deleted)
 	return err
 }
@@ -153,10 +168,8 @@ func (t *StoreTxn) AddVector(id uint64, vec []float32) error {
 	st := t.store
 	v := make([]float32, len(vec))
 	copy(v, vec)
-	t.addPostCommit(func() {
-		if err := st.vectors.AddToMmapCache(id, v, 0); err != nil {
-			slog.Warn("post-commit mmap cache update failed", "id", id, "error", err)
-		}
+	t.addPostCommit(func() error {
+		return st.vectors.AddToMmapCache(id, v, 0)
 	})
 	return nil
 }
@@ -169,10 +182,8 @@ func (t *StoreTxn) AddVectorWithHash(id uint64, vec []float32, semanticHash uint
 	st := t.store
 	v := make([]float32, len(vec))
 	copy(v, vec)
-	t.addPostCommit(func() {
-		if err := st.vectors.AddToMmapCache(id, v, semanticHash); err != nil {
-			slog.Warn("post-commit mmap cache update failed", "id", id, "error", err)
-		}
+	t.addPostCommit(func() error {
+		return st.vectors.AddToMmapCache(id, v, semanticHash)
 	})
 	return nil
 }
@@ -184,7 +195,7 @@ func (t *StoreTxn) DeleteVector(id uint64) bool {
 	if hasVec {
 		st := t.store
 		vid := id
-		t.addPostCommit(func() { st.vectors.Delete(vid) })
+		t.addPostCommit(func() error { st.vectors.Delete(vid); return nil })
 	}
 	return hasVec
 }
@@ -244,7 +255,7 @@ func (t *StoreTxn) deleteDocumentInTxnDeferred(docKey string, topicID uint32) er
 	if t.store.vectors.HasVector(id) {
 		st := t.store
 		vid := id
-		t.addPostCommit(func() { st.vectors.Delete(vid) })
+		t.addPostCommit(func() error { st.vectors.Delete(vid); return nil })
 	}
 
 	// Delete metadata facts
@@ -277,8 +288,9 @@ func (t *StoreTxn) deleteDocumentInTxnDeferred(docKey string, topicID uint32) er
 	_ = t.store.dict.(*dict.Encoder).DeleteIDInTxnDiskOnly(t.txn, id, docKey)
 	st := t.store
 	dKey := docKey
-	t.addPostCommit(func() {
+	t.addPostCommit(func() error {
 		st.dict.(*dict.Encoder).RemoveFromCaches(dKey, id)
+		return nil
 	})
 
 	return nil
@@ -560,6 +572,7 @@ func (m *MEBStore) addFactBatchInTxnCounted(txn *badger.Txn, facts []Fact, topic
 		return 0, fmt.Errorf("failed to encode strings: %w", err)
 	}
 
+	var insertCount int
 	for i, fact := range facts {
 		sID := ids[factStringRefs[i][0].index]
 		pID := ids[factStringRefs[i][1].index]
@@ -585,22 +598,37 @@ func (m *MEBStore) addFactBatchInTxnCounted(txn *badger.Txn, facts []Fact, topic
 		value := encodeTripleValueWithHints(0, 0, hints)
 
 		spoKey := keys.EncodeTripleKey(keys.TripleSPOPrefix, sID, pID, oID)
+		opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, sID, pID, oID)
+
+		// Check if the fact already exists to avoid double-counting.
+		// txn.Set is an upsert — without this check, overwrites would be
+		// counted as new facts, inflating numFacts.
+		_, spoErr := txn.Get(spoKey)
+		if spoErr == badger.ErrKeyNotFound {
+			insertCount++
+		}
+
 		if err := txn.Set(spoKey, value); err != nil {
 			return 0, fmt.Errorf("failed to set SPO key for fact %d: %w", i, err)
 		}
 
-		opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, sID, pID, oID)
 		if err := txn.Set(opsKey, value); err != nil {
 			return 0, fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
 		}
 	}
 
-	return len(facts), nil
+	return insertCount, nil
 }
 
-func (m *MEBStore) deleteFactsBySubjectInTxn(txn *badger.Txn, subject string) (int, error) {
+func (m *MEBStore) deleteFactsBySubjectInTxn(txn *badger.Txn, subject string, topicID uint32) (int, error) {
 	sID, err := m.dict.GetID(subject)
 	if err != nil {
+		return 0, nil
+	}
+
+	// Pack subject ID with topic ID — facts are stored with topic-packed IDs
+	sID = keys.PackID(topicID, keys.UnpackLocalID(sID))
+	if keys.UnpackLocalID(sID) == 0 {
 		return 0, nil
 	}
 

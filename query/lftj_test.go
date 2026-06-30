@@ -2,11 +2,7 @@ package query
 
 import (
 	"context"
-	"log/slog"
-	"os"
 	"sort"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -209,21 +205,6 @@ func TestLFTJOrderedBufferOverflow(t *testing.T) {
 		insertTriple(t, db, keys.TripleOPSPrefix, 1, 100, i)
 	}
 
-	var warnCount int
-	var mu sync.Mutex
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelWarn,
-		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-			if a.Key == "msg" && strings.Contains(a.Value.String(), "buffer overflow") {
-				mu.Lock()
-				warnCount++
-				mu.Unlock()
-			}
-			return a
-		},
-	}))
-	slog.SetDefault(logger)
-
 	engine := NewLFTJEngine(db)
 	ctx := withVisitLimit(100000)
 
@@ -236,24 +217,25 @@ func TestLFTJOrderedBufferOverflow(t *testing.T) {
 	}
 	resultVars := []string{"leaf"}
 
-	count := 0
+	var results []uint64
 	for result, err := range engine.ExecuteOrdered(ctx, relations, nil, resultVars, WithBufferAndSort(5)) {
 		if err != nil {
 			t.Fatalf("error: %v", err)
 		}
-		_ = result.Canonical()
-		count++
+		results = append(results, result.Values[0])
 	}
 
-	if count == 0 {
-		t.Fatal("expected at least one result")
+	if len(results) != 5 {
+		t.Fatalf("expected 5 results (buffer size), got %d", len(results))
 	}
 
-	mu.Lock()
-	if warnCount == 0 {
-		t.Error("expected buffer overflow warning, got none")
+	// Verify results are sorted (Canonical order)
+	for i := 1; i < len(results); i++ {
+		if results[i] <= results[i-1] {
+			t.Errorf("results not sorted: %v", results)
+			break
+		}
 	}
-	mu.Unlock()
 }
 
 func TestLFTJLegacyExecuteStillWorks(t *testing.T) {

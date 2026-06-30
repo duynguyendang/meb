@@ -346,8 +346,13 @@ func DotProductHybridWithPruning(a, b []byte, dim int, cfg *HybridConfig, thresh
 	blockSize := cfg.BlockSize
 
 	// Read per-block norms from the database vector into a stack-sized array.
-	// 64 blocks × 4 bytes = 256 bytes fits easily on stack.
-	var normA [64]float32
+	// 64 blocks × 4 bytes = 256 bytes fits easily on stack for dim <= 2048.
+	// Beyond that, fall back to heap allocation to avoid out-of-bounds access.
+	var normABuf [64]float32
+	normA := normABuf[:]
+	if numBlocks > 64 {
+		normA = make([]float32, numBlocks)
+	}
 	for bl := 0; bl < numBlocks; bl++ {
 		blockStride := 12 + cfg.BlockSize
 		if cfg.BitWidth == 4 {
@@ -361,7 +366,11 @@ func DotProductHybridWithPruning(a, b []byte, dim int, cfg *HybridConfig, thresh
 
 	// Compute suffix sums of normA[r] * queryBlockNorms[r] for Cauchy-Schwarz bound.
 	// suffixNormSum[b] = Σ_{r>=b} normA[r] * queryBlockNorms[r]
-	var suffixNormSum [65]float32
+	var suffixNormSumBuf [65]float32
+	suffixNormSum := suffixNormSumBuf[:]
+	if numBlocks > 64 {
+		suffixNormSum = make([]float32, numBlocks+1)
+	}
 	for bl := numBlocks - 1; bl >= 0; bl-- {
 		suffixNormSum[bl] = suffixNormSum[bl+1] + normA[bl]*queryBlockNorms[bl]
 	}

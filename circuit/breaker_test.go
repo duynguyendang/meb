@@ -3,6 +3,7 @@ package circuit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -73,7 +74,7 @@ func TestExecuteContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := b.ExecuteContext(ctx, func() error {
+	err := b.ExecuteContext(ctx, func(_ context.Context) error {
 		return nil
 	})
 	if err != ErrQueryCancelled {
@@ -186,7 +187,7 @@ func TestPanicRecovery(t *testing.T) {
 
 func TestExecuteWithResult(t *testing.T) {
 	b := NewBreaker(nil)
-	result, err := b.ExecuteWithResult(context.Background(), func() (interface{}, error) {
+	result, err := b.ExecuteWithResult(context.Background(), func(_ context.Context) (interface{}, error) {
 		return "hello", nil
 	})
 	if err != nil {
@@ -222,5 +223,23 @@ func TestConcurrentExecute(t *testing.T) {
 	m := b.Metrics()
 	if m.TotalQueries != 100 {
 		t.Errorf("expected 100 total queries, got %d", m.TotalQueries)
+	}
+}
+
+func TestRecordFailure_WrappedTimeout(t *testing.T) {
+	b := NewBreaker(nil)
+	wrapped := fmt.Errorf("query failed: %w", ErrQueryTimeout)
+	err := b.Execute(func() error {
+		return wrapped
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	m := b.MetricsSnapshot()
+	if m.TimeoutQueries != 1 {
+		t.Errorf("expected 1 timeout (wrapped), got %d", m.TimeoutQueries)
+	}
+	if m.FailedQueries != 1 {
+		t.Errorf("expected 1 failed query, got %d", m.FailedQueries)
 	}
 }

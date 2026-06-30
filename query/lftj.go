@@ -316,6 +316,10 @@ type TrieIterator struct {
 	// When Next() or Seek() advances past this prefix, the iterator stops
 	// instead of wandering into adjacent branches.
 	depthPrefixLen int
+
+	// lastKey tracks the last key returned by Key() to detect backward seeks.
+	// Badger's Seek is forward-only; if target < lastKey we must reopen.
+	lastKey uint64
 }
 
 func NewTrieIterator(txn *badger.Txn, prefix byte, bound map[int]uint64) *TrieIterator {
@@ -333,6 +337,7 @@ func (ti *TrieIterator) Open() {
 	ti.buildPrefix()
 	ti.it.Seek(ti.keyBuf[:ti.prefixLen()])
 	ti.depthPrefixLen = ti.prefixLen()
+	ti.lastKey = 0
 	ti.validatePosition()
 }
 
@@ -365,7 +370,9 @@ func (ti *TrieIterator) Key() uint64 {
 		return 0
 	}
 	s, p, o := keys.DecodeTripleKey(key)
-	return ti.keyAtDepth(s, p, o)
+	k := ti.keyAtDepth(s, p, o)
+	ti.lastKey = k
+	return k
 }
 
 func (ti *TrieIterator) keyAtDepth(s, p, o uint64) uint64 {
@@ -390,6 +397,15 @@ func (ti *TrieIterator) keyAtDepth(s, p, o uint64) uint64 {
 func (ti *TrieIterator) Seek(target uint64) {
 	if ti.atEnd || ti.it == nil {
 		return
+	}
+
+	// Badger iterator is forward-only. If target < lastKey, reopen from scratch.
+	if target < ti.lastKey {
+		ti.Close()
+		ti.Open()
+		if ti.atEnd {
+			return
+		}
 	}
 
 	boundWithTarget := make(map[int]uint64)
@@ -440,6 +456,11 @@ func (ti *TrieIterator) Next() {
 
 func (ti *TrieIterator) leapfrogTopicID() {
 	if ti.it == nil || !ti.it.Valid() {
+		return
+	}
+
+	// No bound subject — can't determine expected topic, skip leapfrog
+	if _, ok := ti.bound[0]; !ok {
 		return
 	}
 

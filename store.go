@@ -7,6 +7,7 @@ import (
 	"iter"
 	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,7 +34,7 @@ type MEBStore struct {
 	factsSinceGC          atomic.Uint64
 
 	vectors *vector.VectorRegistry
-	breaker *circuit.Breaker
+	breaker atomic.Pointer[circuit.Breaker]
 
 	ivfpq *vector.IVFPQIndex
 	hnsw  *vector.HNSWIndex
@@ -49,6 +50,8 @@ type MEBStore struct {
 
 	cleanupStop chan struct{}
 	cleanupDone chan struct{}
+	cleanupMu   sync.Mutex
+	shutdownMu  sync.Mutex
 	cleanupGen  atomic.Uint64
 
 	lftjEngine *query.LFTJEngine
@@ -123,6 +126,29 @@ func (m *MEBStore) ensureSchemaVersion() error {
 	return nil
 }
 
+// replayObject reconstructs the original Go type from a WAL entry's
+// object string and persisted objType tag. This is lossless — unlike
+// the prior heuristic approach, "123" stays "123" when objType is
+// walObjString, and reconstructs as int32(123) when objType is walObjInt32.
+func replayObject(e walEntry) any {
+	switch e.objType {
+	case walObjBool:
+		return e.object == "true"
+	case walObjInt32:
+		if v, err := strconv.ParseInt(e.object, 10, 32); err == nil {
+			return int32(v)
+		}
+		return e.object
+	case walObjFloat32:
+		if v, err := strconv.ParseFloat(e.object, 32); err == nil {
+			return float32(v)
+		}
+		return e.object
+	default:
+		return e.object
+	}
+}
+
 func (m *MEBStore) replayWAL() error {
 	entries, err := m.wal.ReadAll()
 	if err != nil {
@@ -149,15 +175,11 @@ func (m *MEBStore) replayWAL() error {
 		slog.Info("WAL replay skipping dedup (exceeded threshold)", "threshold", dedupMaxEntries)
 		facts = make([]Fact, 0, len(entries))
 		for _, e := range entries {
-			fact := Fact{
+			facts = append(facts, Fact{
 				Subject:   e.subject,
 				Predicate: e.pred,
-				Object:    e.object,
-			}
-			if fact.Object == nil && fact.Predicate != "" {
-				fact.Object = ""
-			}
-			facts = append(facts, fact)
+				Object:    replayObject(e),
+			})
 		}
 	} else {
 		// Build set of existing facts to prevent duplicates on replay
@@ -171,10 +193,7 @@ func (m *MEBStore) replayWAL() error {
 			fact := Fact{
 				Subject:   e.subject,
 				Predicate: e.pred,
-				Object:    e.object,
-			}
-			if fact.Object == nil && fact.Predicate != "" {
-				fact.Object = ""
+				Object:    replayObject(e),
 			}
 
 			factKey := factKeyString(fact)
@@ -187,8 +206,8 @@ func (m *MEBStore) replayWAL() error {
 	}
 
 	if len(facts) > 0 {
-		if err := m.AddFactBatch(facts); err != nil {
-			return fmt.Errorf("WAL replay AddFactBatch failed: %w", err)
+		if err := m.addFactBatchInternal(facts); err != nil {
+			return fmt.Errorf("WAL replay addFactBatchInternal failed: %w", err)
 		}
 	}
 
@@ -307,14 +326,14 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		dict:              dictEncoder,
 		config:            cfg,
 		vectors:           vector.NewRegistry(db, vCfg),
-		breaker:           circuit.NewBreaker(nil),
 		defaultEntityType: keys.EntityUnknown,
 		cleanupStop:       make(chan struct{}),
 		cleanupDone:       make(chan struct{}),
 		lftjEngine:        query.NewLFTJEngine(db),
 		wal:               wal,
 	}
-	m.breaker.OnStateChange(func(oldState, newState circuit.State, err error) {
+	m.breaker.Store(circuit.NewBreaker(nil))
+	m.breaker.Load().OnStateChange(func(oldState, newState circuit.State, err error) {
 		m.telemetry.Emit("circuit_state_change", map[string]any{
 			"oldState": oldState.String(),
 			"newState": newState.String(),
@@ -349,6 +368,9 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 }
 
 func (m *MEBStore) Reset() error {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+
 	slog.Info("resetting store", "factCount", m.numFacts.Load())
 
 	// Stage 1: resetStop — stop the cleanup loop without holding m.mu for long
@@ -415,7 +437,10 @@ func (m *MEBStore) Reset() error {
 
 // resetStop stops the cleanup loop. Must be called without holding m.mu.
 func (m *MEBStore) resetStop() error {
-	m.cleanupGen.Add(1) // bump generation so old cleanup goroutines exit
+	m.cleanupMu.Lock()
+	defer m.cleanupMu.Unlock()
+
+	m.cleanupGen.Add(1)
 
 	select {
 	case <-m.cleanupStop:
@@ -435,10 +460,22 @@ func (m *MEBStore) resetRestart() {
 }
 
 func (m *MEBStore) Close() error {
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+
 	slog.Info("closing store", "factCount", m.numFacts.Load())
 
-	close(m.cleanupStop)
+	// Use cleanupMu to serialize close-and-wait with concurrent Reset() calls.
+	m.cleanupMu.Lock()
+	m.cleanupGen.Add(1)
+	select {
+	case <-m.cleanupStop:
+		// already closed
+	default:
+		close(m.cleanupStop)
+	}
 	<-m.cleanupDone
+	m.cleanupMu.Unlock()
 
 	var errs []error
 
@@ -611,19 +648,19 @@ func (m *MEBStore) RunValueLogGC(ratio float64) error {
 }
 
 func (m *MEBStore) CircuitBreaker() *circuit.Breaker {
-	return m.breaker
+	return m.breaker.Load()
 }
 
 func (m *MEBStore) SetCircuitBreakerConfig(config *circuit.Config) {
-	m.breaker = circuit.NewBreaker(config)
+	m.breaker.Store(circuit.NewBreaker(config))
 }
 
 func (m *MEBStore) CircuitBreakerMetrics() circuit.Metrics {
-	return m.breaker.Metrics()
+	return m.breaker.Load().Metrics()
 }
 
 func (m *MEBStore) CircuitBreakerMetricsSnapshot() circuit.MetricsSnapshot {
-	return m.breaker.MetricsSnapshot()
+	return m.breaker.Load().MetricsSnapshot()
 }
 
 func (m *MEBStore) RegisterTelemetrySink(sink TelemetrySink) {
@@ -836,8 +873,10 @@ func (m *MEBStore) runCleanup() {
 	}
 
 	// Phase 2: Clean up orphaned dictionary entries
-	dictCleaned := m.cleanupOrphanedDictEntries(nil)
-	if dictCleaned > 0 {
+	dictCleaned, err := m.cleanupOrphanedDictEntries(nil)
+	if err != nil {
+		slog.Warn("orphaned dict cleanup skipped", "error", err)
+	} else if dictCleaned > 0 {
 		slog.Info("orphaned dictionary entries cleaned up", "count", dictCleaned)
 		m.telemetry.Emit("dict_orphan_cleanup", map[string]any{
 			"count": dictCleaned,
@@ -1067,8 +1106,14 @@ func (m *MEBStore) FindSubjectsByObject(ctx context.Context, predicate, object s
 				continue
 			}
 			
-			// Check if object matches
-			if objStr, ok := fact.Object.(string); ok && objStr == object {
+			// Check if object matches — handle both string and inline-encoded types.
+			var matches bool
+			if objStr, ok := fact.Object.(string); ok {
+				matches = objStr == object
+			} else {
+				matches = fmt.Sprintf("%v", fact.Object) == object
+			}
+			if matches {
 				if !yield(fact.Subject) {
 					return
 				}

@@ -12,9 +12,16 @@ import (
 
 const (
 	walFileName     = "meb.wal"
-	walHeaderSize   = 8 + 2 + 2 + 2 // id:8 + subjLen:2 + predLen:2 + objLen:2
+	walHeaderSize   = 8 + 2 + 2 + 2 + 1 // id:8 + subjLen:2 + predLen:2 + objLen:2 + objType:1
 	walCRC32Size    = 4
-	walMinRecordLen = walHeaderSize + walCRC32Size // 18 bytes minimum
+	walMinRecordLen = walHeaderSize + walCRC32Size // 19 bytes minimum
+)
+
+const (
+	walObjString uint8 = iota
+	walObjBool
+	walObjInt32
+	walObjFloat32
 )
 
 // walMagicV2 is the 8-byte magic header for v2 WAL files: "MEB\0WAL\x02"
@@ -28,6 +35,7 @@ type walEntry struct {
 	subject string
 	pred    string
 	object  string
+	objType uint8 // 0=string, 1=bool, 2=int32, 3=float32
 }
 
 type WAL struct {
@@ -115,6 +123,56 @@ func (w *WAL) Append(entry walEntry) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.appendLocked(entry)
+}
+
+// AppendBatch writes multiple entries in a single write and single Sync call.
+// Returns nil if no WAL is configured (in-memory mode).
+// Returns ErrWALClosed if the WAL has been closed or is currently being cleared.
+func (w *WAL) AppendBatch(entries []walEntry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.path == "" {
+		return nil
+	}
+	if w.file == nil {
+		return ErrWALClosed
+	}
+
+	var buf []byte
+	for _, entry := range entries {
+		subjBytes := []byte(entry.subject)
+		predBytes := []byte(entry.pred)
+		objBytes := []byte(entry.object)
+
+		payloadLen := len(subjBytes) + len(predBytes) + len(objBytes)
+		entryLen := walHeaderSize + payloadLen + walCRC32Size
+		off := len(buf)
+		buf = append(buf, make([]byte, entryLen)...)
+
+		binary.BigEndian.PutUint64(buf[off+0:off+8], 0) // reserved
+		binary.BigEndian.PutUint16(buf[off+8:off+10], uint16(len(subjBytes)))
+		binary.BigEndian.PutUint16(buf[off+10:off+12], uint16(len(predBytes)))
+		binary.BigEndian.PutUint16(buf[off+12:off+14], uint16(len(objBytes)))
+		buf[off+14] = entry.objType
+		dataOff := off + 15
+		copy(buf[dataOff:], subjBytes)
+		copy(buf[dataOff+len(subjBytes):], predBytes)
+		copy(buf[dataOff+len(subjBytes)+len(predBytes):], objBytes)
+
+		crc := crc32.Checksum(buf[off:off+15+payloadLen], crc32cTable)
+		copy(buf[len(buf)-walCRC32Size:], crc32Bytes(crc))
+	}
+
+	_, err := w.file.Write(buf)
+	if err != nil {
+		return fmt.Errorf("WAL batch append failed: %w", err)
+	}
+	return w.file.Sync()
+}
+
+func (w *WAL) appendLocked(entry walEntry) error {
 	if w.path == "" {
 		return nil
 	}
@@ -133,12 +191,14 @@ func (w *WAL) Append(entry walEntry) error {
 	binary.BigEndian.PutUint16(buf[8:10], uint16(len(subjBytes)))
 	binary.BigEndian.PutUint16(buf[10:12], uint16(len(predBytes)))
 	binary.BigEndian.PutUint16(buf[12:14], uint16(len(objBytes)))
-	copy(buf[14:], subjBytes)
-	copy(buf[14+len(subjBytes):], predBytes)
-	copy(buf[14+len(subjBytes)+len(predBytes):], objBytes)
+	buf[14] = entry.objType
+	dataOff := 15
+	copy(buf[dataOff:], subjBytes)
+	copy(buf[dataOff+len(subjBytes):], predBytes)
+	copy(buf[dataOff+len(subjBytes)+len(predBytes):], objBytes)
 
 	// CRC32C covers header + payload (everything except the CRC bytes themselves)
-	crc := crc32.Checksum(buf[:14+payloadLen], crc32cTable)
+	crc := crc32.Checksum(buf[:dataOff+payloadLen], crc32cTable)
 	copy(buf[len(buf)-walCRC32Size:], crc32Bytes(crc))
 
 	_, err := w.file.Write(buf)
@@ -148,9 +208,13 @@ func (w *WAL) Append(entry walEntry) error {
 	return w.file.Sync()
 }
 
-// ReadAll reads all entries from the WAL file. It handles both v1 and v2 formats.
+// ReadAll reads all entries from the WAL file (v2 format with magic header and CRC).
 // On CRC mismatch (torn last record), returns the valid records so far and logs a warning.
+// Must hold mu to be atomic with Clear.
 func (w *WAL) ReadAll() ([]walEntry, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if w.path == "" {
 		return nil, nil
 	}
@@ -182,6 +246,7 @@ func (w *WAL) readV2WAL() ([]walEntry, error) {
 		subjLen := int(binary.BigEndian.Uint16(data[offset+8 : offset+10]))
 		predLen := int(binary.BigEndian.Uint16(data[offset+10 : offset+12]))
 		objLen := int(binary.BigEndian.Uint16(data[offset+12 : offset+14]))
+		objType := data[offset+14]
 		payloadLen := subjLen + predLen + objLen
 		recordLen := walHeaderSize + payloadLen + walCRC32Size
 
@@ -211,10 +276,12 @@ func (w *WAL) readV2WAL() ([]walEntry, error) {
 			break
 		}
 
+		dataOff := offset + 15
 		entry := walEntry{
-			subject: string(data[offset+14 : offset+14+subjLen]),
-			pred:    string(data[offset+14+subjLen : offset+14+subjLen+predLen]),
-			object:  string(data[offset+14+subjLen+predLen : offset+14+subjLen+predLen+objLen]),
+			subject: string(data[dataOff : dataOff+subjLen]),
+			pred:    string(data[dataOff+subjLen : dataOff+subjLen+predLen]),
+			object:  string(data[dataOff+subjLen+predLen : dataOff+subjLen+predLen+objLen]),
+			objType: objType,
 		}
 		entries = append(entries, entry)
 		offset += recordLen

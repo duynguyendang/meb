@@ -16,9 +16,16 @@ func (idx *HNSWIndex) SoftDelete(packedID uint64) error {
 	val := make([]byte, 8)
 	binary.BigEndian.PutUint64(val, uint64(now))
 
-	return idx.db.Update(func(txn *badger.Txn) error {
+	if err := idx.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(tombstoneKey, val)
-	})
+	}); err != nil {
+		return err
+	}
+
+	idx.tombstonesMu.Lock()
+	idx.tombstones[packedID] = struct{}{}
+	idx.tombstonesMu.Unlock()
+	return nil
 }
 
 func (idx *HNSWIndex) isDeleted(packedID uint64) bool {
@@ -42,9 +49,8 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 	}
 	var toRemove []nodeEntry
 	var tombstoneKeys [][]byte
-	var currentEntry uint64
 
-	currentEntry = idx.getEntryPoint(topicID)
+	currentEntry, hasEP := idx.getEntryPoint(topicID)
 
 	err := idx.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -94,7 +100,7 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 		return nil
 	}
 
-	return idx.db.Update(func(txn *badger.Txn) error {
+	err = idx.db.Update(func(txn *badger.Txn) error {
 		for _, entry := range toRemove {
 			key := keys.EncodeHNSWKey(entry.packedID, entry.level)
 			if err := txn.Delete(key); err != nil {
@@ -106,10 +112,11 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 				return err
 			}
 		}
-		if currentEntry != 0 && idx.isDeleted(currentEntry) {
+		if hasEP && idx.isDeleted(currentEntry) {
 			// Current entry point is deleted — pick a new one from any remaining
 			// active node in this topic.
-			newEntry := uint64(0)
+			var newEntry uint64
+			var found bool
 			dit := txn.NewIterator(badger.DefaultIteratorOptions)
 			defer dit.Close()
 			for dit.Seek(prefix); dit.ValidForPrefix(prefix); dit.Next() {
@@ -118,13 +125,14 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 					continue
 				}
 				packedID := binary.BigEndian.Uint64(key[1:9])
-				if newEntry == 0 {
+				if !found {
 					newEntry = packedID
+					found = true
 				}
 				_ = key[9] // level byte
 			}
 			idx.entryPointMu.Lock()
-			if newEntry != 0 {
+			if found {
 				idx.entryPoints[topicID] = newEntry
 			} else {
 				delete(idx.entryPoints, topicID)
@@ -133,4 +141,16 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	// Remove compacted nodes from in-memory tombstone cache.
+	idx.tombstonesMu.Lock()
+	for _, entry := range toRemove {
+		delete(idx.tombstones, entry.packedID)
+	}
+	idx.tombstonesMu.Unlock()
+
+	return nil
 }

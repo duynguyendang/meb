@@ -307,11 +307,7 @@ func (idx *IVFPQIndex) precomputeLUT(transformed []float32, codebook []float32) 
 }
 
 func (idx *IVFPQIndex) adcDistance(lut []float32, pqCodes []byte) float32 {
-	dist := float32(0)
-	for s := 0; s < len(pqCodes); s++ {
-		dist += lut[s*256+int(pqCodes[s])]
-	}
-	return dist
+	return adcAccum(lut, pqCodes)
 }
 
 func (idx *IVFPQIndex) loadCodebook(txn *badger.Txn, topicID uint32) ([]float32, error) {

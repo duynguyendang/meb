@@ -71,9 +71,15 @@ type VectorRegistry struct {
 	hybridCfg  *HybridConfig
 	vectorSize int
 
-	segments          []*mmapSegment
+	segments          *atomic.Pointer[[]*mmapSegment]
 	vectorsPerSegment int
-	totalVectors      int
+	totalVectors      atomic.Int64
+
+	// cellsPtr is an RCU-published slice of per-slot atomic pointers.
+	// Each cell is independently swappable: writers allocate new slotData
+	// and atomically store the pointer; readers load and read through it.
+	// Data is immutable after publication. nil = uninitialized/tombstone.
+	cellsPtr *atomic.Pointer[[]atomic.Pointer[slotData]]
 
 	idMap    map[uint64]uint32
 	revMap   *atomic.Pointer[[]uint64] // RCU-style: atomic swap avoids full copy under RLock
@@ -90,19 +96,31 @@ type VectorRegistry struct {
 
 const hashSize = 1 // 1 byte for semantic hash filter per vector entry
 
-// appendRevMap extends the revMap by one entry. O(1) when pre-allocated capacity allows.
+// slotData holds the bytes for one vector slot.
+// Once published via an atomic.Pointer[slotData] cell, data must not be mutated.
+//
+// Two backing stores exist: newly-appended slots point directly into the
+// contiguous mmap region (zero-copy, no heap pressure). Overwrites and
+// delete-swaps allocate a new slotData on the Go heap and atomically
+// publish the pointer, detaching that slot from the mmap. For update-heavy
+// or churn-heavy workloads this adds GC pressure and RSS beyond the mmap
+// size, trading the "O(k) memory, disk-scaled" property for correctness.
+// The primary store (BadgerDB) holds the authoritative copy regardless.
+type slotData struct {
+	data []byte
+}
+
+// appendRevMap extends the revMap by one entry.
+// Allocates a new slice every time to avoid data races: in-place append
+// mutates the slice header (len/cap) which a concurrent RLock reader
+// might be mid-read on, seeing a truncated or extended view.
 // Must be called under mu.Lock().
 func (r *VectorRegistry) appendRevMap(id uint64) {
-	oldRev := r.revMap.Load()
-	if cap(*oldRev) > len(*oldRev) {
-		*oldRev = append(*oldRev, id)
-		r.revMap.Store(oldRev)
-	} else {
-		newRev := make([]uint64, len(*oldRev)+1, len(*oldRev)*2)
-		copy(newRev, *oldRev)
-		newRev[len(*oldRev)] = id
-		r.revMap.Store(&newRev)
-	}
+	oldRev := *r.revMap.Load()
+	newRev := make([]uint64, len(oldRev)+1, max(len(oldRev)*2, 1))
+	copy(newRev, oldRev)
+	newRev[len(oldRev)] = id
+	r.revMap.Store(&newRev)
 }
 
 func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
@@ -139,6 +157,17 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 			p.Store(&rev)
 			return p
 		}(),
+		segments: func() *atomic.Pointer[[]*mmapSegment] {
+			p := &atomic.Pointer[[]*mmapSegment]{}
+			p.Store(&[]*mmapSegment{})
+			return p
+		}(),
+		cellsPtr: func() *atomic.Pointer[[]atomic.Pointer[slotData]] {
+			p := &atomic.Pointer[[]atomic.Pointer[slotData]]{}
+			cells := make([]atomic.Pointer[slotData], 0, cfg.VectorCapacity)
+			p.Store(&cells)
+			return p
+		}(),
 		db: db,
 	}
 
@@ -158,21 +187,24 @@ func (r *VectorRegistry) Reset() error {
 
 	r.mu.Lock()
 
+	oldSegs := *r.segments.Load()
+
 	slog.Info("resetting vector registry",
-		"totalVectors", r.totalVectors,
-		"segments", len(r.segments),
+		"totalVectors", r.totalVectors.Load(),
+		"segments", len(oldSegs),
 	)
 
 	// Move current segments to tombstone list
-	if len(r.segments) > 0 {
-		r.tombstoneSegments = append(r.tombstoneSegments, r.segments...)
+	if len(oldSegs) > 0 {
+		r.tombstoneSegments = append(r.tombstoneSegments, oldSegs...)
 	}
 
 	// Clear mappings
 	r.idMap = make(map[uint64]uint32, r.config.InitialCapacity)
 	r.revMap.Store(&[]uint64{})
-	r.totalVectors = 0
-	r.segments = r.segments[:0]
+	r.totalVectors.Store(0)
+	r.segments.Store(&[]*mmapSegment{})
+	r.cellsPtr.Store(&[]atomic.Pointer[slotData]{})
 
 	r.mu.Unlock()
 
@@ -193,7 +225,7 @@ func (r *VectorRegistry) Reset() error {
 	}
 
 	slog.Info("vector registry reset complete",
-		"tombstonedSegments", len(r.segments),
+		"tombstonedSegments", len(r.tombstoneSegments),
 	)
 	return nil
 }
@@ -212,23 +244,67 @@ func (r *VectorRegistry) WaitTombstones() {
 // ensureCapacity grows the segment list if needed to hold the required number of vectors.
 func (r *VectorRegistry) ensureCapacity(totalVectors int) error {
 	requiredSegs := (totalVectors + r.vectorsPerSegment - 1) / r.vectorsPerSegment
-	for len(r.segments) < requiredSegs {
-		segIdx := len(r.segments)
+	for {
+		oldSegs := *r.segments.Load()
+		if len(oldSegs) >= requiredSegs {
+			return nil
+		}
+		segIdx := len(oldSegs)
 		segBytes := r.vectorsPerSegment * r.vectorSize
 		seg, err := newMmapSegment(r.config.SegmentDir, segIdx, segBytes)
 		if err != nil {
 			return fmt.Errorf("failed to create segment %d: %w", segIdx, err)
 		}
-		r.segments = append(r.segments, seg)
+		newSegs := make([]*mmapSegment, len(oldSegs)+1)
+		copy(newSegs, oldSegs)
+		newSegs[len(oldSegs)] = seg
+		r.segments.Store(&newSegs)
 	}
-	return nil
 }
 
-// getVectorSlice returns a writable slice for the vector at the given index.
+// ensureCells grows the cells slice so it has room for at least n entries.
+// Must be called under mu.Lock().
+func (r *VectorRegistry) ensureCells(n int) {
+	old := *r.cellsPtr.Load()
+	if len(old) >= n {
+		return
+	}
+	newCap := max(n, len(old)*3/2)
+	new := make([]atomic.Pointer[slotData], newCap)
+	copy(new, old)
+	r.cellsPtr.Store(&new)
+}
+
+// slotDataOf returns the slotData pointer for the given index, or nil if
+// tombstoned/uninitialized. Safe for lock-free readers after a successful
+// acquire-load of r.totalVectors (which orders the cellsPtr.Store before it).
+//
+// During a delete-swap a lock-free reader may briefly pair a moved slot's
+// bytes with a stale revMap id — this is eventual consistency of search
+// results, not a data race, and is acceptable for a cache layer.
+func (r *VectorRegistry) slotDataOf(idx int) *slotData {
+	return (*r.cellsPtr.Load())[idx].Load()
+}
+
+// slotBytes returns the full slot data (hash byte followed by vector data) for the
+// given index, or nil if tombstoned. Safe for lock-free readers.
+func (r *VectorRegistry) slotBytes(idx int) []byte {
+	sd := r.slotDataOf(idx)
+	if sd == nil {
+		return nil
+	}
+	return sd.data
+}
+
+// getVectorSlice returns a writable slice into the underlying mmap for the vector
+// at the given index. Safe only under r.mu.Lock() — used during initial append to
+// write directly to the mmap before the slotData is published via the cell.
+// For existing/published slots, use slotDataOf.
 func (r *VectorRegistry) getVectorSlice(idx int) []byte {
+	segs := *r.segments.Load()
 	segIdx := idx / r.vectorsPerSegment
 	offset := (idx % r.vectorsPerSegment) * r.vectorSize
-	return r.segments[segIdx].data[offset : offset+r.vectorSize]
+	return segs[segIdx].data[offset : offset+r.vectorSize]
 }
 
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
@@ -258,18 +334,21 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 	}
 
 	if idx, exists := r.idMap[id]; exists {
-		slot := r.getVectorSlice(int(idx))
-		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+hybridSize], hybridData)
+		// COW: allocate new buffer, write, atomically publish to the cell.
+		buf := make([]byte, r.vectorSize)
+		buf[0] = semanticHash
+		copy(buf[hashSize:hashSize+hybridSize], hybridData)
+		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
 		return nil
 	}
 
-	newTotal := r.totalVectors + 1
-	if err := r.ensureCapacity(newTotal); err != nil {
+	newTotal := r.totalVectors.Load() + 1
+	if err := r.ensureCapacity(int(newTotal)); err != nil {
 		return err
 	}
+	r.ensureCells(int(newTotal))
 
-	idx := uint32(r.totalVectors)
+	idx := uint32(r.totalVectors.Load())
 	r.idMap[id] = idx
 	r.appendRevMap(id)
 
@@ -277,7 +356,9 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 	slot[0] = semanticHash
 	copy(slot[hashSize:hashSize+hybridSize], hybridData)
 
-	r.totalVectors = newTotal
+	// Publish the slot data and bump totalVectors atomically.
+	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize]})
+	r.totalVectors.Store(newTotal)
 	return nil
 }
 
@@ -331,18 +412,21 @@ func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash 
 	}
 
 	if idx, exists := r.idMap[id]; exists {
-		slot := r.getVectorSlice(int(idx))
-		slot[0] = semanticHash
-		copy(slot[hashSize:hashSize+hybridSize], hybridData)
+		// COW: allocate new buffer, write, atomically publish.
+		buf := make([]byte, r.vectorSize)
+		buf[0] = semanticHash
+		copy(buf[hashSize:hashSize+hybridSize], hybridData)
+		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
 		return nil
 	}
 
-	newTotal := r.totalVectors + 1
-	if err := r.ensureCapacity(newTotal); err != nil {
+	newTotal := r.totalVectors.Load() + 1
+	if err := r.ensureCapacity(int(newTotal)); err != nil {
 		return err
 	}
+	r.ensureCells(int(newTotal))
 
-	idx := uint32(r.totalVectors)
+	idx := uint32(r.totalVectors.Load())
 	r.idMap[id] = idx
 	r.appendRevMap(id)
 
@@ -350,7 +434,9 @@ func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash 
 	slot[0] = semanticHash
 	copy(slot[hashSize:hashSize+hybridSize], hybridData)
 
-	r.totalVectors = newTotal
+	// Publish the slot data and bump totalVectors atomically.
+	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize]})
+	r.totalVectors.Store(newTotal)
 	return nil
 }
 
@@ -363,8 +449,8 @@ func (r *VectorRegistry) Close() error {
 
 	// Close current segments without holding the lock during IO.
 	r.mu.Lock()
-	segments := r.segments
-	r.segments = nil
+	segments := *r.segments.Load()
+	r.segments.Store(&[]*mmapSegment{})
 	r.mu.Unlock()
 
 	var lastErr error
@@ -402,12 +488,12 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		return false
 	}
 
-	lastIdx := uint32(r.totalVectors - 1)
+	lastIdx := uint32(r.totalVectors.Load() - 1)
 	revMap := *r.revMap.Load()
 	lastID := revMap[lastIdx]
 
 	if idx != lastIdx {
-		// RCU-style: copy and swap
+		// RCU-style revMap copy-and-swap
 		newRev := make([]uint64, len(revMap)-1)
 		copy(newRev, revMap[:idx])
 		if idx < lastIdx {
@@ -417,16 +503,23 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 		r.revMap.Store(&newRev)
 		r.idMap[lastID] = idx
 
-		srcSlot := r.getVectorSlice(int(lastIdx))
-		dstSlot := r.getVectorSlice(int(idx))
-		copy(dstSlot, srcSlot)
+		// Pointer swap instead of byte copy: the hole cell gets the last
+		// slot's slotData pointer; the last cell is tombstoned (nil).
+		// No mmap byte is touched — readers see either old or new data,
+		// both valid and immutable.
+		cells := *r.cellsPtr.Load()
+		lastData := cells[int(lastIdx)].Load()
+		cells[int(idx)].Store(lastData)
+		cells[int(lastIdx)].Store(nil)
 	} else {
 		truncated := revMap[:lastIdx]
 		r.revMap.Store(&truncated)
+		// Tombstone the cell for the removed slot.
+		(*r.cellsPtr.Load())[int(idx)].Store(nil)
 	}
 
 	delete(r.idMap, id)
-	r.totalVectors--
+	r.totalVectors.Add(-1)
 
 	return true
 }
@@ -439,12 +532,18 @@ func (r *VectorRegistry) HasVector(id uint64) bool {
 }
 
 // GetTQVector returns the TQ-compressed vector data at the given index (skipping hash byte).
+// Lock-free safe: uses atomic load of totalVectors and per-slot cell pointer.
+// The returned slice is immutable (data is never mutated after publication) and
+// valid until the calling goroutine drops the reference — no copy needed.
 func (r *VectorRegistry) GetTQVector(idx int) []byte {
-	if idx < 0 || idx >= r.totalVectors {
+	if idx < 0 || int64(idx) >= r.totalVectors.Load() {
 		return nil
 	}
-	slot := r.getVectorSlice(idx)
-	return slot[hashSize:]
+	sd := r.slotDataOf(idx)
+	if sd == nil {
+		return nil
+	}
+	return sd.data[hashSize:]
 }
 
 func (r *VectorRegistry) HybridConfig() *HybridConfig {
@@ -494,11 +593,11 @@ func (r *VectorRegistry) SaveSnapshot() error {
 	numVectors := len(*r.revMap.Load())
 	slog.Info("saving TQ vector snapshot",
 		"vectorCount", numVectors,
-		"segments", len(r.segments),
+		"segments", len(*r.segments.Load()),
 	)
 
 	// Sync all mmap segments to disk
-	for _, seg := range r.segments {
+	for _, seg := range *r.segments.Load() {
 		if err := seg.sync(); err != nil {
 			slog.Warn("segment sync failed", "error", err)
 		}
@@ -523,9 +622,12 @@ func (r *VectorRegistry) SaveSnapshot() error {
 		chunkBytes := (end - start) * r.vectorSize
 		buf := make([]byte, chunkBytes)
 		for i := start; i < end; i++ {
-			slot := r.getVectorSlice(i)
+			sd := r.slotDataOf(i)
+			if sd == nil {
+				continue
+			}
 			off := (i - start) * r.vectorSize
-			copy(buf[off:off+r.vectorSize], slot)
+			copy(buf[off:off+r.vectorSize], sd.data)
 		}
 		key := fmt.Appendf(nil, "sys:tq:vectors:%d", start/chunkSize)
 		if err := batch.Set(key, buf); err != nil {
@@ -597,9 +699,9 @@ func (r *VectorRegistry) LoadSnapshot() error {
 		return err
 	}
 
-	if r.totalVectors > 0 {
+	if r.totalVectors.Load() > 0 {
 		slog.Info("TQ vector snapshot loaded",
-			"vectorCount", r.totalVectors,
+			"vectorCount", r.totalVectors.Load(),
 			"vectorSize", r.vectorSize,
 		)
 	}
@@ -633,6 +735,7 @@ func (r *VectorRegistry) loadChunkedSnapshot(txn *badger.Txn, metaItem *badger.I
 	if err := r.ensureCapacity(numVectors); err != nil {
 		return fmt.Errorf("failed to ensure capacity for snapshot: %w", err)
 	}
+	r.ensureCells(numVectors)
 
 	// Load vector data chunks
 	vecIdx := 0
@@ -650,6 +753,7 @@ func (r *VectorRegistry) loadChunkedSnapshot(txn *badger.Txn, metaItem *badger.I
 			for i := 0; i < chunkVecs; i++ {
 				slot := r.getVectorSlice(vecIdx)
 				copy(slot, val[i*r.vectorSize:(i+1)*r.vectorSize])
+				(*r.cellsPtr.Load())[vecIdx].Store(&slotData{data: slot[:r.vectorSize]})
 				vecIdx++
 			}
 			return nil
@@ -657,7 +761,7 @@ func (r *VectorRegistry) loadChunkedSnapshot(txn *badger.Txn, metaItem *badger.I
 			return err
 		}
 	}
-	r.totalVectors = numVectors
+	r.totalVectors.Store(int64(numVectors))
 
 	// Load ID chunks
 	newRev := make([]uint64, numVectors)
@@ -722,18 +826,21 @@ func (r *VectorRegistry) loadFromBadger(txn *badger.Txn) error {
 
 			// Check if ID already exists
 			if idx, exists := r.idMap[id]; exists {
-				// Overwrite in mmap cache
-				slot := r.getVectorSlice(int(idx))
-				slot[0] = hashByte
-				copy(slot[hashSize:hashSize+len(vecData)], vecData)
+				// COW: allocate new buffer, write, atomically publish.
+				buf := make([]byte, hashSize+len(vecData))
+				buf[0] = hashByte
+				copy(buf[hashSize:], vecData)
+				(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
 				return nil
 			}
 
 			// Append new vector
-			idx := uint32(r.totalVectors)
-			if err := r.ensureCapacity(r.totalVectors + 1); err != nil {
-				return fmt.Errorf("failed to ensure capacity for vector %d: %w", r.totalVectors, err)
+			tv := r.totalVectors.Load()
+			idx := uint32(tv)
+			if err := r.ensureCapacity(int(tv + 1)); err != nil {
+				return fmt.Errorf("failed to ensure capacity for vector %d: %w", tv, err)
 			}
+			r.ensureCells(int(tv + 1))
 
 			r.idMap[id] = idx
 			r.appendRevMap(id)
@@ -742,7 +849,8 @@ func (r *VectorRegistry) loadFromBadger(txn *badger.Txn) error {
 			slot[0] = hashByte
 			copy(slot[hashSize:hashSize+len(vecData)], vecData)
 
-			r.totalVectors++
+			(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize]})
+			r.totalVectors.Store(tv + 1)
 			return nil
 		})
 		if err != nil {

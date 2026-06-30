@@ -23,6 +23,9 @@ func NewMebAdapter(db *badger.DB, dict Dictionary) *MebAdapter {
 	}
 }
 
+// Search implements FactSource. It requires at least the subject or object
+// to be bound; a predicate-only query (nil subject, bound predicate, nil object)
+// is unsupported and returns an EmptyIterator.
 func (a *MebAdapter) Search(predicate string, args []any) Iterator {
 	if predicate != "triples" {
 		return &EmptyIterator{}

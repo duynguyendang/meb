@@ -83,32 +83,48 @@ func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
 	}
 
 	key := makeDictForwardKey(s)
+
+	// Single read-write txn to check-then-act atomically.
+	// BadgerDB conflicts detect concurrent creates of the same string.
 	var id uint64
-	err := e.db.View(func(txn *badger.Txn) error {
+	err := e.db.Update(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
-		if err == badger.ErrKeyNotFound {
-			return ErrNotFound
+		if err == nil {
+			return item.Value(func(val []byte) error {
+				id = binary.BigEndian.Uint64(val)
+				return nil
+			})
 		}
-		if err != nil {
+		if err != badger.ErrKeyNotFound {
 			return err
 		}
-		return item.Value(func(val []byte) error {
-			id = binary.BigEndian.Uint64(val)
-			return nil
-		})
+
+		newID, err := e.allocator.Allocate()
+		if err != nil {
+			return fmt.Errorf("failed to allocate ID: %w", err)
+		}
+
+		idBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(idBytes, newID)
+		if err := txn.Set(key, idBytes); err != nil {
+			return err
+		}
+
+		reverseKey := makeDictReverseKey(newID)
+		if err := txn.Set(reverseKey, []byte(s)); err != nil {
+			return err
+		}
+
+		id = newID
+		return nil
 	})
-
-	if err == nil {
-		e.forwardCache.Add(s, id)
-		e.reverseCache.Add(id, s)
-		return id, nil
-	}
-
-	if err != ErrNotFound {
+	if err != nil {
 		return 0, err
 	}
 
-	return e.allocateNewID(s)
+	e.forwardCache.Add(s, id)
+	e.reverseCache.Add(id, s)
+	return id, nil
 }
 
 func (e *Encoder) allocateNewID(s string) (uint64, error) {

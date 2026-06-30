@@ -105,8 +105,9 @@ func TestSegmentedMultipleSegments(t *testing.T) {
 		t.Errorf("expected count 100, got %d", r.Count())
 	}
 
-	if len(r.segments) < 2 {
-		t.Errorf("expected multiple segments, got %d", len(r.segments))
+	segs := *r.segments.Load()
+	if len(segs) < 2 {
+		t.Errorf("expected multiple segments, got %d", len(segs))
 	}
 
 	// Verify segment files exist
@@ -194,6 +195,136 @@ func TestSegmentedConcurrentReadWrite(t *testing.T) {
 	for err := range errors {
 		t.Errorf("concurrent error: %v", err)
 	}
+}
+
+// TestSegmentedConcurrentDeleteVsRead exercises the delete-swap pointer path
+// concurrently with lock-free reads via GetTQVector and Search.
+// Under -race this catches the in-place byte-copy race that the previous
+// RCU-on-totalVectors-only fix missed.
+func TestSegmentedConcurrentDeleteVsRead(t *testing.T) {
+	r := newTestRegistry(t)
+
+	vec := make([]float32, 128)
+	for i := range vec {
+		vec[i] = float32(i) / 128.0
+	}
+
+	// Pre-populate
+	for id := uint64(1); id <= 100; id++ {
+		r.Add(id, vec)
+	}
+
+	var wg sync.WaitGroup
+
+	// Delete workers: delete random live IDs, then re-add under a new ID
+	// to keep the registry populated for readers.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				id := uint64(1 + (base*500+j)%100)
+				r.Delete(id)
+				// Re-add under a fresh ID to keep the index space dense
+				r.Add(1001+uint64(base*500+j), vec)
+			}
+		}(i)
+	}
+
+	// Read workers: call GetTQVector at random positions and Search
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				count := r.Count()
+				if count > 0 {
+					// Read from the middle, not just the tail
+					idx := int(count) / 2
+					_ = r.GetTQVector(idx)
+					// Also read the tail
+					_ = r.GetTQVector(count - 1)
+				}
+				// Search runs without RLock (workers), testing that
+				// slotBytes handles tombstones gracefully
+				ctx := context.Background()
+				results := make([]SearchResult, 0)
+				for sr, err := range r.Search(ctx, vec, 3) {
+					if err != nil {
+						break
+					}
+					results = append(results, sr)
+				}
+				_ = results
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// TestSegmentedConcurrentUpdateVsRead exercises the COW-overwrite path
+// (AddToMmapCache on existing id) concurrently with lock-free reads.
+func TestSegmentedConcurrentUpdateVsRead(t *testing.T) {
+	r := newTestRegistry(t)
+
+	vec := make([]float32, 128)
+	for i := range vec {
+		vec[i] = float32(i) / 128.0
+	}
+
+	// Pre-populate
+	for id := uint64(1); id <= 50; id++ {
+		r.Add(id, vec)
+	}
+
+	var wg sync.WaitGroup
+
+	// Update workers: repeatedly call AddToMmapCache on existing IDs
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				id := uint64(1 + j%50)
+				// Different vector data each time to stress the COW path
+				v := make([]float32, 128)
+				for k := range v {
+					v[k] = float32(j+k) / 128.0
+				}
+				if err := r.AddToMmapCache(id, v, 0); err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	// Read workers: call GetTQVector on the same IDs being updated
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				// Read the IDs being updated from the middle of the index space
+				id := uint64(1 + j%50)
+				idx := int(r.Count()) / 2
+				_ = r.GetTQVector(idx)
+				// Also read via Search
+				ctx := context.Background()
+				results := make([]SearchResult, 0)
+				for sr, err := range r.Search(ctx, vec, 3) {
+					if err != nil {
+						break
+					}
+					results = append(results, sr)
+				}
+				_ = results
+				_ = id
+			}
+		}()
+	}
+
+	wg.Wait()
 }
 
 func TestSegmentedInvalidDimension(t *testing.T) {

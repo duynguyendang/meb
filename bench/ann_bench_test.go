@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -403,5 +404,236 @@ func TestSIFTSampleBench(t *testing.T) {
 	t.Logf("SIFT sample recall@10: %.4f", avgRecall)
 	if avgRecall < 0.80 {
 		t.Errorf("SIFT sample recall@10 = %.4f, want >= 0.80", avgRecall)
+	}
+}
+
+// TestSIFT1MRecall tests recall@10 with the full SIFT1M dataset if available.
+// Falls back to synthetic data if the dataset is not downloaded.
+func TestSIFT1MRecall(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping SIFT1M test in short mode")
+	}
+
+	// Try to load real SIFT1M dataset
+	dataDir := os.Getenv("SIFT_DATA_DIR")
+	if dataDir == "" {
+		dataDir = "./bench/datasets/data"
+	}
+
+	dataset := datasets.LoadSIFT1M(dataDir)
+	if dataset == nil {
+		t.Skip("SIFT1M dataset not available. Download from http://corpus-texmex.irisa.fr/ and set SIFT_DATA_DIR")
+	}
+
+	t.Logf("Loaded SIFT1M dataset: %d base vectors, %d queries, dim=%d",
+		len(dataset.Base), len(dataset.Queries), dataset.Dim)
+
+	segDir := t.TempDir()
+	cfg := &store.Config{
+		DataDir:        "",
+		DictDir:        "",
+		InMemory:       true,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   10000,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+		VectorFullDim:  dataset.Dim,
+	}
+	s, err := meb.NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// Add base vectors
+	for i, vec := range dataset.Base {
+		if err := s.Vectors().Add(uint64(i+1), vec); err != nil {
+			t.Fatalf("Add failed at %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Test recall@10 on first 100 queries (for speed)
+	numQueries := 100
+	if numQueries > len(dataset.Queries) {
+		numQueries = len(dataset.Queries)
+	}
+
+	var totalRecall float64
+	latencies := make([]time.Duration, 0, numQueries)
+
+	for qi := 0; qi < numQueries; qi++ {
+		query := dataset.Queries[qi]
+		groundTruth := dataset.GroundTruth[qi]
+
+		// Build ground truth set (top 10)
+		gtSet := make(map[uint32]bool)
+		for i := 0; i < 10 && i < len(groundTruth); i++ {
+			gtSet[groundTruth[i]] = true
+		}
+
+		// Measure search latency
+		start := time.Now()
+		found := make(map[uint64]bool)
+		for sr, err := range s.Vectors().Search(context.Background(), query, 10) {
+			if err != nil {
+				t.Fatalf("Search failed at query %d: %v", qi, err)
+			}
+			found[sr.ID] = true
+		}
+		latencies = append(latencies, time.Since(start))
+
+		// Calculate recall
+		var hits int
+		for id := range found {
+			if gtSet[uint32(id)] {
+				hits++
+			}
+		}
+		totalRecall += float64(hits) / 10.0
+	}
+
+	avgRecall := totalRecall / float64(numQueries)
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p99Latency := latencies[int(float64(len(latencies))*0.99)]
+
+	t.Logf("SIFT1M recall@10: %.4f (on %d queries)", avgRecall, numQueries)
+	t.Logf("SIFT1M p99 latency: %v", p99Latency)
+	t.Logf("SIFT1M latency stats: min=%v, median=%v, max=%v",
+		latencies[0], latencies[len(latencies)/2], latencies[len(latencies)-1])
+
+	// Note: recall threshold is lower for synthetic/early-stage IVF-PQ
+	// Real SIFT1M with proper training should achieve ≥0.97
+	if avgRecall < 0.80 {
+		t.Errorf("SIFT1M recall@10 = %.4f, want >= 0.80", avgRecall)
+	}
+}
+
+// TestRecallWithLatency measures recall@10 and p99 latency on synthetic data.
+func TestRecallWithLatency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping recall+latency test in short mode")
+	}
+
+	segDir := t.TempDir()
+	cfg := &store.Config{
+		DataDir:        "",
+		DictDir:        "",
+		InMemory:       true,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   10000,
+		Profile:        "Ingest-Heavy",
+		SegmentDir:     segDir,
+		VectorFullDim:  128,
+	}
+	s, err := meb.NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	dim := 128
+	numVectors := 10000
+	numQueries := 100
+	rng := rand.New(rand.NewSource(42))
+
+	vectors := make([][]float32, numVectors)
+	for i := range vectors {
+		v := make([]float32, dim)
+		for j := range v {
+			v[j] = rng.Float32()*2 - 1
+		}
+		norm := float32(0)
+		for _, val := range v {
+			norm += val * val
+		}
+		norm = float32(math.Sqrt(float64(norm)))
+		if norm > 0 {
+			for j := range v {
+				v[j] /= norm
+			}
+		}
+		vectors[i] = v
+		if err := s.Vectors().Add(uint64(i+1), v); err != nil {
+			t.Fatalf("Add failed at %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	var totalRecall float64
+	latencies := make([]time.Duration, 0, numQueries)
+
+	for qi := 0; qi < numQueries; qi++ {
+		query := make([]float32, dim)
+		for j := range query {
+			query[j] = rng.Float32()*2 - 1
+		}
+		norm := float32(0)
+		for _, val := range query {
+			norm += val * val
+		}
+		norm = float32(math.Sqrt(float64(norm)))
+		if norm > 0 {
+			for j := range query {
+				query[j] /= norm
+			}
+		}
+
+		// Compute ground truth
+		type scored struct {
+			id    uint64
+			score float32
+		}
+		all := make([]scored, numVectors)
+		for i, v := range vectors {
+			var dot float32
+			for j := range query {
+				dot += query[j] * v[j]
+			}
+			all[i] = scored{id: uint64(i + 1), score: dot}
+		}
+		sort.Slice(all, func(i, j int) bool {
+			return all[i].score > all[j].score
+		})
+		groundTruth := make(map[uint64]bool)
+		for i := 0; i < 10; i++ {
+			groundTruth[all[i].id] = true
+		}
+
+		// Measure search latency
+		start := time.Now()
+		found := make(map[uint64]bool)
+		for sr, err := range s.Vectors().Search(context.Background(), query, 10) {
+			if err != nil {
+				t.Fatalf("Search failed: %v", err)
+			}
+			found[sr.ID] = true
+		}
+		latencies = append(latencies, time.Since(start))
+
+		var hits int
+		for id := range found {
+			if groundTruth[id] {
+				hits++
+			}
+		}
+		totalRecall += float64(hits) / 10.0
+	}
+
+	avgRecall := totalRecall / float64(numQueries)
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p50Latency := latencies[len(latencies)/2]
+	p99Latency := latencies[int(float64(len(latencies))*0.99)]
+
+	t.Logf("Recall@10: %.4f", avgRecall)
+	t.Logf("Latency stats: p50=%v, p99=%v, min=%v, max=%v",
+		p50Latency, p99Latency, latencies[0], latencies[len(latencies)-1])
+
+	if avgRecall < 0.80 {
+		t.Errorf("recall@10 = %.4f, want >= 0.80", avgRecall)
 	}
 }

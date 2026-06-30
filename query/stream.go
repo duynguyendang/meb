@@ -71,6 +71,8 @@ func ExecuteStream(ctx context.Context, vecResults iter.Seq2[StreamResult, error
 			count++
 		}
 
+		wg.Wait()
+
 		select {
 		case err := <-errCh:
 			yield(StreamResult{}, err)

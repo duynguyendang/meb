@@ -50,6 +50,10 @@ func (r *VectorRegistry) Search(ctx context.Context, queryVec []float32, k int) 
 // SearchWithFilter returns an iterator of top-k most similar vectors matching a semantic hash.
 // Fast path: parallel mmap scan if vectors are loaded in RAM.
 // Fallback: streams from BadgerDB for cold start.
+//
+// The RLock is held for the entire duration of the parallel mmap scan. This prevents
+// concurrent Delete/Add from modifying slot data in-place (the in-place copy in Delete
+// and the slot overwrite in Add would otherwise race with lock-free readers).
 func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
@@ -64,7 +68,7 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 		}
 
 		r.mu.RLock()
-		numVectors := r.totalVectors
+		numVectors := int(r.totalVectors.Load())
 		hasVectors := numVectors > 0
 		vectorSize := r.vectorSize
 		hybridCfg := r.hybridCfg
@@ -72,11 +76,8 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 		configuredWorkers := r.config.NumWorkers
 		revMap := *r.revMap.Load()
 
-		// Capture function to access vector slots
-		getSlot := func(idx int) []byte { return r.getVectorSlice(idx) }
-		r.mu.RUnlock()
-
 		if !hasVectors {
+			r.mu.RUnlock()
 			// Cold start: stream from Badger
 			r.searchFromBadger(ctx, queryVec, k, filterHash, hybridCfg, fullDim, yield)
 			return
@@ -123,6 +124,7 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 
 			select {
 			case <-ctx.Done():
+				r.mu.RUnlock()
 				yield(SearchResult{}, ctx.Err())
 				return
 			default:
@@ -130,8 +132,13 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 
 			actualWorkers++
 			go func(start, end int) {
-				defer func() { recover() }()
-				topK := scanChunkHybrid(getSlot, hybridQuery, queryBlockNorms, start, end, k, vectorSize, revMap, filterHash, fullDim, hybridCfg)
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("search worker panicked", "start", start, "end", end, "panic", r)
+						resultCh <- nil
+					}
+				}()
+				topK := scanChunkHybrid(r.slotBytes, hybridQuery, queryBlockNorms, start, end, k, vectorSize, revMap, filterHash, fullDim, hybridCfg)
 				resultCh <- topK
 			}(startIdx, endIdx)
 		}
@@ -142,6 +149,8 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 			allResults = append(allResults, results...)
 		}
 		close(resultCh)
+
+		r.mu.RUnlock()
 
 		final := getTopK(allResults, k)
 		for _, sr := range final {
@@ -340,20 +349,21 @@ func (r *VectorRegistry) searchFromBadger(ctx context.Context, queryVec []float3
 }
 
 // buildTopicVectorPrefix builds a Badger prefix for streaming vectors of a specific topic.
-// Key format: [0x11][TopicID:24][LocalID:40] — topic is in the upper 24 bits of the ID.
+// Key format: [0x11][TopicID:24][LocalID:40] — topic occupies the upper 24 bits (3 bytes)
+// of the packed ID. The prefix is 4 bytes: [0x11][topicID:3].
 func buildTopicVectorPrefix(topicID uint32) []byte {
-	prefix := make([]byte, 5)
+	prefix := make([]byte, 4)
 	prefix[0] = keys.VectorFullPrefix
-	binary.BigEndian.PutUint32(prefix[1:], topicID)
+	prefix[1] = byte(topicID >> 16)
+	prefix[2] = byte(topicID >> 8)
+	prefix[3] = byte(topicID)
 	return prefix
 }
 
 // buildTopicVectorEnd builds the exclusive upper bound for a topic's vector range.
+// Returns the prefix for topicID+1, which is the first key beyond this topic.
 func buildTopicVectorEnd(topicID uint32) []byte {
-	end := make([]byte, 5)
-	end[0] = keys.VectorFullPrefix
-	binary.BigEndian.PutUint32(end[1:], topicID+1)
-	return end
+	return buildTopicVectorPrefix(topicID + 1)
 }
 
 func extractResults(h scoreHeap) []SearchResult {
@@ -374,6 +384,9 @@ func scanChunkHybrid(getSlot func(int) []byte, query []byte, queryBlockNorms []f
 
 	for idx := startIdx; idx < endIdx; idx++ {
 		slot := getSlot(idx)
+		if len(slot) < vectorSize {
+			continue
+		}
 
 		hashByte := slot[0]
 		if filterHash != 0 && hashByte != filterHash {

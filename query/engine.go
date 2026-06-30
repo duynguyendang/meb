@@ -331,7 +331,6 @@ func (e *LFTJEngine) executeOrderedBuffered(
 ) iter.Seq2[LFTJResult, error] {
 	return func(yield func(LFTJResult, error) bool) {
 		var results []LFTJResult
-		var overflow bool
 		for raw, err := range e.Execute(ctx, relations, boundVars, sortedVars) {
 			if err != nil {
 				yield(LFTJResult{}, err)
@@ -344,23 +343,16 @@ func (e *LFTJEngine) executeOrderedBuffered(
 			for i, v := range sortedVars {
 				r.Values[i] = raw[v]
 			}
-			if len(results) < maxRows {
-				results = append(results, r)
-			} else {
-				overflow = true
-			}
-		}
-
-		if overflow {
-			slog.Warn("LFTJ buffer overflow",
-				"bufferSize", maxRows,
-				"action", "dropping excess rows",
-			)
+			results = append(results, r)
 		}
 
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].Canonical() < results[j].Canonical()
 		})
+
+		if maxRows > 0 && len(results) > maxRows {
+			results = results[:maxRows]
+		}
 
 		for _, r := range results {
 			if !yield(r, nil) {

@@ -158,7 +158,11 @@ func (b *Builder) executePlan(ctx context.Context, plan query.ExecutionPlan) ([]
 	usePushdown := b.filterFirst && len(b.filters) > 0
 
 	if usePushdown {
-		filterCandidateSet = b.buildFilterCandidateSet(ctx)
+		var err error
+		filterCandidateSet, err = b.buildFilterCandidateSet(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("filter candidate set: %w", err)
+		}
 		slog.Debug("predicate pushdown",
 			"filters", len(b.filters),
 			"candidates", len(filterCandidateSet),
@@ -222,30 +226,26 @@ func (b *Builder) executePlan(ctx context.Context, plan query.ExecutionPlan) ([]
 	return results, nil
 }
 
-// buildFilterCandidateSet scans the graph index to find all subject IDs
-// that match the query's filters. Uses prefix-scanned SPO/OPS lookups
-// for efficiency. Returns nil if no filter is specified.
-func (b *Builder) buildFilterCandidateSet(ctx context.Context) map[uint64]struct{} {
+// Returns a map of candidate IDs matching all filters, or nil if no filter is set.
+// Scan errors (I/O failures) are propagated; per-subject GetID misses are silently
+// excluded since they indicate a dict inconsistency rather than a query error.
+func (b *Builder) buildFilterCandidateSet(ctx context.Context) (map[uint64]struct{}, error) {
 	if len(b.filters) == 0 {
-		return nil
+		return nil, nil
 	}
 
-	// Use the first filter to build the initial candidate set.
-	// Using Scan with bound predicate + object is an OPS index prefix
-	// scan — the most efficient lookup.
 	filter := b.filters[0]
 	candidates := make(map[uint64]struct{})
 
 	scanIter := b.store.Scan("", filter.Predicate, fmt.Sprintf("%v", filter.Object))
 	for fact, err := range scanIter {
 		if err != nil {
-			break
+			return nil, err
 		}
 		if err := ctx.Err(); err != nil {
-			break
+			return nil, err
 		}
 
-		// Resolve the subject to an ID
 		id, err := b.store.Dict().GetID(fact.Subject)
 		if err != nil {
 			continue
@@ -253,7 +253,6 @@ func (b *Builder) buildFilterCandidateSet(ctx context.Context) map[uint64]struct
 		candidates[id] = struct{}{}
 	}
 
-	// Apply remaining filters — narrow down the candidate set
 	for _, f := range b.filters[1:] {
 		for id := range candidates {
 			key, err := b.store.ResolveID(id)
@@ -267,7 +266,7 @@ func (b *Builder) buildFilterCandidateSet(ctx context.Context) map[uint64]struct
 		}
 	}
 
-	return candidates
+	return candidates, nil
 }
 
 func (b *Builder) executeWithLFTJ(ctx context.Context, vecIter iter.Seq2[vector.SearchResult, error], results []Result) ([]Result, error) {

@@ -58,20 +58,49 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 	}
 
 	// Write to WAL before any DB operations (dual-DB atomicity)
-	for _, fact := range facts {
-		objStr, isString := fact.Object.(string)
-		if !isString {
-			objStr = fmt.Sprintf("%v", fact.Object)
+	entries := make([]walEntry, len(facts))
+	for i, fact := range facts {
+		objStr := fmt.Sprintf("%v", fact.Object)
+		var objType uint8
+		switch fact.Object.(type) {
+		case string:
+			objType = walObjString
+		case bool:
+			objType = walObjBool
+		case int32:
+			objType = walObjInt32
+		case float32:
+			objType = walObjFloat32
 		}
-		if err := m.wal.Append(walEntry{
+		entries[i] = walEntry{
 			subject: fact.Subject,
 			pred:    fact.Predicate,
 			object:  objStr,
-		}); err != nil {
-			return fmt.Errorf("WAL append failed: %w", err)
+			objType: objType,
 		}
 	}
+	if err := m.wal.AppendBatch(entries); err != nil {
+		return fmt.Errorf("WAL batch append failed: %w", err)
+	}
 
+	if err := m.addFactBatchInternal(facts); err != nil {
+		return err
+	}
+
+	// Clear WAL after successful graph DB write
+	if err := m.wal.Clear(); err != nil {
+		m.telemetry.Emit("wal_clear_failed", map[string]any{
+			"error": err.Error(),
+		})
+	}
+
+	return nil
+}
+
+// addFactBatchInternal writes facts to Badger without touching the WAL.
+// Used by both AddFactBatch (after WAL write) and WAL replay (which supplies
+// its own commit guarantees).
+func (m *MEBStore) addFactBatchInternal(facts []Fact) error {
 	type stringRef struct {
 		index int
 		isObj bool
@@ -143,20 +172,14 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 		if err := batch.Set(opsKey, value); err != nil {
 			return fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
 		}
-
-		m.numFacts.Add(1)
 	}
 
 	if err := batch.Flush(); err != nil {
 		return fmt.Errorf("failed to flush batch: %w", err)
 	}
 
-	// Clear WAL after successful graph DB write
-	if err := m.wal.Clear(); err != nil {
-		m.telemetry.Emit("wal_clear_failed", map[string]any{
-			"error": err.Error(),
-		})
-	}
+	// Count AFTER successful flush to avoid overcounting on failure.
+	m.numFacts.Add(uint64(len(facts)))
 
 	m.persistStatsIfNeeded(uint64(len(facts)))
 
@@ -272,13 +295,16 @@ func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 
 	// Clean up orphaned dictionary entries for predicates and objects
 	// that are no longer referenced by any other triples
-	cleaned := m.cleanupOrphanedDictEntries(referencedIDs)
+	cleaned, err := m.cleanupOrphanedDictEntries(referencedIDs)
+	if err != nil {
+		slog.Warn("orphaned dict cleanup skipped", "error", err)
+	}
 
 	slog.Info("facts deleted successfully", "subject", subject, "factsDeleted", totalDeleted, "dictEntriesCleaned", cleaned)
 	return nil
 }
 
-func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int {
+func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) (int, error) {
 	if len(referencedIDs) == 0 {
 		return m.cleanupOrphanedDictEntriesFullScan()
 	}
@@ -294,7 +320,7 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 	}
 
 	if len(localCandidates) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	candidateSet := make(map[uint64]bool, len(localCandidates))
@@ -305,7 +331,9 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 	// Single scan over SPO+OPS to build set of all referenced local IDs,
 	// then check candidates against that set. O(N + M) instead of O(N*M).
 	referencedSet := make(map[uint64]bool)
-	m.buildReferencedLocalIDSet(referencedSet)
+	if err := m.buildReferencedLocalIDSet(referencedSet); err != nil {
+		return 0, fmt.Errorf("build referenced set: %w", err)
+	}
 
 	unreferenced := make([]uint64, 0, len(localCandidates))
 	for _, localID := range localCandidates {
@@ -325,13 +353,13 @@ func (m *MEBStore) cleanupOrphanedDictEntries(referencedIDs map[uint64]int) int 
 		}
 	}
 
-	return cleaned
+	return cleaned, nil
 }
 
 // buildReferencedLocalIDSet scans all triple keys and collects every referenced local ID
 // (subjects, predicates, and objects) into the given set.
-func (m *MEBStore) buildReferencedLocalIDSet(refs map[uint64]bool) {
-	m.withReadTxn(func(txn *badger.Txn) error {
+func (m *MEBStore) buildReferencedLocalIDSet(refs map[uint64]bool) error {
+	return m.withReadTxn(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -359,11 +387,11 @@ func (m *MEBStore) buildReferencedLocalIDSet(refs map[uint64]bool) {
 // cleanupOrphanedDictEntriesFullScan scans all dictionary entries and removes
 // those not referenced by any triple, content, or vector key.
 // Throttled: max 1000 orphans per cycle.
-func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
+func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() (int, error) {
 	const maxOrphansPerCycle = 1000
 
 	var candidateIDs []uint64
-	m.withReadTxn(func(txn *badger.Txn) error {
+	if err := m.withReadTxn(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -379,18 +407,22 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 			candidateIDs = append(candidateIDs, id)
 		}
 		return nil
-	})
+	}); err != nil {
+		return 0, fmt.Errorf("scan dict candidates: %w", err)
+	}
 
 	if len(candidateIDs) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	// Build set of all referenced local IDs (triples + content + vectors)
 	referencedSet := make(map[uint64]bool)
-	m.buildReferencedLocalIDSet(referencedSet)
+	if err := m.buildReferencedLocalIDSet(referencedSet); err != nil {
+		return 0, fmt.Errorf("build referenced set: %w", err)
+	}
 
 	// Also check content (0x10) and vector (0x11) keys
-	m.withReadTxn(func(txn *badger.Txn) error {
+	if err := m.withReadTxn(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
@@ -408,7 +440,9 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return 0, fmt.Errorf("scan content/vector refs: %w", err)
+	}
 
 	unreferenced := make([]uint64, 0, maxOrphansPerCycle)
 	for _, localID := range candidateIDs {
@@ -428,7 +462,7 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() int {
 		}
 	}
 
-	return cleaned
+	return cleaned, nil
 }
 
 // cleanupOrphanedVectors scans vectors and removes those that have no

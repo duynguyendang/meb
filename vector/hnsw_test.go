@@ -104,7 +104,7 @@ func TestADCAccumScalar(t *testing.T) {
 	lut[1*256+2] = 2.5
 	codes := []byte{1, 2}
 
-	dist := adcAccumImplScalar(lut, codes)
+	dist := adcAccumScalar(lut, codes)
 	expected := float32(4.0)
 	if dist != expected {
 		t.Errorf("adcAccumScalar = %f, want %f", dist, expected)

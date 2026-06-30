@@ -291,7 +291,7 @@ func decodeInlineID(id uint64) any {
 	return keys.UnpackInlineBool(id)
 }
 
-func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact, error)) iter.Seq2[Fact, error] {
+func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (*Fact, error)) iter.Seq2[Fact, error] {
 	return func(yield func(Fact, error) bool) {
 		txn := m.db.NewTransaction(false)
 		defer txn.Discard()
@@ -352,8 +352,11 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (Fact
 				yield(Fact{}, err)
 				return
 			}
+			if fact == nil {
+				continue // processFn requested skip (e.g. filter rejection)
+			}
 
-			if !yield(fact, nil) {
+			if !yield(*fact, nil) {
 				return
 			}
 		}
@@ -372,8 +375,12 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o string) iter.Seq2[Fa
 		}
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
-		return m.resolveFactStrings(opts, r)
+	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
+		fact, err := m.resolveFactStrings(opts, r)
+		if err != nil {
+			return nil, err
+		}
+		return &fact, nil
 	})
 }
 
@@ -390,21 +397,21 @@ func (m *MEBStore) ScanWithFiltersContext(ctx context.Context, s, p, o string, f
 	}
 	opts.filters = filters
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
 		fact, err := m.resolveFactStrings(opts, r)
 		if err != nil {
-			return Fact{}, err
+			return nil, err
 		}
 
 		objectStr := fmt.Sprintf("%v", fact.Object)
 
 		for _, filter := range opts.filters {
 			if !evaluatePredicateFilter(objectStr, filter) {
-				return Fact{}, nil
+				return nil, nil // skip: filter rejected
 			}
 		}
 
-		return fact, nil
+		return &fact, nil
 	})
 }
 
@@ -460,22 +467,22 @@ func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o 
 		topicID:  topicID,
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
+	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
 		fact, err := m.resolveFactStrings(opts, r)
 		if err != nil {
-			return Fact{}, err
+			return nil, err
 		}
 
 		if len(opts.filters) > 0 {
 			objectStr := fmt.Sprintf("%v", fact.Object)
 			for _, filter := range opts.filters {
 				if !evaluatePredicateFilter(objectStr, filter) {
-					return Fact{}, nil
+					return nil, nil // skip: filter rejected
 				}
 			}
 		}
 
-		return fact, nil
+		return &fact, nil
 	})
 }
 
@@ -492,7 +499,11 @@ func (m *MEBStore) ScanWithPruning(ctx context.Context, s, p, o string, entityTy
 	opts.pruneEntityType = entityType
 	opts.prunePublic = wantPublic
 
-	return m.scanImpl(opts, func(r *scanResult) (Fact, error) {
-		return m.resolveFactStrings(opts, r)
+	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
+		fact, err := m.resolveFactStrings(opts, r)
+		if err != nil {
+			return nil, err
+		}
+		return &fact, nil
 	})
 }
