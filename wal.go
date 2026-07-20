@@ -350,6 +350,12 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
+// WALPath returns the file path of the WAL file.
+// Returns empty string for in-memory stores without a WAL.
+func (w *WAL) WALPath() string {
+	return w.path
+}
+
 // crc32Bytes converts a uint32 CRC to a 4-byte big-endian slice.
 func crc32Bytes(crc uint32) []byte {
 	b := make([]byte, 4)

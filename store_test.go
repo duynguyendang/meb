@@ -1433,3 +1433,93 @@ func TestPreCancelledCtxVectorSearch(t *testing.T) {
 	}
 }
 
+
+func TestStoreDebugInfo_Empty(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+	health := s.DebugInfo()
+
+	if health.NumFacts != 0 {
+		t.Errorf("NumFacts = %d, want 0", health.NumFacts)
+	}
+	if health.NumVectors != 0 {
+		t.Errorf("NumVectors = %d, want 0", health.NumVectors)
+	}
+	if health.ReadOnly {
+		t.Error("ReadOnly = true, want false")
+	}
+	if health.CircuitBreakerState == "" {
+		t.Error("CircuitBreakerState is empty, expected a state string")
+	}
+}
+
+func TestStoreDebugInfo_WithData(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+
+	// Add a fact
+	if err := s.AddFact(Fact{Subject: "alice", Predicate: "knows", Object: "bob"}); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+
+	// Add a vector
+	vec := make([]float32, 1536)
+	for i := range vec {
+		vec[i] = 0.5
+	}
+	if err := s.Vectors().Add(42, vec); err != nil {
+		t.Fatalf("Vectors().Add: %v", err)
+	}
+
+	health := s.DebugInfo()
+
+	if health.NumFacts != 1 {
+		t.Errorf("NumFacts = %d, want 1", health.NumFacts)
+	}
+	if health.NumVectors != 1 {
+		t.Errorf("NumVectors = %d, want 1", health.NumVectors)
+	}
+	if health.VectorFullDim != 1536 {
+		t.Errorf("VectorFullDim = %d, want 1536", health.VectorFullDim)
+	}
+	if health.VectorCapacity <= 0 {
+		t.Errorf("VectorCapacity = %d, want > 0", health.VectorCapacity)
+	}
+	if health.ReadOnly {
+		t.Error("ReadOnly = true, want false")
+	}
+}
+
+func TestStoreDebugInfo_ReadOnly(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	segDir := t.TempDir()
+	if err := os.MkdirAll(segDir, 0755); err != nil {
+		t.Fatalf("failed to create segment dir: %v", err)
+	}
+	cfg := &store.Config{
+		DataDir:        "",
+		DictDir:        "",
+		InMemory:       true,
+		BlockCacheSize: 1 << 20,
+		IndexCacheSize: 1 << 20,
+		LRUCacheSize:   100,
+		ReadOnly:       true,
+		SegmentDir:     segDir,
+	}
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	health := s.DebugInfo()
+
+	if !health.ReadOnly {
+		t.Error("ReadOnly = false, want true for ReadOnly profile")
+	}
+}
+
+var _ = context.Background

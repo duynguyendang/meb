@@ -1144,3 +1144,48 @@ func hasPrefix(s, prefix string) bool {
 	}
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
+
+// StoreHealth provides operational metrics for debugging and monitoring.
+// All values are atomically or lock-protected reads; safe to call concurrently.
+type StoreHealth struct {
+	NumFacts               uint64                      `json:"num_facts"`
+	NumVectors             int64                       `json:"num_vectors"`
+	VectorFullDim          int                         `json:"vector_full_dim"`
+	VectorCapacity         int                         `json:"vector_capacity"`
+	WALSizeBytes           int64                       `json:"wal_size_bytes,omitempty"`
+	ReadOnly               bool                        `json:"read_only"`
+	CircuitBreakerState    string                      `json:"circuit_breaker_state"`
+	CircuitBreakerMetrics  circuit.MetricsSnapshot     `json:"circuit_breaker_metrics,omitempty"`
+	LastGCTimeNano         int64                       `json:"last_gc_time_nano"`
+}
+
+// DebugInfo returns a snapshot of store health metrics.
+// Safe to call concurrently; all reads are atomic or lock-protected.
+func (m *MEBStore) DebugInfo() StoreHealth {
+	health := StoreHealth{
+		NumFacts:       m.numFacts.Load(),
+		ReadOnly:       m.config.ReadOnly,
+		LastGCTimeNano: m.lastGCTimeNano.Load(),
+	}
+
+	if m.vectors != nil {
+		health.NumVectors = int64(m.vectors.Count())
+		health.VectorFullDim = m.vectors.FullDim()
+		health.VectorCapacity = m.vectors.VectorCapacity()
+	}
+
+	// Circuit breaker state (best-effort)
+	if b := m.breaker.Load(); b != nil {
+		health.CircuitBreakerState = b.State().String()
+		health.CircuitBreakerMetrics = b.MetricsSnapshot()
+	}
+
+	// WAL size (best-effort, may fail for in-memory mode)
+	if m.wal != nil && m.wal.WALPath() != "" {
+		if info, err := os.Stat(m.wal.WALPath()); err == nil {
+			health.WALSizeBytes = info.Size()
+		}
+	}
+
+	return health
+}

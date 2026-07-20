@@ -541,6 +541,79 @@ func (e *Encoder) GetStringInTxn(txn *badger.Txn, id uint64) (string, error) {
 	return s, nil
 }
 
+// GetStrings resolves multiple IDs to strings in a single operation.
+// Missing IDs return empty strings at their position in the result slice.
+// The returned slice has the same length as input ids.
+// Phase 1 checks the in-memory reverse cache; Phase 2 batch-fetches
+// missing IDs from BadgerDB in a single View transaction.
+func (e *Encoder) GetStrings(ids []uint64) ([]string, error) {
+	results := make([]string, len(ids))
+
+	// Fast path: empty input
+	if len(ids) == 0 {
+		return results, nil
+	}
+
+	// Phase 1: Check reverse cache for each ID
+	type missingEntry struct {
+		resultIdx int
+		id        uint64
+	}
+	var missing []missingEntry
+
+	e.reverseCache.mu.RLock()
+	for i, id := range ids {
+		if s, ok := e.reverseCache.cache.Get(id); ok && s != "" {
+			results[i] = s
+		} else {
+			missing = append(missing, missingEntry{resultIdx: i, id: id})
+		}
+	}
+	e.reverseCache.mu.RUnlock()
+
+	// Fast path: all IDs were in cache
+	if len(missing) == 0 {
+		return results, nil
+	}
+
+	// Phase 2: Batch fetch missing IDs from Badger
+	reverseKey := make([]byte, 1+8)
+	reverseKey[0] = dictReversePrefix
+	err := e.db.View(func(txn *badger.Txn) error {
+		for _, m := range missing {
+			binary.BigEndian.PutUint64(reverseKey[1:], m.id)
+			item, err := txn.Get(reverseKey)
+			if err == badger.ErrKeyNotFound {
+				results[m.resultIdx] = "" // missing ID → empty string
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			results[m.resultIdx] = string(val)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Phase 3: Populate cache with fetched values
+	e.reverseCache.mu.Lock()
+	for _, m := range missing {
+		if results[m.resultIdx] != "" {
+			e.reverseCache.cache.Add(m.id, results[m.resultIdx])
+		}
+	}
+	e.reverseCache.mu.Unlock()
+
+	return results, nil
+}
+
 // DeleteIDInTxnDiskOnly deletes dict entries from Badger only, leaving caches intact.
 // The idHint parameter avoids a second lookup when the caller already knows the ID.
 // Returns any badger error, or discards the error if the entry was not found.

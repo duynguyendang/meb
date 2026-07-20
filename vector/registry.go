@@ -558,6 +558,11 @@ func (r *VectorRegistry) VectorSize() int {
 	return r.vectorSize
 }
 
+// VectorCapacity returns the configured maximum vector capacity.
+func (r *VectorRegistry) VectorCapacity() int {
+	return r.config.VectorCapacity
+}
+
 func (r *VectorRegistry) GetFullVector(id uint64) ([]float32, error) {
 	key := keys.EncodeVectorFullKey(id)
 

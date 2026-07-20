@@ -7,6 +7,9 @@ require (
 	github.com/dgraph-io/badger/v4 v4.3.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/klauspost/compress v1.18.2
+	go.uber.org/goleak v1.3.0
+	golang.org/x/sys v0.24.0
+	pgregory.net/rapid v0.6.1
 )
 
 require (
@@ -20,10 +23,8 @@ require (
 	github.com/google/flatbuffers v1.12.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	go.opencensus.io v0.24.0 // indirect
-	go.uber.org/goleak v1.3.0 // indirect
 	golang.org/x/exp v0.0.0-20240707233637-46b078467d37 // indirect
 	golang.org/x/net v0.28.0 // indirect
-	golang.org/x/sys v0.24.0 // indirect
 	google.golang.org/protobuf v1.34.0 // indirect
 )
 

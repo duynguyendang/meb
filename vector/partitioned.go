@@ -15,6 +15,11 @@ import (
 // the existing partition without creating new ones.
 const DefaultMaxPartitions = 1000
 
+// ErrPartitionLimit is returned when a vector operation is attempted on a
+// topic that cannot fit a new partition because the max partitions limit
+// has been reached.
+var ErrPartitionLimit = fmt.Errorf("partition limit reached")
+
 // PartitionedRegistry shards vectors by TopicID for distributed scale.
 // Each topic gets its own independent VectorRegistry with separate mmap segments.
 // Searches can be scoped to a single topic or broadcast across all topics.
@@ -116,12 +121,18 @@ func (p *PartitionedRegistry) ClearPartitions() error {
 // Add adds a vector to the partition for the given topicID.
 func (p *PartitionedRegistry) Add(topicID uint32, id uint64, vec []float32) error {
 	part := p.GetPartition(topicID)
+	if part == nil {
+		return fmt.Errorf("%w (%d): cannot add vector to topic %d", ErrPartitionLimit, p.maxPartitions, topicID)
+	}
 	return part.Add(id, vec)
 }
 
 // AddWithHash adds a vector with semantic hash to the partition for the given topicID.
 func (p *PartitionedRegistry) AddWithHash(topicID uint32, id uint64, vec []float32, hash uint8) error {
 	part := p.GetPartition(topicID)
+	if part == nil {
+		return fmt.Errorf("%w (%d): cannot add vector to topic %d", ErrPartitionLimit, p.maxPartitions, topicID)
+	}
 	return part.AddWithHash(id, vec, hash)
 }
 
