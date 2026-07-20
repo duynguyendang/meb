@@ -987,6 +987,11 @@ func (m *MEBStore) cleanupDeprecatedTriples() int {
 	return totalDeleted
 }
 
+// subjectScanBatchSize bounds how many subject IDs are buffered before a
+// batched dictionary resolution in ScanSubjects/ScanSubjectsByPrefix.
+// 4096 IDs ≈ 32KB of scratch — bounded even on memory-constrained deployments.
+const subjectScanBatchSize = 4096
+
 // ScanSubjectsByPrefix returns all subjects starting with the given prefix string.
 // Uses SPO index with LSM-tree prefix scan - O(log N + k) where k is number of results.
 // The prefix is matched against the full subject string (e.g., "project/pkg/" matches
@@ -1007,6 +1012,32 @@ func (m *MEBStore) ScanSubjects(ctx context.Context) iter.Seq[string] {
 		spoPrefix := []byte{keys.TripleSPOPrefix}
 		var lastSubjectID uint64
 		first := true
+
+		// Batched dictionary resolution: buffer unique subject IDs in chunks,
+		// then resolve each chunk with a single GetStrings call instead of a
+		// point lookup per subject. 4096 IDs ≈ 32KB — bounded even on
+		// memory-constrained deployments.
+		var localIDs []uint64
+		flush := func() bool {
+			if len(localIDs) == 0 {
+				return true
+			}
+			subjects, err := m.dict.GetStrings(localIDs)
+			localIDs = localIDs[:0]
+			if err != nil {
+				// A failed batch aborts the chunk (matches per-item skip-on-error)
+				return true
+			}
+			for _, subjectStr := range subjects {
+				if subjectStr == "" {
+					continue // missing dictionary entry
+				}
+				if !yield(subjectStr) {
+					return false
+				}
+			}
+			return true
+		}
 
 		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
 			select {
@@ -1032,15 +1063,14 @@ func (m *MEBStore) ScanSubjects(ctx context.Context) iter.Seq[string] {
 			lastSubjectID = localID
 			first = false
 
-			subjectStr, err := m.dict.GetString(localID)
-			if err != nil {
-				continue
-			}
-
-			if !yield(subjectStr) {
-				return
+			localIDs = append(localIDs, localID)
+			if len(localIDs) >= subjectScanBatchSize {
+				if !flush() {
+					return
+				}
 			}
 		}
+		flush()
 	}
 }
 
@@ -1059,6 +1089,29 @@ func (m *MEBStore) ScanSubjectsByPrefix(ctx context.Context, prefix string) iter
 		defer it.Close()
 
 		spoPrefix := []byte{keys.TripleSPOPrefix}
+
+		// Batched dictionary resolution (same pattern as ScanSubjects).
+		var localIDs []uint64
+		flush := func() bool {
+			if len(localIDs) == 0 {
+				return true
+			}
+			subjects, err := m.dict.GetStrings(localIDs)
+			localIDs = localIDs[:0]
+			if err != nil {
+				return true // skip chunk on error (matches per-item skip-on-error)
+			}
+			for _, subjectStr := range subjects {
+				if subjectStr == "" || !hasPrefix(subjectStr, prefix) {
+					continue
+				}
+				if !yield(subjectStr) {
+					return false
+				}
+			}
+			return true
+		}
+
 		for it.Seek(spoPrefix); it.ValidForPrefix(spoPrefix); it.Next() {
 			select {
 			case <-ctx.Done():
@@ -1076,17 +1129,14 @@ func (m *MEBStore) ScanSubjectsByPrefix(ctx context.Context, prefix string) iter
 			s, _, _ := keys.DecodeTripleKey(key)
 			localID := keys.UnpackLocalID(s)
 
-			subjectStr, err := m.dict.GetString(localID)
-			if err != nil {
-				continue
-			}
-
-			if hasPrefix(subjectStr, prefix) {
-				if !yield(subjectStr) {
+			localIDs = append(localIDs, localID)
+			if len(localIDs) >= subjectScanBatchSize {
+				if !flush() {
 					return
 				}
 			}
 		}
+		flush()
 	}
 }
 

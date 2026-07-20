@@ -210,3 +210,81 @@ func TestScanContextCancellation(t *testing.T) {
 
 	_ = ctx.Err() // may be Canceled
 }
+
+func TestScanChunkBoundary(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	// 1100 facts crosses two 512-fact chunks (512 + 512 + 76).
+	const n = 1100
+	facts := make([]Fact, n)
+	for i := 0; i < n; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("sub_%04d", i),
+			Predicate: "rel",
+			Object:    fmt.Sprintf("obj_%04d", i),
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	got, err := Collect(s.Scan("", "rel", ""))
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(got) != n {
+		t.Fatalf("got %d facts, want %d (chunk boundary handling broken)", len(got), n)
+	}
+
+	// Spot-check a few entries across chunk boundaries.
+	seen := make(map[string]bool, n)
+	for _, f := range got {
+		seen[f.Subject] = true
+	}
+	for _, i := range []int{0, 511, 512, 1023, 1024, 1099} {
+		sub := fmt.Sprintf("sub_%04d", i)
+		if !seen[sub] {
+			t.Errorf("missing fact %s across chunk boundary", sub)
+		}
+	}
+}
+
+func TestScanSubjectsChunkBoundary(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	// 5000 unique subjects crosses the 4096-ID batch boundary.
+	const n = 5000
+	facts := make([]Fact, n)
+	for i := 0; i < n; i++ {
+		facts[i] = Fact{
+			Subject:   fmt.Sprintf("entity:%05d", i),
+			Predicate: "type",
+			Object:    "thing",
+		}
+	}
+	if err := s.AddFactBatch(facts); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	count := 0
+	for range s.ScanSubjects(context.Background()) {
+		count++
+	}
+	if count != n {
+		t.Errorf("ScanSubjects returned %d subjects, want %d", count, n)
+	}
+
+	count = 0
+	for range s.ScanSubjectsByPrefix(context.Background(), "entity:") {
+		count++
+	}
+	// ScanSubjectsByPrefix does not deduplicate — one triple per subject here,
+	// so count equals the number of triples (same as subjects in this test).
+	if count != n {
+		t.Errorf("ScanSubjectsByPrefix returned %d subjects, want %d", count, n)
+	}
+}

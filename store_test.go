@@ -1523,3 +1523,55 @@ func TestStoreDebugInfo_ReadOnly(t *testing.T) {
 }
 
 var _ = context.Background
+
+func TestMinimumResourceProfile_EndToEnd(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	dataDir := t.TempDir()
+	cfg := store.MinimumResourceConfig(dataDir)
+	cfg.SegmentDir = t.TempDir()
+
+	s, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore with MinimumResourceConfig: %v", err)
+	}
+
+	// Writable: add facts and read them back
+	if err := s.AddFactBatch([]Fact{
+		{Subject: "alice", Predicate: "knows", Object: "bob"},
+		{Subject: "alice", Predicate: "works_at", Object: "acme"},
+		{Subject: "bob", Predicate: "knows", Object: "alice"},
+	}); err != nil {
+		t.Fatalf("AddFactBatch: %v", err)
+	}
+
+	got, err := Collect(s.Scan("alice", "", ""))
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d facts, want 2", len(got))
+	}
+
+	health := s.DebugInfo()
+	if health.NumFacts != 3 {
+		t.Errorf("NumFacts = %d, want 3", health.NumFacts)
+	}
+	if health.ReadOnly {
+		t.Error("ReadOnly = true, want false for Minimum profile")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen: data must persist (WAL + LSM)
+	s2, err := NewMEBStore(cfg)
+	if err != nil {
+		t.Fatalf("NewMEBStore (reopen): %v", err)
+	}
+	defer s2.Close()
+	if c := s2.Count(); c != 3 {
+		t.Errorf("Count after reopen = %d, want 3", c)
+	}
+}

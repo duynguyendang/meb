@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
 
 	"github.com/dgraph-io/badger/v4"
@@ -291,6 +292,106 @@ func decodeInlineID(id uint64) any {
 	return keys.UnpackInlineBool(id)
 }
 
+// scanBatchSize bounds the number of scan results buffered before a batched
+// dictionary resolution. 512 results ≈ 12KB of IDs plus resolved strings —
+// negligible even on memory-constrained deployments.
+const scanBatchSize = 512
+
+// resolveFactsBatch resolves a chunk of scan results using a single batched
+// dictionary lookup (GetStrings) instead of a point lookup per fact.
+// Inline-encoded object IDs are decoded without dictionary access.
+// Error semantics match resolveFactStrings: a missing dictionary entry fails
+// the chunk.
+func (m *MEBStore) resolveFactsBatch(opts *scanOptions, results []scanResult) ([]Fact, error) {
+	facts := make([]Fact, len(results))
+
+	// Collect unbound IDs needing dictionary resolution.
+	idSet := make(map[uint64]struct{})
+	var ids []uint64
+	addID := func(id uint64) {
+		if _, ok := idSet[id]; !ok {
+			idSet[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	for i := range results {
+		r := &results[i]
+		if !opts.sBound {
+			addID(keys.UnpackLocalID(r.foundSID))
+		}
+		if !opts.pBound {
+			addID(r.foundPID) // predicates are never topic-packed
+		}
+		if !opts.oBound && !keys.IsInline(r.foundOID) {
+			addID(keys.UnpackLocalID(r.foundOID))
+		}
+	}
+
+	// Single batched dictionary lookup for the whole chunk.
+	var resolved map[uint64]string
+	if len(ids) > 0 {
+		strs, err := m.dict.GetStrings(ids)
+		if err != nil {
+			return nil, err
+		}
+		resolved = make(map[uint64]string, len(ids))
+		for i, id := range ids {
+			resolved[id] = strs[i]
+		}
+	}
+
+	lookup := func(id uint64, kind string) (string, error) {
+		s := resolved[id]
+		if s == "" {
+			return "", fmt.Errorf("failed to resolve %s ID %d: %w", kind, id, dict.ErrNotFound)
+		}
+		return s, nil
+	}
+
+	for i := range results {
+		r := &results[i]
+		var subject, predicate string
+		var object any
+
+		if opts.sBound {
+			subject = opts.s
+		} else {
+			s, err := lookup(keys.UnpackLocalID(r.foundSID), "subject")
+			if err != nil {
+				return nil, err
+			}
+			subject = s
+		}
+
+		if opts.pBound {
+			predicate = opts.p
+		} else {
+			p, err := lookup(r.foundPID, "predicate")
+			if err != nil {
+				return nil, err
+			}
+			predicate = p
+		}
+
+		switch {
+		case keys.IsInline(r.foundOID):
+			object = decodeInlineID(r.foundOID)
+		case opts.oBound:
+			object = opts.o
+		default:
+			objectStr, err := lookup(keys.UnpackLocalID(r.foundOID), "object")
+			if err != nil {
+				return nil, err
+			}
+			object = objectStr
+		}
+
+		facts[i] = Fact{Subject: subject, Predicate: predicate, Object: object}
+	}
+
+	return facts, nil
+}
+
 func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (*Fact, error)) iter.Seq2[Fact, error] {
 	return func(yield func(Fact, error) bool) {
 		txn := m.db.NewTransaction(false)
@@ -363,6 +464,100 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (*Fac
 	}
 }
 
+// scanImplBatched mirrors scanImpl but resolves facts in fixed-size chunks,
+// converting per-fact dictionary point lookups into one batched resolution per
+// chunk via processBatchFn. Streaming semantics are preserved: at most one
+// chunk (scanBatchSize results) is buffered at a time.
+//
+// Note: scanResult.key is not populated in batched mode — the Badger key buffer
+// is only valid until the iterator advances, so it must not be retained across
+// iterations. No current processFn implementation reads it.
+func (m *MEBStore) scanImplBatched(opts *scanOptions, processBatchFn func([]scanResult) ([]Fact, error)) iter.Seq2[Fact, error] {
+	return func(yield func(Fact, error) bool) {
+		txn := m.db.NewTransaction(false)
+		defer txn.Discard()
+
+		scanCtx := opts.ctx
+		if scanCtx == nil {
+			scanCtx = context.Background()
+		}
+
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = true // Needed for semantic hint pruning (ShouldPruneTriple)
+		it := txn.NewIterator(itOpts)
+		defer it.Close()
+
+		chunk := make([]scanResult, 0, scanBatchSize)
+
+		flush := func() bool {
+			if len(chunk) == 0 {
+				return true
+			}
+			facts, err := processBatchFn(chunk)
+			chunk = chunk[:0]
+			if err != nil {
+				yield(Fact{}, err)
+				return false
+			}
+			for i := range facts {
+				if !yield(facts[i], nil) {
+					return false
+				}
+			}
+			return true
+		}
+
+		for it.Seek(opts.strategy.prefix); it.ValidForPrefix(opts.strategy.prefix); it.Next() {
+			select {
+			case <-scanCtx.Done():
+				yield(Fact{}, scanCtx.Err())
+				return
+			default:
+			}
+
+			item := it.Item()
+			key := item.Key()
+
+			if len(key) != keys.TripleKeySize {
+				continue
+			}
+
+			var result scanResult
+			result.foundSID, result.foundPID, result.foundOID = keys.DecodeTripleKey(key)
+
+			if opts.sBound && result.foundSID != opts.sID {
+				continue
+			}
+			if opts.pBound && result.foundPID != opts.pID {
+				continue
+			}
+			if opts.oBound && result.foundOID != opts.oID {
+				continue
+			}
+
+			// Semantic hints pruning: skip triples that don't match entity type or flags
+			if opts.pruneEntityType > 0 || opts.prunePublic {
+				var pruned bool
+				_ = item.Value(func(val []byte) error {
+					pruned = ShouldPruneTriple(val, opts.pruneEntityType, opts.prunePublic)
+					return nil
+				})
+				if pruned {
+					continue
+				}
+			}
+
+			chunk = append(chunk, result)
+			if len(chunk) >= scanBatchSize {
+				if !flush() {
+					return
+				}
+			}
+		}
+		flush()
+	}
+}
+
 func (m *MEBStore) Scan(s, p, o string) iter.Seq2[Fact, error] {
 	return m.ScanContext(context.Background(), s, p, o)
 }
@@ -375,12 +570,8 @@ func (m *MEBStore) ScanContext(ctx context.Context, s, p, o string) iter.Seq2[Fa
 		}
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
-		fact, err := m.resolveFactStrings(opts, r)
-		if err != nil {
-			return nil, err
-		}
-		return &fact, nil
+	return m.scanImplBatched(opts, func(results []scanResult) ([]Fact, error) {
+		return m.resolveFactsBatch(opts, results)
 	})
 }
 
@@ -397,21 +588,31 @@ func (m *MEBStore) ScanWithFiltersContext(ctx context.Context, s, p, o string, f
 	}
 	opts.filters = filters
 
-	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
-		fact, err := m.resolveFactStrings(opts, r)
+	return m.scanImplBatched(opts, func(results []scanResult) ([]Fact, error) {
+		facts, err := m.resolveFactsBatch(opts, results)
 		if err != nil {
 			return nil, err
 		}
 
-		objectStr := fmt.Sprintf("%v", fact.Object)
+		// Apply predicate filters on resolved facts (same order as before:
+		// resolve first, then filter).
+		kept := facts[:0]
+		for _, fact := range facts {
+			objectStr := fmt.Sprintf("%v", fact.Object)
 
-		for _, filter := range opts.filters {
-			if !evaluatePredicateFilter(objectStr, filter) {
-				return nil, nil // skip: filter rejected
+			match := true
+			for _, filter := range opts.filters {
+				if !evaluatePredicateFilter(objectStr, filter) {
+					match = false
+					break
+				}
+			}
+			if match {
+				kept = append(kept, fact)
 			}
 		}
 
-		return &fact, nil
+		return kept, nil
 	})
 }
 
@@ -467,22 +668,32 @@ func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o 
 		topicID:  topicID,
 	}
 
-	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
-		fact, err := m.resolveFactStrings(opts, r)
+	return m.scanImplBatched(opts, func(results []scanResult) ([]Fact, error) {
+		facts, err := m.resolveFactsBatch(opts, results)
 		if err != nil {
 			return nil, err
 		}
 
-		if len(opts.filters) > 0 {
+		if len(opts.filters) == 0 {
+			return facts, nil
+		}
+
+		kept := facts[:0]
+		for _, fact := range facts {
 			objectStr := fmt.Sprintf("%v", fact.Object)
+			match := true
 			for _, filter := range opts.filters {
 				if !evaluatePredicateFilter(objectStr, filter) {
-					return nil, nil // skip: filter rejected
+					match = false
+					break
 				}
+			}
+			if match {
+				kept = append(kept, fact)
 			}
 		}
 
-		return &fact, nil
+		return kept, nil
 	})
 }
 
@@ -499,11 +710,7 @@ func (m *MEBStore) ScanWithPruning(ctx context.Context, s, p, o string, entityTy
 	opts.pruneEntityType = entityType
 	opts.prunePublic = wantPublic
 
-	return m.scanImpl(opts, func(r *scanResult) (*Fact, error) {
-		fact, err := m.resolveFactStrings(opts, r)
-		if err != nil {
-			return nil, err
-		}
-		return &fact, nil
+	return m.scanImplBatched(opts, func(results []scanResult) ([]Fact, error) {
+		return m.resolveFactsBatch(opts, results)
 	})
 }

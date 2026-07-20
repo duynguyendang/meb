@@ -61,11 +61,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("DictDir must be specified when InMemory is false")
 	}
 
-	if c.BlockCacheSize <= 0 {
-		return fmt.Errorf("BlockCacheSize must be positive, got %d", c.BlockCacheSize)
+	// Block/Index caches may be 0 (disabled) for memory-constrained deployments.
+	if c.BlockCacheSize < 0 {
+		return fmt.Errorf("BlockCacheSize must be non-negative, got %d", c.BlockCacheSize)
 	}
-	if c.IndexCacheSize <= 0 {
-		return fmt.Errorf("IndexCacheSize must be positive, got %d", c.IndexCacheSize)
+	if c.IndexCacheSize < 0 {
+		return fmt.Errorf("IndexCacheSize must be non-negative, got %d", c.IndexCacheSize)
 	}
 	if c.LRUCacheSize < 0 {
 		return fmt.Errorf("LRUCacheSize must be non-negative, got %d", c.LRUCacheSize)
@@ -89,9 +90,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("NumDictShards must be 0 or a power of 2, got %d", c.NumDictShards)
 	}
 
-	validProfiles := map[string]bool{"Ingest-Heavy": true, "Safe-Serving": true, "ReadOnly": true}
+	validProfiles := map[string]bool{"Ingest-Heavy": true, "Safe-Serving": true, "ReadOnly": true, "Minimum": true}
 	if c.Profile != "" && !validProfiles[c.Profile] {
-		return fmt.Errorf("invalid Profile %q, must be one of: Ingest-Heavy, Safe-Serving, ReadOnly", c.Profile)
+		return fmt.Errorf("invalid Profile %q, must be one of: Ingest-Heavy, Safe-Serving, ReadOnly, Minimum", c.Profile)
 	}
 
 	if c.GCRatio < 0 || c.GCRatio > 1 {
@@ -123,7 +124,9 @@ func SafeServingConfig(dataDir string) *Config {
 		DataDir:          dataDir,
 		DictDir:          filepath.Join(dataDir, "dict"),
 		InMemory:         false,
-		BlockCacheSize:   0,
+		// BlockCacheSize must be non-zero: Badger panics when compression is
+		// enabled without a block cache. 32MB keeps the serving footprint small.
+		BlockCacheSize:   32 << 20,
 		IndexCacheSize:   0,
 		LRUCacheSize:     10000,
 		Compression:      true,
@@ -143,6 +146,37 @@ func ReadOnlyConfig(dataDir string) *Config {
 	cfg.Profile = "ReadOnly"
 	cfg.ValueLogFileSize = 16 << 20
 	return cfg
+}
+
+// MinimumResourceConfig targets embedded deployments with tight memory and CPU
+// budgets (e.g. Cloud Run minimum instances, on-prem edge nodes). Block/index
+// caches are disabled (0), background GC is off, memtables and the value log
+// are small, and durability comes from the WAL (AppendBatch Write+Sync) rather
+// than per-transaction fsync. Unlike SafeServingConfig, the store stays
+// writable — this profile is for load-on-demand read workloads that still
+// ingest data.
+func MinimumResourceConfig(dataDir string) *Config {
+	return &Config{
+		DataDir:          dataDir,
+		DictDir:          filepath.Join(dataDir, "dict"),
+		InMemory:         false,
+		BlockCacheSize:   0,
+		IndexCacheSize:   0,
+		LRUCacheSize:     10000,
+		// Compression requires a block cache in Badger; since this profile runs
+		// with caches disabled, compression must stay off (leanest RAM/CPU at
+		// the cost of a larger on-disk footprint).
+		Compression:      false,
+		SyncWrites:       false,
+		NumDictShards:    0,
+		Profile:          "Minimum",
+		ReadOnly:         false,
+		EnableAutoGC:     false,
+		GCRatio:          0.5,
+		ValueLogFileSize: 16 << 20,
+		MemTableSize:     8 << 20,
+		NumMemtables:     2,
+	}
 }
 
 func buildBadgerOptions(cfg *Config) badger.Options {
@@ -210,6 +244,17 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		opts.MemTableSize = 8 << 20
 		opts.NumMemtables = 1
 
+	case "Minimum":
+		// Minimal footprint: small value log, few compactors, single version.
+		if cfg.ValueLogFileSize > 0 {
+			opts.ValueLogFileSize = cfg.ValueLogFileSize
+		} else {
+			opts.ValueLogFileSize = 16 << 20
+		}
+
+		opts.NumCompactors = 2
+		opts.NumVersionsToKeep = 1
+
 	case "Ingest-Heavy":
 		fallthrough
 	default:
@@ -228,7 +273,7 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 	opts.SyncWrites = cfg.SyncWrites
 
 	switch cfg.Profile {
-	case "Safe-Serving", "ReadOnly":
+	case "Safe-Serving", "ReadOnly", "Minimum":
 		if cfg.MemTableSize <= 0 {
 			opts.MemTableSize = 16 << 20
 		} else {

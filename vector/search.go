@@ -279,6 +279,9 @@ func (r *VectorRegistry) searchFromBadger(ctx context.Context, queryVec []float3
 
 	itOpts := badger.DefaultIteratorOptions
 	itOpts.PrefetchValues = true
+	// Batch value fetches for full-corpus streaming (load-on-demand path).
+	// Default PrefetchSize (100) forces excessive I/O round-trips on large corpora.
+	itOpts.PrefetchSize = 1000
 	it := txn.NewIterator(itOpts)
 	defer it.Close()
 
