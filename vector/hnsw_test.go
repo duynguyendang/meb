@@ -22,11 +22,9 @@ func TestDefaultHNSWConfig(t *testing.T) {
 }
 
 func TestRandomLevel(t *testing.T) {
-	idx := &HNSWIndex{
-		cfg: &HNSWConfig{
-			ML: 1.0 / math.Log(16.0),
-		},
-	}
+	idx := NewHNSWIndex(nil, &HNSWConfig{
+		ML: 1.0 / math.Log(16.0),
+	}, 128)
 
 	levels := make(map[int]int)
 	for i := 0; i < 10000; i++ {
@@ -52,7 +50,7 @@ func TestRandomLevel(t *testing.T) {
 }
 
 func TestSelectNeighbors(t *testing.T) {
-	idx := &HNSWIndex{cfg: &HNSWConfig{M: 5, MMax: 10}}
+	idx := NewHNSWIndex(nil, &HNSWConfig{M: 5, MMax: 10}, 128)
 	candidates := []uint64{1, 2, 3}
 	result := idx.selectNeighbors(candidates, 5, 0)
 	if len(result) != 3 {

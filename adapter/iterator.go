@@ -46,6 +46,7 @@ func NewBadgerIterator(txn *badger.Txn, prefix []byte, dict Dictionary) *BadgerI
 	opts.PrefetchValues = false
 
 	it := txn.NewIterator(opts)
+	it.Seek(prefix)
 
 	return &BadgerIterator{
 		txn:           txn,

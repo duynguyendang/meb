@@ -127,38 +127,6 @@ func (e *Encoder) GetOrCreateID(s string) (uint64, error) {
 	return id, nil
 }
 
-func (e *Encoder) allocateNewID(s string) (uint64, error) {
-	newID, err := e.allocator.Allocate()
-	if err != nil {
-		return 0, fmt.Errorf("failed to allocate ID: %w", err)
-	}
-
-	err = e.db.Update(func(txn *badger.Txn) error {
-		key := makeDictForwardKey(s)
-		idBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(idBytes, newID)
-		if err := txn.Set(key, idBytes); err != nil {
-			return err
-		}
-
-		reverseKey := makeDictReverseKey(newID)
-		if err := txn.Set(reverseKey, []byte(s)); err != nil {
-			return err
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return 0, err
-	}
-
-	e.forwardCache.Add(s, newID)
-	e.reverseCache.Add(newID, s)
-
-	return newID, nil
-}
-
 func (e *Encoder) GetIDs(keys []string) ([]uint64, error) {
 	results := make([]uint64, len(keys))
 

@@ -53,6 +53,7 @@ type HNSWIndex struct {
 	cfg       *HNSWConfig
 	fullDim   int
 	paddedDim int
+	rng       *rand.Rand
 
 	entryPointMu sync.RWMutex
 	entryPoints  map[uint32]uint64
@@ -87,6 +88,7 @@ func NewHNSWIndex(db *badger.DB, cfg *HNSWConfig, fullDim int) *HNSWIndex {
 		cfg:         cfg,
 		fullDim:     fullDim,
 		paddedDim:   paddedDim,
+		rng:         rand.New(rand.NewSource(rand.Int63())),
 		entryPoints: make(map[uint32]uint64),
 		maxLevels:   make(map[uint32]int),
 		nodeCounts:  make(map[uint32]int),
@@ -181,7 +183,7 @@ func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64
 }
 
 func (idx *HNSWIndex) randomLevel() int {
-	r := rand.Float64()
+	r := idx.rng.Float64()
 	return int(math.Floor(-math.Log(r) * idx.cfg.ML))
 }
 

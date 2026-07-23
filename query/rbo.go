@@ -10,6 +10,10 @@ const (
 	IntersectionFirst
 )
 
+// DefaultSelectivityThreshold is the default estimated selectivity below which
+// GraphFirst is preferred over VectorFirst. Can be tuned per deployment.
+var DefaultSelectivityThreshold = 0.2
+
 type ExecutionPlan struct {
 	Type        PlanType
 	FilterCount int
@@ -38,7 +42,7 @@ func Optimize(hasVector bool, filterCount int, estimatedSelectivity float64) Exe
 		return plan
 	}
 
-	if estimatedSelectivity < 0.2 {
+	if estimatedSelectivity < DefaultSelectivityThreshold {
 		plan.Type = GraphFirst
 		return plan
 	}

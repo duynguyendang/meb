@@ -84,6 +84,33 @@ var KeySchemaVersion = []byte{SystemPrefix, 0x02}
 
 const CurrentSchemaVersion = 2
 
+const (
+	snapshotVectorChunk byte = 0x10
+	snapshotIDChunk     byte = 0x11
+	snapshotMeta        byte = 0x12
+	snapshotDirty       byte = 0x13
+)
+
+var KeySnapshotDirty = []byte{SystemPrefix, snapshotDirty}
+
+func EncodeSnapshotVectorChunkKey(chunkIdx int) []byte {
+	key := make([]byte, 6)
+	key[0] = SystemPrefix
+	key[1] = snapshotVectorChunk
+	binary.BigEndian.PutUint32(key[2:], uint32(chunkIdx))
+	return key
+}
+
+func EncodeSnapshotIDChunkKey(chunkIdx int) []byte {
+	key := make([]byte, 6)
+	key[0] = SystemPrefix
+	key[1] = snapshotIDChunk
+	binary.BigEndian.PutUint32(key[2:], uint32(chunkIdx))
+	return key
+}
+
+var KeySnapshotMeta = []byte{SystemPrefix, snapshotMeta}
+
 // Inline ID encoding: store primitive values directly in the 64-bit object ID.
 //
 // Bit layout:
@@ -93,6 +120,10 @@ const CurrentSchemaVersion = 2
 //	bits 37-0  = payload (38 bits — fits zigzag int32 [38 bits] or IEEE float32 [32 bits])
 //
 // For number type, payload[37] distinguishes: 0=int32(zigzag), 1=float32
+//
+// These constants are exported for use by the inline encoding functions.
+// They are internal implementation details of the ID encoding scheme and
+// should not be used directly by external callers.
 const (
 	InlineBit      = uint64(1) << 39
 	InlineIsBool   = uint64(0) << 38       // bit 38 = 0: bool, bit 0 = value
@@ -381,7 +412,8 @@ func EncodeTripleValueWithHintsInto(buf []byte, vectorID uint64, contentOffset u
 // --- IVF-PQ Key Encoding ---
 
 // EncodeIVFCentroidKey builds a 9-byte key:
-// [0x13][TopicID:24][CentroidID:4]
+// [0x13][TopicID:32][CentroidID:32]
+// Note: TopicID uses 4 bytes for alignment, though only 24 bits are significant.
 func EncodeIVFCentroidKey(topicID uint32, centroidID uint32) []byte {
 	buf := make([]byte, 9)
 	buf[0] = IVFCentroidPrefix
@@ -391,7 +423,8 @@ func EncodeIVFCentroidKey(topicID uint32, centroidID uint32) []byte {
 }
 
 // EncodeIVFPostingKey builds a 14-byte key:
-// [0x14][TopicID:24][CentroidID:4][LocalID:40]
+// [0x14][TopicID:32][CentroidID:32][LocalID:40]
+// Note: TopicID uses 4 bytes for alignment, though only 24 bits are significant.
 func EncodeIVFPostingKey(topicID uint32, centroidID uint32, localID uint64) []byte {
 	buf := make([]byte, 14)
 	buf[0] = IVFPostingPrefix

@@ -222,23 +222,28 @@ func (b *Breaker) ExecuteWithResult(ctx context.Context, fn func(context.Context
 }
 
 func (b *Breaker) canExecute() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	b.mu.RLock()
 	switch b.state {
-	case StateClosed:
+	case StateClosed, StateHalfOpen:
+		b.mu.RUnlock()
 		return true
 	case StateOpen:
-		if time.Since(b.lastFailureTime) > b.config.OpenDuration {
-			b.state = StateHalfOpen
-			b.failures = 0
-			b.successes = 0
-			return true
+		if time.Since(b.lastFailureTime) <= b.config.OpenDuration {
+			b.mu.RUnlock()
+			return false
 		}
-		return false
-	case StateHalfOpen:
+		b.mu.RUnlock()
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.state != StateOpen || time.Since(b.lastFailureTime) <= b.config.OpenDuration {
+			return b.state == StateClosed || b.state == StateHalfOpen
+		}
+		b.state = StateHalfOpen
+		b.failures = 0
+		b.successes = 0
 		return true
 	default:
+		b.mu.RUnlock()
 		return true
 	}
 }

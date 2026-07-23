@@ -3,6 +3,7 @@ package meb
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/duynguyendang/meb/dict"
 	"github.com/duynguyendang/meb/keys"
@@ -747,6 +748,9 @@ func (m *MEBStore) deleteVectorInTxnDiskOnly(txn *badger.Txn, id uint64) bool {
 	vecKey := keys.EncodeVectorFullKey(id)
 	if err := txn.Delete(vecKey); err != nil {
 		return false
+	}
+	if err := m.vectors.MarkSnapshotDirty(txn); err != nil {
+		slog.Warn("failed to mark snapshot dirty on vector delete", "error", err)
 	}
 	return true
 }

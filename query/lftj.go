@@ -69,7 +69,9 @@ func (r LFTJResult) Canonical() string {
 	for i, v := range r.Vars {
 		pairs[i] = kv{k: v, v: r.Values[i]}
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
+	if !sort.SliceIsSorted(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k }) {
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
+	}
 
 	var buf []byte
 	for i, p := range pairs {

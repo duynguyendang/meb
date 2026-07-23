@@ -216,10 +216,10 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		opts.NumVersionsToKeep = 1
 
 		if cfg.BlockCacheSize == 0 {
-			opts.BlockCacheSize = 0
+			opts.BlockCacheSize = 64 << 20
 		}
 		if cfg.IndexCacheSize == 0 {
-			opts.IndexCacheSize = 0
+			opts.IndexCacheSize = 128 << 20
 		}
 
 		if cfg.MemTableSize <= 0 {
@@ -236,10 +236,10 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		opts.NumVersionsToKeep = 1
 
 		if cfg.BlockCacheSize == 0 {
-			opts.BlockCacheSize = 0
+			opts.BlockCacheSize = 32 << 20
 		}
 		if cfg.IndexCacheSize == 0 {
-			opts.IndexCacheSize = 0
+			opts.IndexCacheSize = 64 << 20
 		}
 		opts.MemTableSize = 8 << 20
 		opts.NumMemtables = 1
@@ -255,6 +255,13 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 		opts.NumCompactors = 2
 		opts.NumVersionsToKeep = 1
 
+		if cfg.BlockCacheSize == 0 {
+			opts.BlockCacheSize = 8 << 20
+		}
+		if cfg.IndexCacheSize == 0 {
+			opts.IndexCacheSize = 16 << 20
+		}
+
 	case "Ingest-Heavy":
 		fallthrough
 	default:
@@ -266,10 +273,21 @@ func buildBadgerOptions(cfg *Config) badger.Options {
 
 		opts.NumCompactors = 4
 		opts.NumVersionsToKeep = 0
+
+		if cfg.BlockCacheSize == 0 {
+			opts.BlockCacheSize = 256 << 20
+		}
+		if cfg.IndexCacheSize == 0 {
+			opts.IndexCacheSize = 512 << 20
+		}
 	}
 
-	opts.BlockCacheSize = cfg.BlockCacheSize
-	opts.IndexCacheSize = cfg.IndexCacheSize
+	if cfg.BlockCacheSize > 0 {
+		opts.BlockCacheSize = cfg.BlockCacheSize
+	}
+	if cfg.IndexCacheSize > 0 {
+		opts.IndexCacheSize = cfg.IndexCacheSize
+	}
 	opts.SyncWrites = cfg.SyncWrites
 
 	switch cfg.Profile {

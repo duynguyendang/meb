@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"iter"
 	"sync"
 )
@@ -72,11 +73,14 @@ func ExecuteStream(ctx context.Context, vecResults iter.Seq2[StreamResult, error
 		}
 
 		wg.Wait()
+		close(errCh)
 
-		select {
-		case err := <-errCh:
-			yield(StreamResult{}, err)
-		default:
+		var errs []error
+		for err := range errCh {
+			errs = append(errs, err)
+		}
+		if len(errs) > 0 {
+			yield(StreamResult{}, errors.Join(errs...))
 		}
 	}
 }
