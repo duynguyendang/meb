@@ -594,6 +594,10 @@ func (st *MEBStore) IVFPQIndex() *vector.IVFPQIndex {
 	return st.ivfpq
 }
 
+func (st *MEBStore) HNSWIndex() *vector.HNSWIndex {
+	return st.hnsw
+}
+
 func (m *MEBStore) LFTJEngine() *query.LFTJEngine {
 	return m.lftjEngine
 }

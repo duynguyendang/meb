@@ -8,7 +8,9 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 
 - **Triple Store**: Subject-Predicate-Object with dual SPO/OPS indexing (25-byte keys)
 - **Multi-Topic Isolation**: 24-bit TopicID bit-packing enables 16M namespaces without a Graph column
+- **ANN Indexes**: IVF-PQ (coarse K-means + residual PQ) and HNSW (hierarchical navigable small world) for O(log N) vector search
 - **Badger-Native Vector Store**: Compressed vectors stored in BadgerDB with mmap cache layer — disk-scaled, O(k) memory per search
+- **SIMD ADC Accumulation**: Asymmetric distance computation with scalar, AVX2 (amd64), and NEON (arm64) kernels; runtime dispatch via `golang.org/x/sys/cpu`
 - **Dual-Path Search**: Hot queries hit parallel mmap (~500K vectors/sec); cold start streams from Badger
 - **LSM-Level Topic Filtering**: `SearchInTopic()` uses Badger prefix scan — zero I/O on unrelated topics
 - **Hybrid Vector Compression**: FWHT preconditioning + block-wise 4/8-bit quantization preserving full 1536 dimensions
@@ -18,10 +20,14 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 - **Cross-Subsystem Transactions**: Opt-in `View()`/`Update()` API for atomic multi-operation writes (graph + vector + content + dictionary)
 - **Datalog Integration**: Mangle `factstore.FactStore` interface for symbolic reasoning
 - **Neuro-Symbolic Search**: Hybrid vector + LFTJ graph query builder with streaming joins
+- **Rule-Based Optimizer (RBO)**: Auto-selects GraphFirst, VectorFirst, IntersectionFirst, PureVectorSearch, or PureLFTJ strategy per query
+- **Cost-Based Optimizer (CBO)**: Greedy smallest-first join ordering with plan cache
+- **Streaming Execution**: Concurrent dense/graph path merge with early termination via context cancellation
 - **Circuit Breaker**: Configurable query timeout protection with push telemetry
 - **Hybrid WAL Approach**: Transactions use BadgerDB `SyncWrites: true` for durability; WriteBatch path uses WAL v2 (CRC32C) for crash recovery
 - **Deterministic LFTJ Joins**: Canonical ordering + ExecuteOrdered for reproducible multi-way join results
 - **Sharded Dictionary**: Configurable lock-striping for high-concurrent ingestion
+- **Soft Delete**: HNSW tombstone keys + `Compact()` graph rebuild
 - **S2 Compression**: Fast content storage with Snappy-compatible compression
 
 ## Quick Start
@@ -367,16 +373,36 @@ meb/
 │   ├── partitioned.go # PartitionedRegistry (sharded by TopicID)
 │   ├── registry.go    # Badger-native store + mmap cache, RCU revMap
 │   ├── search.go      # Dual-path: mmap parallel + Badger streaming, adaptive workers
-│   └── math.go        # L2 normalize, dot product
-├── query/             # LFTJ engine (worst-case optimal multi-way joins)
+│   ├── math.go        # L2 normalize, dot product
+│   ├── index.go       # Index selection API (brute-force / IVF-PQ / HNSW)
+│   ├── ivfpq.go       # IVF-PQ index: centroid assignment, ADC search, posting list iteration
+│   ├── ivfpq_config.go# IVFPQConfig with validation
+│   ├── ivfpq_train.go # Mini-batch K-means training, PQ codebook training
+│   ├── hnsw.go        # HNSW index: Insert, SearchInTopic, searchLayer
+│   ├── hnsw_graph.go  # HNSW graph operations: writeNode, readNeighbors, addSymmetricalLink
+│   ├── hnsw_delete.go # SoftDelete, isDeleted, Compact
+│   ├── adc_scalar.go       # Portable scalar ADC accumulation (4-way unrolled)
+│   ├── adc_sse_amd64.go    # SSE ADC kernel for amd64 (dispatch)
+│   ├── adc_neon_arm64.go   # NEON ADC kernel for arm64 (dispatch)
+│   ├── adc_dispatch_amd64.go   # amd64 runtime dispatch via golang.org/x/sys/cpu
+│   ├── adc_dispatch_arm64.go   # arm64 runtime dispatch
+│   ├── adc_dispatch_generic.go # Generic fallback dispatch
+│   ├── adc_avx2_amd64.s   # Hand-written Plan 9 AVX2 assembly
+│   ├── adc_neon_arm64.s   # Hand-written Plan 9 NEON assembly
+│   └── diskann.go     # DiskANNConfig and DiskANNIndex scaffold (unreachable)
+├── query/             # LFTJ engine + CBO + RBO + plan cache
 │   ├── lftj.go        # TrieIterator, LFTJResult, Canonical ordering
-│   └── engine.go      # Execute, ExecuteOrdered, WithBufferAndSort
+│   ├── engine.go      # Execute, ExecuteOrdered, WithBufferAndSort, OptimizeRelations
+│   ├── rbo.go         # Rule-Based Optimizer (PlanType, ExecutionPlan, Optimize)
+│   ├── rbo_test.go    # RBO unit tests
+│   ├── plan_cache.go  # QueryPlanCache with LRU eviction + TTL + FNV-1a hash
+│   └── stream.go      # ExecuteStream concurrent dense/sparse merge
 ├── circuit/           # Query timeout circuit breaker with state callbacks
 ├── utils/             # Zero-copy string/byte conversion
 ├── adapter/           # Mangle Datalog integration
 ├── bench/             # ANN benchmarks + perf benchmarks
-├── store.go           # MEBStore orchestrator (NewMEBStore, Reset, Close)
-├── tx.go              # Transaction API (View/Update, StoreTxn) — ctx-aware Scan
+├── store.go           # MEBStore orchestrator (NewMEBStore, Reset, Close, EnableIVFPQ, EnableHNSW)
+├── tx.go              # Transaction API (View/Update, StoreTxn, AddIVFVector, SearchHybrid)
 ├── knowledge_store.go # SPO/OPS dual-index write, orphan cleanup
 ├── scan.go            # Index selection scan (iter.Seq2 streaming)
 ├── content.go         # S2-compressed content storage, atomic Add/DeleteDocument

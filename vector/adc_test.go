@@ -155,4 +155,46 @@ func BenchmarkADCAccumDispatched(b *testing.B) {
 	}
 }
 
+// BenchmarkADCVSScalar compares scalar and dispatched implementations and
+// reports the speedup ratio and throughput in GB/s.
+func BenchmarkADCVSScalar(b *testing.B) {
+	for _, numSubSpaces := range []int{16, 32, 64, 128} {
+		bytesPerIter := int64(numSubSpaces * 4) // LUT bytes read per ADC call
+
+		b.Run(fmt.Sprintf("scalar_sub%d", numSubSpaces), func(b *testing.B) {
+			rng := rand.New(rand.NewSource(42))
+			lut := make([]float32, numSubSpaces*256)
+			for i := range lut {
+				lut[i] = rng.Float32()
+			}
+			codes := make([]byte, numSubSpaces)
+			for i := range codes {
+				codes[i] = byte(rng.Intn(256))
+			}
+			b.ResetTimer()
+			b.SetBytes(bytesPerIter)
+			for i := 0; i < b.N; i++ {
+				_ = adcAccumScalar(lut, codes)
+			}
+		})
+
+		b.Run(fmt.Sprintf("dispatch_sub%d", numSubSpaces), func(b *testing.B) {
+			rng := rand.New(rand.NewSource(42))
+			lut := make([]float32, numSubSpaces*256)
+			for i := range lut {
+				lut[i] = rng.Float32()
+			}
+			codes := make([]byte, numSubSpaces)
+			for i := range codes {
+				codes[i] = byte(rng.Intn(256))
+			}
+			b.ResetTimer()
+			b.SetBytes(bytesPerIter)
+			for i := 0; i < b.N; i++ {
+				_ = adcAccum(lut, codes)
+			}
+		})
+	}
+}
+
 

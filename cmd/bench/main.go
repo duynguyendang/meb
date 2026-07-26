@@ -31,10 +31,12 @@ type BenchReport struct {
 
 type ScenarioResult struct {
 	Name       string  `json:"name"`
+	Path       string  `json:"path"`
 	OpsPerSec  float64 `json:"ops_per_sec"`
 	P50Ms      float64 `json:"p50_ms"`
 	P95Ms      float64 `json:"p95_ms"`
 	P99Ms      float64 `json:"p99_ms"`
+	Throughput float64 `json:"throughput,omitempty"`
 	RecallAt10 float64 `json:"recall_at_10,omitempty"`
 }
 
@@ -169,11 +171,12 @@ func benchVectorSearch(numVectors int) ScenarioResult {
 	throughput := float64(numTrials) / totalTime.Seconds()
 
 	return ScenarioResult{
-		Name:       fmt.Sprintf("VectorSearch_%dK", numVectors/1000),
-		OpsPerSec:  throughput,
-		P50Ms:      percentile(latencies, 50),
-		P95Ms:      percentile(latencies, 95),
-		P99Ms:      percentile(latencies, 99),
+		Name:  fmt.Sprintf("VectorSearch_%dK", numVectors/1000),
+		Path:  "brute-force",
+		OpsPerSec: throughput,
+		P50Ms: percentile(latencies, 50),
+		P95Ms: percentile(latencies, 95),
+		P99Ms: percentile(latencies, 99),
 	}
 }
 
@@ -197,6 +200,7 @@ func benchVectorAdd() ScenarioResult {
 	throughput := float64(numVectors) / elapsed.Seconds()
 	return ScenarioResult{
 		Name:      "VectorAdd_Sustained",
+		Path:      "brute-force",
 		OpsPerSec: throughput,
 	}
 }
@@ -265,6 +269,7 @@ func benchIVFPQSearch(numVectors int) ScenarioResult {
 
 	return ScenarioResult{
 		Name:       fmt.Sprintf("IVFPQSearch_%dK", numVectors/1000),
+		Path:       "ivfpq",
 		OpsPerSec:  throughput,
 		P50Ms:      percentile(latencies, 50),
 		P95Ms:      percentile(latencies, 95),
@@ -342,6 +347,7 @@ func benchHNSWSearch(numVectors int) ScenarioResult {
 
 	return ScenarioResult{
 		Name:       fmt.Sprintf("HNSWSearch_%dK", numVectors/1000),
+		Path:       "hnsw",
 		OpsPerSec:  throughput,
 		P50Ms:      percentile(latencies, 50),
 		P95Ms:      percentile(latencies, 95),
@@ -409,6 +415,7 @@ func benchRecall() ScenarioResult {
 
 	return ScenarioResult{
 		Name:       "Recall@10",
+		Path:       "brute-force",
 		RecallAt10: totalRecall / float64(numQueries),
 	}
 }

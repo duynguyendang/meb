@@ -173,7 +173,7 @@ func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64
 	idx.nodeCountMu.Unlock()
 
 	for _, neighbor := range neighbors {
-		if err := idx.addSymmetricalLink(ctx, packedID, neighbor, level); err != nil {
+		if err := idx.addSymmetricalLink(ctx, neighbor, packedID, level); err != nil {
 			slog.Warn("HNSW: failed to add symmetrical link",
 				"node", packedID, "neighbor", neighbor, "level", level, "error", err)
 		}
@@ -446,4 +446,20 @@ func (idx *HNSWIndex) selectNeighbors(candidates []uint64, m int, level int) []u
 		return candidates
 	}
 	return candidates[:m]
+}
+
+func (idx *HNSWIndex) GetEntryPoint(topicID uint32) (uint64, bool) {
+	return idx.getEntryPoint(topicID)
+}
+
+func (idx *HNSWIndex) GetMaxLevel(topicID uint32) (int, bool) {
+	return idx.getMaxLevel(topicID)
+}
+
+func (idx *HNSWIndex) ReadLevel(packedID uint64) (int, error) {
+	return idx.readLevel(packedID)
+}
+
+func (idx *HNSWIndex) ReadNeighbors(packedID uint64, level int) ([]uint64, error) {
+	return idx.readNeighbors(packedID, level)
 }

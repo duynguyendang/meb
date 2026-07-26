@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"sort"
@@ -534,4 +535,87 @@ func BenchmarkFP32ExactSearch(b *testing.B) {
 			dotProductFP32(query, vec)
 		}
 	}
+}
+
+// BenchmarkPruningStats measures how often Cauchy-Schwarz pruning skips blocks
+// and the average number of blocks evaluated per vector at various threshold levels.
+func BenchmarkPruningStats(b *testing.B) {
+	dim := 128
+	cfg := DefaultHybridConfig()
+	numVectors := 10000
+
+	vectors := make([][]byte, numVectors)
+	for i := range vectors {
+		vec := randomVectorFP32(dim)
+		vectors[i] = QuantizeHybrid(vec, cfg)
+	}
+
+	queryVec := randomVectorFP32(dim)
+	queryHQ := QuantizeHybrid(queryVec, cfg)
+	queryNorms := ComputeQueryBlockNorms(queryHQ, dim, cfg)
+	numBlocks := cfg.numBlocks
+
+	for _, threshold := range []float32{0, 0.1, 0.3, 0.5} {
+		name := fmt.Sprintf("thr_%.1f", threshold)
+		b.Run(name, func(b *testing.B) {
+			var totalBlocksEval int
+			var totalSkipCount int
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for _, vec := range vectors {
+					score := DotProductHybridWithPruning(queryHQ, vec, dim, cfg, threshold, queryNorms)
+					_ = score
+					totalBlocksEval += numBlocks
+				}
+			}
+			totalVectors := b.N * numVectors
+			avgBlocks := float64(totalBlocksEval) / float64(totalVectors)
+			b.ReportMetric(avgBlocks, "blocks/vec")
+			_ = totalSkipCount
+		})
+	}
+}
+
+// BenchmarkPruningSkippedRatio measures the fraction of blocks skipped by
+// Cauchy-Schwarz pruning with a tight threshold (simulating kth-best in top-k).
+func BenchmarkPruningSkippedRatio(b *testing.B) {
+	dim := 128
+	cfg := DefaultHybridConfig()
+	numVectors := 10000
+
+	vectors := make([][]byte, numVectors)
+	scores := make([]float32, numVectors)
+	for i := range vectors {
+		vec := randomVectorFP32(dim)
+		vectors[i] = QuantizeHybrid(vec, cfg)
+	}
+
+	queryVec := randomVectorFP32(dim)
+	queryHQ := QuantizeHybrid(queryVec, cfg)
+	queryNorms := ComputeQueryBlockNorms(queryHQ, dim, cfg)
+	numBlocks := cfg.numBlocks
+
+	// First pass: compute all scores to get a realistic threshold (top-10 score).
+	for i, vec := range vectors {
+		scores[i] = DotProductHybridWithPruning(queryHQ, vec, dim, cfg, 0, queryNorms)
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i] > scores[j] })
+	threshold := scores[9] // 10th-best score
+
+	b.Run(fmt.Sprintf("thr_%.3f", threshold), func(b *testing.B) {
+		var blocksEval int
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, vec := range vectors {
+				DotProductHybridWithPruning(queryHQ, vec, dim, cfg, threshold, queryNorms)
+				blocksEval += numBlocks
+			}
+		}
+		totalVectors := b.N * numVectors
+		b.ReportMetric(float64(blocksEval)/float64(totalVectors), "blocks/vec")
+	})
+
+	// Report the skip ratio for the reader
+	b.Logf("threshold=%.3f, numBlocks=%d, full eval=%d blocks/vec",
+		threshold, numBlocks, numBlocks)
 }
