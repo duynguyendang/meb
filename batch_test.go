@@ -179,6 +179,11 @@ func TestHealth(t *testing.T) {
 	if h.DiskUsage < 0 || h.MemoryInUse == 0 {
 		t.Errorf("unexpected health resources: disk=%d mem=%d", h.DiskUsage, h.MemoryInUse)
 	}
+	// Health() is an alias for DebugInfo(); they must agree.
+	d := s.DebugInfo()
+	if d != h {
+		t.Errorf("Health() and DebugInfo() disagree: %+v vs %+v", h, d)
+	}
 }
 
 func TestCompact(t *testing.T) {

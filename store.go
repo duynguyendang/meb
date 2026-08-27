@@ -7,6 +7,7 @@ import (
 	"iter"
 	"log/slog"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -819,9 +820,9 @@ func (m *MEBStore) SetRetention(maxFacts uint64) error {
 	}
 
 	m.telemetry.Emit("retention", map[string]any{
-		"currentFacts":  m.numFacts.Load(),
-		"maxFacts":      maxFacts,
-		"factsDeleted":  totalDeleted,
+		"currentFacts": m.numFacts.Load(),
+		"maxFacts":     maxFacts,
+		"factsDeleted": totalDeleted,
 	})
 
 	slog.Info("retention cleanup complete",
@@ -1159,7 +1160,7 @@ func (m *MEBStore) FindSubjectsByObject(ctx context.Context, predicate, object s
 			if err != nil {
 				continue
 			}
-			
+
 			// Check if object matches — handle both string and inline-encoded types.
 			var matches bool
 			if objStr, ok := fact.Object.(string); ok {
@@ -1202,15 +1203,20 @@ func hasPrefix(s, prefix string) bool {
 // StoreHealth provides operational metrics for debugging and monitoring.
 // All values are atomically or lock-protected reads; safe to call concurrently.
 type StoreHealth struct {
-	NumFacts               uint64                      `json:"num_facts"`
-	NumVectors             int64                       `json:"num_vectors"`
-	VectorFullDim          int                         `json:"vector_full_dim"`
-	VectorCapacity         int                         `json:"vector_capacity"`
-	WALSizeBytes           int64                       `json:"wal_size_bytes,omitempty"`
-	ReadOnly               bool                        `json:"read_only"`
-	CircuitBreakerState    string                      `json:"circuit_breaker_state"`
-	CircuitBreakerMetrics  circuit.MetricsSnapshot     `json:"circuit_breaker_metrics,omitempty"`
-	LastGCTimeNano         int64                       `json:"last_gc_time_nano"`
+	NumFacts              uint64                  `json:"num_facts"`
+	NumVectors            int64                   `json:"num_vectors"`
+	VectorFullDim         int                     `json:"vector_full_dim"`
+	VectorCapacity        int                     `json:"vector_capacity"`
+	WALSizeBytes          int64                   `json:"wal_size_bytes,omitempty"`
+	ReadOnly              bool                    `json:"read_only"`
+	CircuitBreakerState   string                  `json:"circuit_breaker_state"`
+	CircuitBreakerMetrics circuit.MetricsSnapshot `json:"circuit_breaker_metrics,omitempty"`
+	LastGCTimeNano        int64                   `json:"last_gc_time_nano"`
+	StoreOpen             bool                    `json:"store_open"`
+	LSMSize               int64                   `json:"lsm_size_bytes,omitempty"`
+	ValueLogSize          int64                   `json:"value_log_size_bytes,omitempty"`
+	DiskUsage             int64                   `json:"disk_usage_bytes,omitempty"`
+	MemoryInUse           uint64                  `json:"memory_in_use_bytes,omitempty"`
 }
 
 // DebugInfo returns a snapshot of store health metrics.
@@ -1220,6 +1226,12 @@ func (m *MEBStore) DebugInfo() StoreHealth {
 		NumFacts:       m.numFacts.Load(),
 		ReadOnly:       m.config.ReadOnly,
 		LastGCTimeNano: m.lastGCTimeNano.Load(),
+		StoreOpen:      m.db != nil && !m.db.IsClosed(),
+	}
+
+	if m.db != nil {
+		health.LSMSize, health.ValueLogSize = m.db.Size()
+		health.DiskUsage = health.LSMSize + health.ValueLogSize
 	}
 
 	if m.vectors != nil {
@@ -1241,5 +1253,17 @@ func (m *MEBStore) DebugInfo() StoreHealth {
 		}
 	}
 
+	// Go heap currently in use (best-effort; the read is STW-pauseless)
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	health.MemoryInUse = ms.Alloc
+
 	return health
+}
+
+// Health returns a snapshot of store health metrics. It is a convenience alias
+// for DebugInfo, suited to monitoring/health endpoints. Safe to call at any
+// time (including after Close); values simply reflect the closed state.
+func (m *MEBStore) Health() StoreHealth {
+	return m.DebugInfo()
 }
