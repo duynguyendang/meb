@@ -101,75 +101,26 @@ func (m *MEBStore) AddFactBatch(facts []Fact) error {
 // Used by both AddFactBatch (after WAL write) and WAL replay (which supplies
 // its own commit guarantees).
 func (m *MEBStore) addFactBatchInternal(facts []Fact) error {
-	type stringRef struct {
-		index int
-		isObj bool
-	}
-	factStringRefs := make([][]stringRef, len(facts))
-	uniqueStringsMap := make(map[string]int)
-	var uniqueStrings []string
-
-	for i, fact := range facts {
-		if _, ok := uniqueStringsMap[fact.Subject]; !ok {
-			uniqueStringsMap[fact.Subject] = len(uniqueStrings)
-			uniqueStrings = append(uniqueStrings, fact.Subject)
-		}
-		factStringRefs[i] = append(factStringRefs[i], stringRef{index: uniqueStringsMap[fact.Subject], isObj: false})
-
-		if _, ok := uniqueStringsMap[fact.Predicate]; !ok {
-			uniqueStringsMap[fact.Predicate] = len(uniqueStrings)
-			uniqueStrings = append(uniqueStrings, fact.Predicate)
-		}
-		factStringRefs[i] = append(factStringRefs[i], stringRef{index: uniqueStringsMap[fact.Predicate], isObj: false})
-
-		if s, ok := fact.Object.(string); ok {
-			if _, ok := uniqueStringsMap[s]; !ok {
-				uniqueStringsMap[s] = len(uniqueStrings)
-				uniqueStrings = append(uniqueStrings, s)
-			}
-			factStringRefs[i] = append(factStringRefs[i], stringRef{index: uniqueStringsMap[s], isObj: true})
-		}
-	}
+	factRefs, uniqueStrings := collectStringRefs(facts)
 
 	ids, err := m.dict.GetIDs(uniqueStrings)
 	if err != nil {
 		return fmt.Errorf("failed to encode strings: %w", err)
 	}
 
+	fks, err := m.encodeFactKeys(facts, factRefs, ids)
+	if err != nil {
+		return err
+	}
+
 	batch := m.db.NewWriteBatch()
 	defer batch.Cancel()
 
-	for i, fact := range facts {
-		sID := ids[factStringRefs[i][0].index]
-		pID := ids[factStringRefs[i][1].index]
-
-		var oID uint64
-		var isInline bool
-		if len(factStringRefs[i]) > 2 && factStringRefs[i][2].isObj {
-			oID = ids[factStringRefs[i][2].index]
-		} else {
-			_, oID, err = m.encodeObject(fact.Object)
-			if err != nil {
-				return fmt.Errorf("failed to encode object for fact %d: %w", i, err)
-			}
-			isInline = keys.IsInline(oID)
-		}
-
-		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
-		if !isInline {
-			oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
-		}
-
-		hints := keys.EncodeSemanticHints(m.defaultEntityType, uint16(keys.HashSemanticName(fact.Subject)), m.defaultFlags)
-		value := encodeTripleValueWithHints(0, 0, hints)
-
-		spoKey := keys.EncodeTripleKey(keys.TripleSPOPrefix, sID, pID, oID)
-		if err := batch.Set(spoKey, value); err != nil {
+	for i, fk := range fks {
+		if err := batch.Set(fk.spo, fk.value); err != nil {
 			return fmt.Errorf("failed to set SPO key for fact %d: %w", i, err)
 		}
-
-		opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, sID, pID, oID)
-		if err := batch.Set(opsKey, value); err != nil {
+		if err := batch.Set(fk.ops, fk.value); err != nil {
 			return fmt.Errorf("failed to set OPS key for fact %d: %w", i, err)
 		}
 	}

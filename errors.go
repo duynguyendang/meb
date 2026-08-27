@@ -22,6 +22,10 @@ var (
 	// ErrEmptyBatch is returned when a batch write is called with no facts.
 	ErrEmptyBatch = fmt.Errorf("empty batch")
 
+	// ErrStoreClosed is returned when an operation is attempted on a store or
+	// batch writer that has been closed.
+	ErrStoreClosed = fmt.Errorf("store is closed")
+
 	// ErrWALClosed is returned by WAL.Append or WAL.Clear when the WAL has
 	// been closed or is mid-clear. Callers should treat this as a hard
 	// failure rather than a silent drop.
