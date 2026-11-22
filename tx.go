@@ -449,6 +449,10 @@ func (m *MEBStore) scanWithTxn(ctx context.Context, txn *badger.Txn, s, p, o str
 	}
 
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
+	if !sBound && !oBound && topicID != 0 {
+		strategy.prefix = keys.EncodeSPOTopicPrefix(topicID)
+		strategy.index = keys.TripleSPOPrefix
+	}
 
 	opts := &scanOptions{
 		ctx:      ctx,
@@ -498,6 +502,9 @@ func (m *MEBStore) scanImplWithTxn(txn *badger.Txn, opts *scanOptions) iterSeq2F
 			var result scanResult
 			result.foundSID, result.foundPID, result.foundOID = keys.DecodeTripleKey(key)
 
+			if opts.topicID != 0 && keys.UnpackTopicID(result.foundSID) != opts.topicID {
+				continue
+			}
 			if opts.sBound && result.foundSID != opts.sID {
 				continue
 			}

@@ -2,8 +2,13 @@ package vector
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"math"
 	"testing"
+
+	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/keys"
 )
 
 func TestPadAndTransformGolden(t *testing.T) {
@@ -154,5 +159,139 @@ func TestSelectIndex(t *testing.T) {
 	}
 	if SelectIndex(20_000_000, true) != IndexIVFPQ {
 		t.Error("expected IndexIVFPQ for very large corpus")
+	}
+}
+
+func newInMemoryVectorBadger(t *testing.T) *badger.DB {
+	t.Helper()
+	opts := badger.DefaultOptions("")
+	opts.InMemory = true
+	opts.Logger = nil
+	db, err := badger.Open(opts)
+	if err != nil {
+		t.Fatalf("badger.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestIVFPQSearchResidualRecall(t *testing.T) {
+	db := newInMemoryVectorBadger(t)
+	cfg := &IVFPQConfig{
+		NumCentroids: 2,
+		NumSubSpaces: 4,
+		BitsPerSpace: 8,
+		NProbe:       2,
+		NSample:      500,
+		BatchSize:    100,
+	}
+	idx := NewIVFPQIndex(db, cfg, 8)
+	const topicID uint32 = 1
+
+	// Insert two well-separated clusters:
+	// Cluster 0 around (0, ..., 0), Cluster 1 around (50, ..., 50).
+	err := db.Update(func(txn *badger.Txn) error {
+		for i := 1; i <= 150; i++ {
+			v := make([]float32, 8)
+			v[0] = float32(i) * 0.01
+			if err := idx.AddVector(txn, topicID, uint64(i), v); err != nil {
+				return err
+			}
+		}
+		for i := 151; i <= 300; i++ {
+			v := make([]float32, 8)
+			for d := range v {
+				v[d] = 50.0
+			}
+			v[0] += float32(i-151) * 0.05
+			if err := idx.AddVector(txn, topicID, uint64(i), v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("AddVector failed: %v", err)
+	}
+
+	if err := idx.Train(topicID, 500); err != nil {
+		t.Fatalf("Train failed: %v", err)
+	}
+
+	query := []float32{50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0}
+	var results []SearchResult
+	err = db.View(func(txn *badger.Txn) error {
+		for res, err := range idx.SearchInTopic(context.Background(), txn, topicID, query, 3) {
+			if err != nil {
+				return err
+			}
+			results = append(results, res)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SearchInTopic failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected non-empty search results")
+	}
+
+	top := results[0]
+	localID := keys.UnpackLocalID(top.ID)
+	if localID < 151 || localID > 155 {
+		t.Errorf("expected top-1 localID near 151, got %d (score=%.6f)", localID, top.Score)
+	}
+	// With residual ADC math, distance to centroid+residual is near 0 so score should be > 0.5.
+	// Without centroid subtraction, distance is ~20000 and score is ~0.00005.
+	if top.Score < 0.5 {
+		t.Errorf("expected high residual ADC score (>= 0.5), got %.6f", top.Score)
+	}
+}
+
+func TestIVFPQSearchCancellation(t *testing.T) {
+	db := newInMemoryVectorBadger(t)
+	cfg := &IVFPQConfig{
+		NumCentroids: 2,
+		NumSubSpaces: 4,
+		BitsPerSpace: 8,
+		NProbe:       2,
+		NSample:      300,
+		BatchSize:    50,
+	}
+	idx := NewIVFPQIndex(db, cfg, 8)
+	const topicID uint32 = 1
+
+	err := db.Update(func(txn *badger.Txn) error {
+		for i := 1; i <= 20; i++ {
+			v := make([]float32, 8)
+			v[0] = float32(i)
+			if err := idx.AddVector(txn, topicID, uint64(i), v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("AddVector failed: %v", err)
+	}
+	if err := idx.Train(topicID, 300); err != nil {
+		t.Fatalf("Train failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var gotErr error
+	_ = db.View(func(txn *badger.Txn) error {
+		for _, err := range idx.SearchInTopic(ctx, txn, topicID, make([]float32, 8), 5) {
+			if err != nil {
+				gotErr = err
+				break
+			}
+		}
+		return nil
+	})
+	if !errors.Is(gotErr, context.Canceled) {
+		t.Errorf("expected context.Canceled, got %v", gotErr)
 	}
 }

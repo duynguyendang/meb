@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/duynguyendang/meb/keys"
 )
 
 func TestExecuteStream_Basic(t *testing.T) {
@@ -266,4 +269,102 @@ func makeSeedSeq(ids ...uint64) iter.Seq2[uint64, error] {
 			}
 		}
 	}
+}
+
+func TestLFTJEngineConcurrentOptimizeWithCache(t *testing.T) {
+	db := newTestDB(t)
+	for i := uint64(2); i <= 10; i++ {
+		insertTriple(t, db, keys.TripleSPOPrefix, 1, 100, i)
+		insertTriple(t, db, keys.TripleOPSPrefix, 1, 100, i)
+		insertTriple(t, db, keys.TripleSPOPrefix, i, 200, i+100)
+		insertTriple(t, db, keys.TripleOPSPrefix, i, 200, i+100)
+	}
+
+	engine := NewLFTJEngine(db)
+	relations := []RelationPattern{
+		{
+			Prefix:            keys.TripleSPOPrefix,
+			BoundPositions:    map[int]uint64{0: 1, 1: 100},
+			VariablePositions: map[int]string{2: "mid"},
+		},
+		{
+			Prefix:            keys.TripleSPOPrefix,
+			BoundPositions:    map[int]uint64{1: 200},
+			VariablePositions: map[int]string{0: "mid", 2: "leaf"},
+		},
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := withVisitLimit(100000)
+			for _, err := range engine.Execute(ctx, relations, nil, []string{"mid", "leaf"}) {
+				if err != nil {
+					t.Errorf("Execute failed: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestQueryPlanCache_OverwriteDoesNotLeakLRU(t *testing.T) {
+	cache := NewQueryPlanCache(2, 5*time.Minute)
+
+	rel1 := []RelationPattern{{Prefix: 0x20, BoundPositions: map[int]uint64{0: 1}}}
+	rel2 := []RelationPattern{{Prefix: 0x20, BoundPositions: map[int]uint64{0: 2}}}
+	rel3 := []RelationPattern{{Prefix: 0x20, BoundPositions: map[int]uint64{0: 3}}}
+
+	k1 := planKey(rel1, nil)
+	k2 := planKey(rel2, nil)
+	k3 := planKey(rel3, nil)
+
+	// Set k2 first, then overwrite k1 multiple times so k1 is MRU and k2 is LRU.
+	cache.Set(k2, rel2, 20)
+	for i := 0; i < 5; i++ {
+		cache.Set(k1, rel1, 10+i)
+	}
+
+	// Inserting k3 should evict k2 (the LRU), NOT k1.
+	cache.Set(k3, rel3, 30)
+
+	_, _, size, _ := cache.Stats()
+	if size != 2 {
+		t.Fatalf("expected size 2, got %d", size)
+	}
+	if _, cnt, ok := cache.Get(k1); !ok || cnt != 14 {
+		t.Errorf("expected k1 to remain with count 14, got ok=%v cnt=%d", ok, cnt)
+	}
+	if _, _, ok := cache.Get(k2); ok {
+		t.Error("expected k2 (LRU) to be evicted")
+	}
+	if _, _, ok := cache.Get(k3); !ok {
+		t.Error("expected k3 to remain in cache")
+	}
+}
+
+func TestQueryPlanCache_ConcurrentAccess(t *testing.T) {
+	cache := NewQueryPlanCache(16, 50*time.Millisecond)
+	rel := []RelationPattern{{Prefix: 0x20, BoundPositions: map[int]uint64{0: 1}}}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				k := uint64((id*100 + i) % 24)
+				cache.Set(k, rel, i)
+				cache.Get(k)
+				if i%10 == 0 {
+					cache.Invalidate(k)
+				}
+				cache.Stats()
+			}
+		}(g)
+	}
+	wg.Wait()
 }

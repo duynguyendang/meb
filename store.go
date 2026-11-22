@@ -283,6 +283,23 @@ func factKeyString(f Fact) string {
 	return f.Subject + "|" + f.Predicate + "|" + objStr
 }
 
+// OpenDefault opens a persistent MEBStore at dataDir with recommended production defaults.
+func OpenDefault(dataDir string) (*MEBStore, error) {
+	return NewMEBStore(store.DefaultConfig(dataDir))
+}
+
+// OpenSafeServing opens a persistent MEBStore optimized for low-memory serving workloads.
+func OpenSafeServing(dataDir string) (*MEBStore, error) {
+	return NewMEBStore(store.SafeServingConfig(dataDir))
+}
+
+// OpenInMemory opens an ephemeral, RAM-only MEBStore ideal for unit testing and scratch environments.
+func OpenInMemory() (*MEBStore, error) {
+	cfg := store.DefaultConfig("")
+	cfg.InMemory = true
+	return NewMEBStore(cfg)
+}
+
 func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 	if cfg.Verbose {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))

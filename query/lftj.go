@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/duynguyendang/meb/keys"
@@ -90,12 +91,16 @@ func (r LFTJResult) Canonical() string {
 // LFTJ traverses all relations simultaneously via trie iterators,
 // yielding results one-by-one at the deepest level.
 type LFTJEngine struct {
-	db        *badger.DB
-	planCache *QueryPlanCache // per-engine plan cache, lazy-init
+	db            *badger.DB
+	planCache     *QueryPlanCache // per-engine plan cache
+	planCacheOnce sync.Once
 }
 
 func NewLFTJEngine(db *badger.DB) *LFTJEngine {
-	return &LFTJEngine{db: db}
+	return &LFTJEngine{
+		db:        db,
+		planCache: DefaultQueryPlanCache(),
+	}
 }
 
 // Execute runs a multi-way join query. Uses CBO (Cost-Based Optimization)

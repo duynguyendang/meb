@@ -69,6 +69,42 @@ func TestNewMEBStore(t *testing.T) {
 	}
 }
 
+func TestFactoryPresets(t *testing.T) {
+	t.Run("OpenInMemory", func(t *testing.T) {
+		s, err := OpenInMemory()
+		if err != nil {
+			t.Fatalf("OpenInMemory failed: %v", err)
+		}
+		defer s.Close()
+		if err := s.AddFact(Fact{Subject: "A", Predicate: "calls", Object: "B"}); err != nil {
+			t.Fatalf("AddFact failed: %v", err)
+		}
+	})
+
+	t.Run("OpenDefault_and_SafeServing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		s1, err := OpenDefault(tmpDir)
+		if err != nil {
+			t.Fatalf("OpenDefault failed: %v", err)
+		}
+		if err := s1.AddFact(Fact{Subject: "A", Predicate: "calls", Object: "B"}); err != nil {
+			t.Fatalf("AddFact failed: %v", err)
+		}
+		s1.Close()
+
+		// Reopen in SafeServing (read-only low footprint) mode
+		s2, err := OpenSafeServing(tmpDir)
+		if err != nil {
+			t.Fatalf("OpenSafeServing failed: %v", err)
+		}
+		defer s2.Close()
+
+		if s2.Count() != 1 {
+			t.Fatalf("expected count 1 in SafeServing, got %d", s2.Count())
+		}
+	})
+}
+
 func TestAddFact(t *testing.T) {
 	s := newTestStore(t)
 

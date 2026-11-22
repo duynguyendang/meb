@@ -7,28 +7,31 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 ## Features
 
 - **Triple Store**: Subject-Predicate-Object with dual SPO/OPS indexing (25-byte keys)
-- **Multi-Topic Isolation**: 24-bit TopicID bit-packing enables 16M namespaces without a Graph column
-- **ANN Indexes**: IVF-PQ (coarse K-means + residual PQ) and HNSW (hierarchical navigable small world) for O(log N) vector search
+- **Multi-Topic Isolation**: 24-bit TopicID bit-packing enables 16M namespaces without a Graph column, enforced across `Scan`, `ScanInTopic`, `Query`, and `SearchInTopic`
+- **ANN Indexes**: IVF-PQ (coarse K-means + residual PQ with per-centroid residual ADC) and HNSW (hierarchical navigable small world) for O(log N) vector search
 - **Badger-Native Vector Store**: Compressed vectors stored in BadgerDB with mmap cache layer — disk-scaled, O(k) memory per search
-- **SIMD ADC Accumulation**: Asymmetric distance computation with scalar, AVX2 (amd64), and NEON (arm64) kernels; runtime dispatch via `golang.org/x/sys/cpu`
+- **SIMD ADC Accumulation**: Asymmetric distance computation with scalar, SSE (amd64, opt-in via `MEB_AVX2_ADC=1`), and NEON (arm64) kernels; runtime dispatch via `golang.org/x/sys/cpu`
 - **Dual-Path Search**: Hot queries hit parallel mmap (~500K vectors/sec); cold start streams from Badger
-- **LSM-Level Topic Filtering**: `SearchInTopic()` uses Badger prefix scan — zero I/O on unrelated topics
+- **LSM-Level Topic Filtering**: `SearchInTopic()` and `EncodeSPOTopicPrefix()` use Badger prefix scans — zero I/O on unrelated topics
 - **Hybrid Vector Compression**: FWHT preconditioning + block-wise 4/8-bit quantization preserving full 1536 dimensions
 - **Cauchy-Schwarz Pruning**: Per-block L2 norm suffix sums for early termination during vector search
 - **Zero-Copy Streaming**: Go 1.23+ `iter.Seq2` for constant-memory scan operations
 - **Unified BadgerDB**: Single database for graph, dictionary, vectors, and content — enables cross-subsystem transactions
 - **Cross-Subsystem Transactions**: Opt-in `View()`/`Update()` API for atomic multi-operation writes (graph + vector + content + dictionary)
-- **Datalog Integration**: Mangle `factstore.FactStore` interface for symbolic reasoning
+- **High-Level Datalog Engine**: `MEBStore.Query()` with single-atom scans, multi-way LFTJ joins, constraint evaluation (`!=`, `=`, `gt`, `gte`, `lt`, `lte`, `contains`, `regex`, `not(triples(...))`), topic/limit-isolated `QueryCache`, and circuit breaker protection
+- **Mangle Integration (`mangle-go v0.7.0`)**: `MangleFactStore` (`factstore.FactStoreWithRemove` + typed constants + `SimpleInMemoryStore` overlay) plus `EvalMangle`, `ExplainMangle`, and `ExplainMangleAsFacts` for stratified evaluation, builtins (`:string:matches`, `:float:gt`, `fn:max` on lists), and full `provenance` proof DAGs; lower-level `adapter/` for direct Badger iteration
+- **Graph Engine (`meb/graph`)**: Directed graph over `uint64` dictionary IDs with Dijkstra shortest path, BFS reachability, lowest common ancestor, cycle detection, degree centrality, and PageRank
 - **Neuro-Symbolic Search**: Hybrid vector + LFTJ graph query builder with streaming joins
-- **Rule-Based Optimizer (RBO)**: Auto-selects GraphFirst, VectorFirst, IntersectionFirst, PureVectorSearch, or PureLFTJ strategy per query
-- **Cost-Based Optimizer (CBO)**: Greedy smallest-first join ordering with plan cache
+- **Rule-Based Optimizer (RBO)**: Strategy selector (`GraphFirst`, `VectorFirst`, `IntersectionFirst`, `PureVectorSearch`, `PureLFTJ`)
+- **Cost-Based Optimizer (CBO)**: Greedy smallest-first join ordering with thread-safe `O(1)` LRU/TTL plan cache
 - **Streaming Execution**: Concurrent dense/graph path merge with early termination via context cancellation
-- **Circuit Breaker**: Configurable query timeout protection with push telemetry
+- **Circuit Breaker**: Configurable query timeout protection (`Query()` + builder paths) with push telemetry
 - **Hybrid WAL Approach**: Transactions use BadgerDB `SyncWrites: true` for durability; WriteBatch path uses WAL v2 (CRC32C) for crash recovery
-- **Deterministic LFTJ Joins**: Canonical ordering + ExecuteOrdered for reproducible multi-way join results
+- **Deterministic LFTJ Joins**: Canonical ordering + `ExecuteOrdered` for reproducible multi-way join results
 - **Sharded Dictionary**: Configurable lock-striping for high-concurrent ingestion
-- **Soft Delete**: HNSW tombstone keys + `Compact()` graph rebuild
+- **Soft Delete & Compaction**: HNSW tombstone keys + mutex-serialized `Compact()` pruning deleted neighbor links and re-selecting entry points
 - **S2 Compression**: Fast content storage with Snappy-compatible compression
+- **Ergonomic Presets & Health**: `OpenDefault`, `OpenSafeServing`, `OpenInMemory`, `BatchWriter`, and `Health()` diagnostics
 
 ## Quick Start
 
@@ -44,6 +47,7 @@ import (
 
 func main() {
     ctx := context.Background()
+    // Or use presets: meb.OpenDefault("./meb-data"), meb.OpenSafeServing("./meb-data"), meb.OpenInMemory()
     cfg := store.DefaultConfig("./meb-data")
     s, err := meb.NewMEBStore(cfg)
     if err != nil {
@@ -53,7 +57,14 @@ func main() {
 
     // Add facts
     s.AddFact(meb.NewFact("Alice", "knows", "Bob"))
-    s.AddFact(meb.NewFact("Alice", "works_at", "Acme"))
+    s.AddFact(meb.NewFact("Bob", "works_at", "Acme"))
+
+    // High-level Datalog query (LFTJ join + constraints + circuit breaker)
+    rows, err := s.Query(ctx, `triples(?a, "knows", ?b), triples(?b, "works_at", ?c), ?c != "Other"`)
+    if err != nil {
+        log.Fatal(err)
+    }
+    _ = rows
 
     // Add document with explicit topic isolation (atomic: dict + facts + vector + content)
     topicID := uint32(101)
@@ -158,15 +169,21 @@ MEB's Neuro-Symbolic pipeline combines neural vector search with symbolic graph 
 MEB uses a **Symmetric TopicID packing** strategy to enable multi-tenancy within a standard triple-store model — no Graph column needed.
 
 ```
-Prefix │ Index │ Key Size │ Value Size │ ID Layout (64-bit)
-───────┼───────┼──────────┼────────────┼───────────────────────────────────
-0x20   │ SPO   │ 25 bytes │ 16 bytes   │ [Topic:24] | [Local:40]
-0x21   │ OPS   │ 25 bytes │ 16 bytes   │ [Topic:24] | [Local:40]
-0x10   │ Chunk │ 9 bytes  │ S2 blob    │ [Local:40]
-0x11   │ Vec   │ 9 bytes  │ compressed │ [Local:40]
-0x80   │ Dict→ │ var      │ 8 bytes    │ string → ID
-0x81   │ Dict← │ 9 bytes  │ var        │ ID → string
-0xFF   │ Sys   │ 2 bytes  │ counter    │ —
+Prefix    │ Index       │ Key Size │ Value Size  │ ID / Key Layout
+──────────┼─────────────┼──────────┼─────────────┼─────────────────────────────────────
+0x20      │ SPO         │ 25 bytes │ 16 bytes    │ [Topic:24] | [Local:40]
+0x21      │ OPS         │ 25 bytes │ 16 bytes    │ [Topic:24] | [Local:40]
+0x10      │ Chunk       │ 9 bytes  │ S2 blob     │ [Local:40]
+0x11      │ Vec         │ 9 bytes  │ compressed  │ [Topic:24] | [Local:40]
+0x12      │ HNSW / Tomb │ 10 bytes │ neighbors   │ [packedID:8][level:1] / [0xFF][id:8]
+0x13      │ IVFCentroid │ 9 bytes  │ float32[]   │ [TopicID:4][CentroidID:4]
+0x14      │ IVFPosting  │ 14 bytes │ PQ codes    │ [TopicID:4][CentroidID:4][LocalID:5]
+0x15      │ IVFCodebook │ 5 bytes  │ float32[]   │ [TopicID:4]
+0x16      │ IVFRawVec   │ 9 bytes  │ float32[]   │ [Topic:24] | [Local:40]
+0x80      │ Dict→       │ var      │ 8 bytes     │ string → ID
+0x81      │ Dict←       │ 9 bytes  │ var         │ ID → string
+0xFF 0x01 │ FactCount   │ 2 bytes  │ 8 bytes     │ durable fact count
+0xFF 0x02 │ SchemaVer   │ 2 bytes  │ 8 bytes     │ schema version (2)
 ```
 
 **ID Bit-packing:**
@@ -363,58 +380,60 @@ All cleanup operations are **throttled** (max 1000 orphans per cycle) to avoid l
 
 ```
 meb/
-├── .github/workflows/
-│   └── ci.yml            # CI: go test, goleak, race detector
-├── keys/              # 25-byte triple key encoding (TopicID packing)
-├── dict/              # String interning (thread-safe LRU + sharded allocator)
-├── store/             # BadgerDB config with deployment profiles
-├── vector/            # Hybrid vector compression and search
-│   ├── turboquant.go  # FWHT + block-wise 4/8-bit quantization + Cauchy-Schwarz pruning
-│   ├── partitioned.go # PartitionedRegistry (sharded by TopicID)
-│   ├── registry.go    # Badger-native store + mmap cache, RCU revMap
-│   ├── search.go      # Dual-path: mmap parallel + Badger streaming, adaptive workers
-│   ├── math.go        # L2 normalize, dot product
-│   ├── index.go       # Index selection API (brute-force / IVF-PQ / HNSW)
-│   ├── ivfpq.go       # IVF-PQ index: centroid assignment, ADC search, posting list iteration
-│   ├── ivfpq_config.go# IVFPQConfig with validation
-│   ├── ivfpq_train.go # Mini-batch K-means training, PQ codebook training
-│   ├── hnsw.go        # HNSW index: Insert, SearchInTopic, searchLayer
-│   ├── hnsw_graph.go  # HNSW graph operations: writeNode, readNeighbors, addSymmetricalLink
-│   ├── hnsw_delete.go # SoftDelete, isDeleted, Compact
-│   ├── adc_scalar.go       # Portable scalar ADC accumulation (4-way unrolled)
-│   ├── adc_sse_amd64.go    # SSE ADC kernel for amd64 (dispatch)
-│   ├── adc_neon_arm64.go   # NEON ADC kernel for arm64 (dispatch)
-│   ├── adc_dispatch_amd64.go   # amd64 runtime dispatch via golang.org/x/sys/cpu
-│   ├── adc_dispatch_arm64.go   # arm64 runtime dispatch
-│   ├── adc_dispatch_generic.go # Generic fallback dispatch
-│   ├── adc_avx2_amd64.s   # Hand-written Plan 9 AVX2 assembly
-│   ├── adc_neon_arm64.s   # Hand-written Plan 9 NEON assembly
-│   └── diskann.go     # DiskANNConfig and DiskANNIndex scaffold (unreachable)
-├── query/             # LFTJ engine + CBO + RBO + plan cache
-│   ├── lftj.go        # TrieIterator, LFTJResult, Canonical ordering
-│   ├── engine.go      # Execute, ExecuteOrdered, WithBufferAndSort, OptimizeRelations
-│   ├── rbo.go         # Rule-Based Optimizer (PlanType, ExecutionPlan, Optimize)
-│   ├── rbo_test.go    # RBO unit tests
-│   ├── plan_cache.go  # QueryPlanCache with LRU eviction + TTL + FNV-1a hash
-│   └── stream.go      # ExecuteStream concurrent dense/sparse merge
-├── circuit/           # Query timeout circuit breaker with state callbacks
-├── utils/             # Zero-copy string/byte conversion
-├── adapter/           # Mangle Datalog integration
-├── bench/             # ANN benchmarks + perf benchmarks
-├── store.go           # MEBStore orchestrator (NewMEBStore, Reset, Close, EnableIVFPQ, EnableHNSW)
-├── tx.go              # Transaction API (View/Update, StoreTxn, AddIVFVector, SearchHybrid)
-├── knowledge_store.go # SPO/OPS dual-index write, orphan cleanup
-├── scan.go            # Index selection scan (iter.Seq2 streaming)
-├── content.go         # S2-compressed content storage, atomic Add/DeleteDocument
-├── query_builder.go   # Neuro-symbolic query builder with LFTJ joins — Execute(ctx)
-├── telemetry.go       # Push telemetry (TelemetrySink interface)
-├── wal.go             # Write-ahead log v2 (CRC32C, WriteBatch crash recovery only)
-├── fact_store.go      # factstore.FactStore implementation
-├── store_test.go      # H4 Lifecycle, H5 cancellation, H10 lifecycle
-├── reset_test.go      # H1 Reset no-deadlock, concurrent guards
-├── scan_test.go       # H9 PreserveObjectTypes deprecation warning
-├── wal_test.go        # H8 WAL v2 format, CRC32C, WriteBatch recovery tests
-└── go.mod             # go.uber.org/goleak added for test goroutine leak detection
+├── Makefile               # SIFT-1M download & benchmark targets
+├── keys/                  # 25-byte triple key encoding, TopicID/inline bit-packing, IVF/HNSW keys
+├── dict/                  # String interning (thread-safe LRU + sharded range allocator)
+├── store/                 # BadgerDB config with deployment profiles
+├── graph/                 # Integer-ID graph algorithms (Dijkstra, BFS, LCA, cycles, centrality, PageRank)
+├── vector/                # Hybrid vector compression, ANN indexes & SIMD ADC
+│   ├── turboquant.go      # FWHT + block-wise 4/8-bit quantization + Cauchy-Schwarz pruning
+│   ├── fwht.go            # Fast Walsh-Hadamard transform
+│   ├── partitioned.go     # PartitionedRegistry (sharded by TopicID)
+│   ├── registry.go        # Badger-native store + mmap cache, RCU revMap
+│   ├── mmap*.go           # Cross-platform mmap segment lifecycle
+│   ├── search.go          # Dual-path: mmap parallel + Badger streaming, adaptive workers
+│   ├── heap.go            # Purpose-built top-K and node-distance heaps
+│   ├── math.go            # L2 normalize, dot product
+│   ├── index.go           # Index selection API (brute-force / IVF-PQ / HNSW)
+│   ├── ivfpq.go           # IVF-PQ index: centroid assignment, residual ADC search, posting scan
+│   ├── ivfpq_config.go    # IVFPQConfig with validation
+│   ├── ivfpq_train.go     # Mini-batch K-means training, PQ codebook training
+│   ├── hnsw.go            # HNSW index: Insert, SearchInTopic, searchLayer
+│   ├── hnsw_graph.go      # HNSW graph operations: writeNode, readNeighbors, deleteNode
+│   ├── hnsw_level.go      # Level lookup helpers
+│   ├── hnsw_delete.go     # SoftDelete, isDeleted, Compact
+│   ├── adc_*.go / *.s     # Scalar, SSE (amd64), and NEON (arm64) ADC kernels + dispatch
+│   ├── dotprod_*.go       # Platform dot-product helpers
+│   └── diskann.go         # DiskANNConfig and DiskANNIndex scaffold (unreachable)
+├── query/                 # LFTJ engine + Datalog parser + CBO + RBO + plan/query caches
+│   ├── lftj.go            # TrieIterator, LFTJResult, Canonical ordering
+│   ├── datalog_parser.go  # Datalog atom parser & constraint syntactic sugar
+│   ├── cache.go           # TTL query result cache
+│   ├── engine.go          # Execute, ExecuteOrdered, WithBufferAndSort, OptimizeRelations
+│   ├── rbo.go             # Rule-Based Optimizer (PlanType, ExecutionPlan, Optimize)
+│   ├── plan_cache.go      # QueryPlanCache with container/list LRU + TTL + FNV-1a hash
+│   └── stream.go          # ExecuteStream concurrent dense/sparse merge
+├── circuit/               # Query timeout circuit breaker with state callbacks & metrics
+├── utils/                 # Zero-copy string/byte conversion
+├── adapter/               # Mangle Datalog integration
+├── bench/                 # ANN & CBO benchmarks + SIFT dataset loader
+├── cmd/bench/             # Benchmark runner CLI
+├── store.go               # MEBStore orchestrator, factory presets, EnableIVFPQ/EnableHNSW
+├── tx.go                  # Transaction API (View/Update, StoreTxn, AddIVFVector, SearchHybrid)
+├── knowledge_store.go     # SPO/OPS dual-index write, orphan cleanup
+├── scan.go                # Index & topic-scoped scan (iter.Seq2 streaming)
+├── datalog.go             # High-level MEBStore.Query engine with constraints & breaker
+├── content.go             # S2-compressed content storage, atomic Add/DeleteDocument
+├── batch.go               # Bulk point reads and BatchWriter
+├── health.go              # StoreHealth diagnostics and manual compaction
+├── query_builder.go       # Neuro-symbolic query builder with LFTJ joins — Execute(ctx)
+├── query_result.go        # Result and Results helpers
+├── fact.go / errors.go    # Fact value type and sentinel errors
+├── generics.go / helpers.go # iter.Seq2 helpers and batching primitives
+├── telemetry.go           # Push telemetry (TelemetrySink interface)
+├── wal.go                 # Write-ahead log v2 (CRC32C, WriteBatch crash recovery)
+├── fact_store.go          # factstore.FactStore implementation
+└── go.mod                 # Go module dependencies (go.uber.org/goleak, rapid, etc.)
 ```
 
 ## Configuration
@@ -556,13 +575,14 @@ go test ./vector/... -v -run "TestHybridQuantizationFidelity|TestRecallAtK|TestF
 | Max Join Results | 5,000 facts | Prevent RAM exhaustion |
 | Vector Search Top-K | 100 | Limit result set size |
 
-## Build
+## Build & Test
 
 ```bash
 go build ./...
-go test -short ./...    # skip slow ANN benchmarks
-go test -race ./...     # race detector (except vector/ — FWHT timeout)
+go test ./...
+go test -race . ./adapter/... ./circuit/... ./dict/... ./graph/... ./keys/... ./query/... ./store/... ./vector/...
 go vet ./...
+make bench            # run benchmarks in ./bench/...
 ```
 
 ## Dependencies
@@ -572,4 +592,5 @@ go vet ./...
 - `github.com/klauspost/compress` — S2 compression
 - `github.com/hashicorp/golang-lru/v2` — Dictionary caching
 - `go.uber.org/goleak` — Goroutine leak detection in tests
-- `golang.org/x/sys` — CPU feature detection (AVX2 dispatch)
+- `golang.org/x/sys` — CPU feature detection (SIMD ADC dispatch)
+- `pgregory.net/rapid` — Property-based testing (`keys/`)

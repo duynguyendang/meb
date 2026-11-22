@@ -318,12 +318,23 @@ func EncodeTripleOPSPrefix(o, p, s uint64) []byte {
 	return buildTriplePrefix(TripleOPSPrefix, o, p, s)
 }
 
-// EncodeSPOByTopic builds a prefix that scans all triples for a given TopicID in SPO index.
+// EncodeSPOByTopic builds a seek key at the start of TopicID in SPO index.
 func EncodeSPOByTopic(topicID uint32) []byte {
 	packedTopic := uint64(topicID) << TopicIDShift
 	buf := make([]byte, PrefixSize+IDSize)
 	buf[0] = TripleSPOPrefix
 	binary.BigEndian.PutUint64(buf[1:], packedTopic)
+	return buf
+}
+
+// EncodeSPOTopicPrefix builds a 4-byte prefix [0x20][topicID:3] that matches
+// all SPO triple keys belonging to topicID.
+func EncodeSPOTopicPrefix(topicID uint32) []byte {
+	buf := make([]byte, 4)
+	buf[0] = TripleSPOPrefix
+	buf[1] = byte(topicID >> 16)
+	buf[2] = byte(topicID >> 8)
+	buf[3] = byte(topicID)
 	return buf
 }
 

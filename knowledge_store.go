@@ -142,6 +142,81 @@ func (m *MEBStore) addFactBatchInternal(facts []Fact) error {
 	return nil
 }
 
+// DeleteFactWithTopic deletes a single exact fact from the specified topic and
+// returns true if the triple existed and was deleted.
+func (m *MEBStore) DeleteFactWithTopic(fact Fact, topicID uint32) (bool, error) {
+	if m.config.ReadOnly {
+		return false, ErrStoreReadOnly
+	}
+	if err := validateFact(fact); err != nil {
+		return false, err
+	}
+	if topicID == 0 {
+		topicID = m.topicID.Load()
+	}
+
+	sID, err := m.dict.GetID(fact.Subject)
+	if err != nil {
+		return false, nil
+	}
+	pID, err := m.dict.GetID(fact.Predicate)
+	if err != nil {
+		return false, nil
+	}
+
+	var oID uint64
+	if sObj, ok := fact.Object.(string); ok {
+		id, err := m.dict.GetID(sObj)
+		if err != nil {
+			return false, nil
+		}
+		oID = keys.PackID(topicID, keys.UnpackLocalID(id))
+	} else {
+		objStr, encodedID, err := m.encodeObject(fact.Object)
+		if err != nil {
+			return false, err
+		}
+		if encodedID != 0 {
+			oID = encodedID
+		} else {
+			id, err := m.dict.GetID(objStr)
+			if err != nil {
+				return false, nil
+			}
+			oID = keys.PackID(topicID, keys.UnpackLocalID(id))
+		}
+	}
+
+	sID = keys.PackID(topicID, keys.UnpackLocalID(sID))
+	spoKey := keys.EncodeTripleKey(keys.TripleSPOPrefix, sID, pID, oID)
+	opsKey := keys.EncodeTripleKey(keys.TripleOPSPrefix, sID, pID, oID)
+
+	deleted := false
+	err = m.withWriteTxn(func(txn *badger.Txn) error {
+		if _, err := txn.Get(spoKey); err == badger.ErrKeyNotFound {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if err := txn.Delete(spoKey); err != nil {
+			return err
+		}
+		if err := txn.Delete(opsKey); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if deleted {
+		m.numFacts.Add(^uint64(0))
+		m.persistStatsIfNeeded(0)
+	}
+	return deleted, nil
+}
+
 func (m *MEBStore) DeleteFactsBySubject(subject string) error {
 	if m.config.ReadOnly {
 		return ErrStoreReadOnly

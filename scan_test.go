@@ -288,3 +288,40 @@ func TestScanSubjectsChunkBoundary(t *testing.T) {
 		t.Errorf("ScanSubjectsByPrefix returned %d subjects, want %d", count, n)
 	}
 }
+
+func TestScanTopicIsolation(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStoreForScan(t)
+
+	s.SetTopicID(1)
+	if err := s.AddFactBatch([]Fact{
+		{Subject: "t1_s1", Predicate: "calls", Object: "t1_o1"},
+		{Subject: "t1_s2", Predicate: "defines", Object: "t1_o2"},
+	}); err != nil {
+		t.Fatalf("AddFactBatch topic 1: %v", err)
+	}
+
+	s.SetTopicID(2)
+	if err := s.AddFact(Fact{Subject: "t2_s1", Predicate: "calls", Object: "t2_o1"}); err != nil {
+		t.Fatalf("AddFact topic 2: %v", err)
+	}
+
+	// Unbound-subject/object predicate scan on topic 2 must only return topic 2.
+	gotPred, err := Collect(s.ScanContext(context.Background(), "", "calls", ""))
+	if err != nil {
+		t.Fatalf("ScanContext failed: %v", err)
+	}
+	if len(gotPred) != 1 || gotPred[0].Subject != "t2_s1" {
+		t.Fatalf("expected only topic 2 fact for predicate scan, got %+v", gotPred)
+	}
+
+	// ScanInTopicContext with all-empty args must return all facts for topic 1.
+	gotAllT1, err := Collect(s.ScanInTopicContext(context.Background(), 1, "", "", ""))
+	if err != nil {
+		t.Fatalf("ScanInTopicContext failed: %v", err)
+	}
+	if len(gotAllT1) != 2 {
+		t.Fatalf("expected 2 facts for topic 1 via ScanInTopicContext, got %d: %+v", len(gotAllT1), gotAllT1)
+	}
+}

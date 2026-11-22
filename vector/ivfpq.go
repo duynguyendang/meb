@@ -208,7 +208,8 @@ func (idx *IVFPQIndex) SearchInTopic(ctx context.Context, txn *badger.Txn, topic
 			return
 		}
 
-		lut := idx.precomputeLUT(transformed, codebook)
+		queryResidual := make([]float32, idx.paddedDim)
+		lut := make([]float32, idx.cfg.NumSubSpaces*256)
 
 		heap := newMinHeap(k)
 		for _, centroidID := range topCentroids {
@@ -217,6 +218,12 @@ func (idx *IVFPQIndex) SearchInTopic(ctx context.Context, txn *badger.Txn, topic
 				return
 			}
 
+			centroidBase := int(centroidID) * idx.paddedDim
+			for i := 0; i < idx.paddedDim; i++ {
+				queryResidual[i] = transformed[i] - centroids[centroidBase+i]
+			}
+			idx.precomputeLUTInto(queryResidual, codebook, lut)
+
 			prefix := keys.IVFPostingPrefixByCentroid(topicID, centroidID)
 			opts := badger.DefaultIteratorOptions
 			opts.Prefix = prefix
@@ -224,18 +231,29 @@ func (idx *IVFPQIndex) SearchInTopic(ctx context.Context, txn *badger.Txn, topic
 			opts.PrefetchSize = 1000
 
 			iter := txn.NewIterator(opts)
+			entryCount := 0
 			for iter.Rewind(); iter.Valid(); iter.Next() {
+				if entryCount&63 == 0 {
+					if err := ctx.Err(); err != nil {
+						iter.Close()
+						yield(SearchResult{}, err)
+						return
+					}
+				}
+				entryCount++
+
 				item := iter.Item()
 				localID := keys.ExtractLocalIDFromPostingKey(item.Key())
 
-				var pqCodes []byte
-				_ = item.Value(func(val []byte) error {
-					pqCodes = make([]byte, len(val))
-					copy(pqCodes, val)
+				var dist float32
+				if err := item.Value(func(val []byte) error {
+					dist = idx.adcDistance(lut, val)
 					return nil
-				})
-
-				dist := idx.adcDistance(lut, pqCodes)
+				}); err != nil {
+					iter.Close()
+					yield(SearchResult{}, err)
+					return
+				}
 
 				heap.push(SearchResult{
 					ID:    keys.PackID(topicID, localID),
@@ -291,6 +309,11 @@ func (idx *IVFPQIndex) findTopNCentroids(queryVec []float32, centroids []float32
 
 func (idx *IVFPQIndex) precomputeLUT(transformed []float32, codebook []float32) []float32 {
 	lut := make([]float32, idx.cfg.NumSubSpaces*256)
+	idx.precomputeLUTInto(transformed, codebook, lut)
+	return lut
+}
+
+func (idx *IVFPQIndex) precomputeLUTInto(transformed []float32, codebook []float32, lut []float32) {
 	for s := 0; s < idx.cfg.NumSubSpaces; s++ {
 		base := s * idx.subspaceDim
 		for code := 0; code < 256; code++ {
@@ -303,7 +326,6 @@ func (idx *IVFPQIndex) precomputeLUT(transformed []float32, codebook []float32) 
 			lut[s*256+code] = dist
 		}
 	}
-	return lut
 }
 
 func (idx *IVFPQIndex) adcDistance(lut []float32, pqCodes []byte) float32 {

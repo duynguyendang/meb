@@ -1,6 +1,7 @@
 package query
 
 import (
+	"container/list"
 	"context"
 	"encoding/binary"
 	"hash/fnv"
@@ -15,6 +16,7 @@ const defaultCacheSize = 1000
 
 // planCacheEntry holds a cached query plan with its expiry.
 type planCacheEntry struct {
+	key                uint64
 	optimizedRelations []RelationPattern
 	estimatedCount     int
 	expiresAt          time.Time
@@ -25,14 +27,13 @@ type planCacheEntry struct {
 // filter strategies) keyed by query signature. Plans expire after a TTL
 // and are evicted by LRU when the cache is full.
 type QueryPlanCache struct {
-	mu       sync.RWMutex
-	entries  map[uint64]*planCacheEntry
-	maxSize  int
-	ttl      time.Duration
-	hitCount int64
+	mu        sync.RWMutex
+	entries   map[uint64]*list.Element
+	lruList   *list.List
+	maxSize   int
+	ttl       time.Duration
+	hitCount  int64
 	missCount int64
-	// lru list for O(1) eviction ordering (not just LFU).
-	lruList []uint64
 }
 
 // NewQueryPlanCache creates a new query plan cache with the given max size
@@ -45,7 +46,8 @@ func NewQueryPlanCache(maxSize int, ttl time.Duration) *QueryPlanCache {
 		ttl = 5 * time.Minute
 	}
 	return &QueryPlanCache{
-		entries: make(map[uint64]*planCacheEntry),
+		entries: make(map[uint64]*list.Element),
+		lruList: list.New(),
 		maxSize: maxSize,
 		ttl:     ttl,
 	}
@@ -122,30 +124,25 @@ func planKey(relations []RelationPattern, resultVars []string) uint64 {
 
 // Get retrieves a cached plan. Returns nil if not found or expired.
 func (c *QueryPlanCache) Get(key uint64) ([]RelationPattern, int, bool) {
-	c.mu.RLock()
-	entry, ok := c.entries[key]
-	c.mu.RUnlock()
-
-	if !ok {
-		c.mu.Lock()
-		c.missCount++
-		c.mu.Unlock()
-		return nil, 0, false
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Check expiry
+	elem, ok := c.entries[key]
+	if !ok {
+		c.missCount++
+		return nil, 0, false
+	}
+
+	entry := elem.Value.(*planCacheEntry)
 	if time.Now().After(entry.expiresAt) {
+		c.lruList.Remove(elem)
 		delete(c.entries, key)
-		c.removeFromLRU(key)
 		c.missCount++
 		return nil, 0, false
 	}
 
 	entry.lastAccess = time.Now()
-	c.promoteInLRU(key)
+	c.lruList.MoveToBack(elem)
 	c.hitCount++
 
 	slog.Debug("plan cache hit",
@@ -156,67 +153,61 @@ func (c *QueryPlanCache) Get(key uint64) ([]RelationPattern, int, bool) {
 	return entry.optimizedRelations, entry.estimatedCount, true
 }
 
-// promoteInLRU moves key to the front (most recently used).
-func (c *QueryPlanCache) promoteInLRU(key uint64) {
-	for i, k := range c.lruList {
-		if k == key {
-			c.lruList = append(c.lruList[:i], c.lruList[i+1:]...)
-			break
-		}
-	}
-	c.lruList = append(c.lruList, key)
-}
-
-// removeFromLRU removes key from the LRU list.
-func (c *QueryPlanCache) removeFromLRU(key uint64) {
-	for i, k := range c.lruList {
-		if k == key {
-			c.lruList = append(c.lruList[:i], c.lruList[i+1:]...)
-			return
-		}
-	}
-}
-
 // Set stores an optimized plan in the cache. Evicts the least-recently-used
 // entry (LRU) if the cache is full.
 func (c *QueryPlanCache) Set(key uint64, relations []RelationPattern, estimatedCount int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Evict if full — LRU: the first entry in lruList is the oldest.
-	for len(c.entries) >= c.maxSize && len(c.lruList) > 0 {
-		oldest := c.lruList[0]
-		c.lruList = c.lruList[1:]
-		delete(c.entries, oldest)
+	now := time.Now()
+	if elem, ok := c.entries[key]; ok {
+		entry := elem.Value.(*planCacheEntry)
+		entry.optimizedRelations = relations
+		entry.estimatedCount = estimatedCount
+		entry.expiresAt = now.Add(c.ttl)
+		entry.lastAccess = now
+		c.lruList.MoveToBack(elem)
+		return
+	}
+
+	// Evict if full — LRU: the front element in lruList is the oldest.
+	for len(c.entries) >= c.maxSize && c.lruList.Len() > 0 {
+		oldestElem := c.lruList.Front()
+		c.lruList.Remove(oldestElem)
+		oldest := oldestElem.Value.(*planCacheEntry)
+		delete(c.entries, oldest.key)
 		slog.Debug("plan cache evicted LRU",
-			"key", oldest,
+			"key", oldest.key,
 			"cacheSize", len(c.entries),
 		)
 	}
 
-	c.entries[key] = &planCacheEntry{
+	entry := &planCacheEntry{
+		key:                key,
 		optimizedRelations: relations,
 		estimatedCount:     estimatedCount,
-		expiresAt:          time.Now().Add(c.ttl),
-		lastAccess:         time.Now(),
+		expiresAt:          now.Add(c.ttl),
+		lastAccess:         now,
 	}
-	c.lruList = append(c.lruList, key)
+	c.entries[key] = c.lruList.PushBack(entry)
 }
 
 // Invalidate removes a specific plan from the cache.
 func (c *QueryPlanCache) Invalidate(key uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.entries, key)
-	c.removeFromLRU(key)
+	if elem, ok := c.entries[key]; ok {
+		c.lruList.Remove(elem)
+		delete(c.entries, key)
+	}
 }
 
 // Clear removes all cached plans.
 func (c *QueryPlanCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = make(map[uint64]*planCacheEntry)
-	c.lruList = c.lruList[:0]
+	c.entries = make(map[uint64]*list.Element)
+	c.lruList.Init()
 	c.hitCount = 0
 	c.missCount = 0
 }
@@ -233,10 +224,11 @@ func (c *QueryPlanCache) Stats() (hits, misses int64, size, maxSize int) {
 // immediately. Otherwise, the engine optimizes the relations, caches them,
 // and returns the optimized result.
 func (e *LFTJEngine) OptimizeRelationsWithCache(ctx context.Context, relations []RelationPattern, boundVars map[string]uint64) ([]RelationPattern, int) {
-	// Lazy-init plan cache per engine instance.
-	if e.planCache == nil {
-		e.planCache = DefaultQueryPlanCache()
-	}
+	e.planCacheOnce.Do(func() {
+		if e.planCache == nil {
+			e.planCache = DefaultQueryPlanCache()
+		}
+	})
 
 	key := planKey(relations, nil)
 

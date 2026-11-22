@@ -1,8 +1,14 @@
 package vector
 
 import (
+	"context"
+	"fmt"
 	"math"
+	"sync"
 	"testing"
+
+	"github.com/dgraph-io/badger/v4"
+	"github.com/duynguyendang/meb/keys"
 )
 
 func TestDefaultHNSWConfig(t *testing.T) {
@@ -107,4 +113,166 @@ func TestADCAccumScalar(t *testing.T) {
 	if dist != expected {
 		t.Errorf("adcAccumScalar = %f, want %f", dist, expected)
 	}
+}
+
+func newInMemoryHNSWBadger(t *testing.T) *badger.DB {
+	t.Helper()
+	opts := badger.DefaultOptions("")
+	opts.InMemory = true
+	opts.Logger = nil
+	db, err := badger.Open(opts)
+	if err != nil {
+		t.Fatalf("badger.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestHNSWInsertSoftDeleteAndCompact(t *testing.T) {
+	db := newInMemoryHNSWBadger(t)
+	cfg := DefaultHNSWConfig()
+	idx := NewHNSWIndex(db, cfg, 8)
+	ctx := context.Background()
+	const topicID uint32 = 1
+
+	for i := uint64(1); i <= 10; i++ {
+		vec := make([]float32, 8)
+		vec[0] = float32(i)
+		if err := idx.Insert(ctx, topicID, i, vec); err != nil {
+			t.Fatalf("Insert(%d) failed: %v", i, err)
+		}
+	}
+
+	ep, ok := idx.GetEntryPoint(topicID)
+	if !ok {
+		t.Fatal("expected entry point to be set")
+	}
+
+	// Delete the entry point plus two other nodes (1, 5, and ep).
+	deletedSet := map[uint64]bool{
+		ep:                   true,
+		keys.PackID(topicID, 2): true,
+		keys.PackID(topicID, 5): true,
+	}
+	for id := range deletedSet {
+		if err := idx.SoftDelete(id); err != nil {
+			t.Fatalf("SoftDelete(%d) failed: %v", id, err)
+		}
+	}
+
+	// Compact must prune tombstoned nodes, tombstone keys, dangling neighbor links,
+	// re-select a valid entry point, and update nodeCounts/vecCache.
+	if err := idx.Compact(ctx, topicID); err != nil {
+		t.Fatalf("Compact failed: %v", err)
+	}
+
+	newEP, hasEP := idx.GetEntryPoint(topicID)
+	if !hasEP {
+		t.Fatal("expected a surviving entry point after Compact")
+	}
+	if deletedSet[newEP] {
+		t.Errorf("entry point %d was deleted and should have been replaced", newEP)
+	}
+
+	// Verify no surviving node references any deleted ID in its neighbor lists.
+	for i := uint64(1); i <= 10; i++ {
+		pid := keys.PackID(topicID, i)
+		if deletedSet[pid] {
+			continue
+		}
+		lvl, err := idx.ReadLevel(pid)
+		if err != nil {
+			t.Fatalf("ReadLevel(%d) failed: %v", i, err)
+		}
+		neighbors, err := idx.ReadNeighbors(pid, lvl)
+		if err != nil {
+			t.Fatalf("ReadNeighbors(%d) failed: %v", i, err)
+		}
+		for _, nid := range neighbors {
+			if deletedSet[nid] {
+				t.Errorf("surviving node %d still has dangling neighbor %d after Compact", pid, nid)
+			}
+		}
+	}
+
+	// Verify tombstones and deleted HNSW keys are removed from BadgerDB.
+	err := db.View(func(txn *badger.Txn) error {
+		for id := range deletedSet {
+			if _, err := txn.Get(keys.EncodeHNSWTombstoneKey(id)); err != badger.ErrKeyNotFound {
+				return fmt.Errorf("tombstone key for %d still exists (err=%v)", id, err)
+			}
+			it := txn.NewIterator(badger.DefaultIteratorOptions)
+			pfx := keys.HNSWNodePrefix(id)
+			it.Seek(pfx)
+			if it.ValidForPrefix(pfx) {
+				it.Close()
+				return fmt.Errorf("HNSW node key for deleted id %d still exists", id)
+			}
+			it.Close()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify SearchInTopic returns only surviving nodes.
+	q := make([]float32, 8)
+	q[0] = 6.0
+	var results []SearchResult
+	for res, err := range idx.SearchInTopic(ctx, topicID, q, 10) {
+		if err != nil {
+			t.Fatalf("SearchInTopic failed: %v", err)
+		}
+		if deletedSet[res.ID] {
+			t.Errorf("SearchInTopic returned deleted node %d", res.ID)
+		}
+		results = append(results, res)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected surviving results after Compact")
+	}
+
+	idx.nodeCountMu.RLock()
+	cnt := idx.nodeCounts[topicID]
+	idx.nodeCountMu.RUnlock()
+	wantCount := 10 - len(deletedSet)
+	if cnt != wantCount {
+		t.Errorf("nodeCounts[%d] = %d, want %d", topicID, cnt, wantCount)
+	}
+}
+
+func TestHNSWConcurrentInsertAndCompact(t *testing.T) {
+	db := newInMemoryHNSWBadger(t)
+	idx := NewHNSWIndex(db, DefaultHNSWConfig(), 8)
+	ctx := context.Background()
+	const topicID uint32 = 1
+
+	for i := uint64(1); i <= 10; i++ {
+		vec := make([]float32, 8)
+		vec[0] = float32(i)
+		if err := idx.Insert(ctx, topicID, i, vec); err != nil {
+			t.Fatalf("seed Insert failed: %v", err)
+		}
+	}
+	_ = idx.SoftDelete(keys.PackID(topicID, 2))
+	_ = idx.SoftDelete(keys.PackID(topicID, 4))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := uint64(11); i <= 30; i++ {
+			vec := make([]float32, 8)
+			vec[0] = float32(i)
+			_ = idx.Insert(ctx, topicID, i, vec)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			_ = idx.Compact(ctx, topicID)
+		}
+	}()
+	wg.Wait()
 }

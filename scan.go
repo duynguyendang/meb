@@ -207,14 +207,18 @@ func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o string) (
 
 	// Pack sID and oID with current topicID for symmetric key lookup.
 	// Keys in BadgerDB are stored with topic-packed IDs.
+	topicID := m.topicID.Load()
 	if sBound {
-		sID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(sID))
+		sID = keys.PackID(topicID, keys.UnpackLocalID(sID))
 	}
 	if oBound {
-		oID = keys.PackID(m.topicID.Load(), keys.UnpackLocalID(oID))
+		oID = keys.PackID(topicID, keys.UnpackLocalID(oID))
 	}
 
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
+	if !sBound && !oBound && topicID != 0 {
+		strategy.prefix = keys.EncodeSPOTopicPrefix(topicID)
+	}
 
 	return &scanOptions{
 		ctx:      ctx,
@@ -228,6 +232,7 @@ func (m *MEBStore) prepareScanWithContext(ctx context.Context, s, p, o string) (
 		pBound:   pBound,
 		oBound:   oBound,
 		strategy: strategy,
+		topicID:  topicID,
 	}, nil
 }
 
@@ -425,6 +430,9 @@ func (m *MEBStore) scanImpl(opts *scanOptions, processFn func(*scanResult) (*Fac
 			var result scanResult
 			result.foundSID, result.foundPID, result.foundOID = keys.DecodeTripleKey(key)
 
+			if opts.topicID != 0 && keys.UnpackTopicID(result.foundSID) != opts.topicID {
+				continue
+			}
 			if opts.sBound && result.foundSID != opts.sID {
 				continue
 			}
@@ -525,6 +533,9 @@ func (m *MEBStore) scanImplBatched(opts *scanOptions, processBatchFn func([]scan
 			var result scanResult
 			result.foundSID, result.foundPID, result.foundOID = keys.DecodeTripleKey(key)
 
+			if opts.topicID != 0 && keys.UnpackTopicID(result.foundSID) != opts.topicID {
+				continue
+			}
 			if opts.sBound && result.foundSID != opts.sID {
 				continue
 			}
@@ -646,9 +657,9 @@ func (m *MEBStore) scanInTopicImpl(ctx context.Context, topicID uint32, s, p, o 
 
 	strategy := selectScanStrategy(sBound, pBound, oBound, sID, pID, oID)
 
-	// If no bound args, use topic-specific prefix scan
-	if !sBound && !oBound && !pBound {
-		strategy.prefix = keys.EncodeSPOByTopic(topicID)
+	// If neither subject nor object is bound, restrict to the 4-byte SPO topic prefix.
+	if !sBound && !oBound && topicID != 0 {
+		strategy.prefix = keys.EncodeSPOTopicPrefix(topicID)
 		strategy.index = keys.TripleSPOPrefix
 	}
 
