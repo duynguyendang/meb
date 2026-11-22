@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -16,8 +17,12 @@ const tombstoneBarrier = 5 * time.Second
 
 // mmapSegment represents a single memory-mapped file segment.
 type mmapSegment struct {
+	index      int
+	size       int
 	file       *os.File
 	data       []byte
+	lastAccess atomic.Int64
+	evicted    atomic.Bool
 	tombstoned bool // if true, marked for deferred cleanup
 }
 
@@ -44,19 +49,32 @@ func newMmapSegment(dir string, index int, size int) (*mmapSegment, error) {
 		return nil, fmt.Errorf("failed to mmap segment: %w", err)
 	}
 
-	return &mmapSegment{file: f, data: data}, nil
+	return &mmapSegment{index: index, size: size, file: f, data: data}, nil
+}
+
+// unmap flushes and releases the OS virtual mapping and file descriptor for LRU eviction.
+// Must only be called when no readers are concurrently accessing seg.data (e.g., under r.mu.Lock()).
+func (seg *mmapSegment) unmap() error {
+	seg.evicted.Store(true)
+	return seg.close()
 }
 
 func (seg *mmapSegment) close() error {
 	var err error
 	if seg.data != nil {
-		err = syscall.Munmap(seg.data)
+		if syncErr := seg.sync(); syncErr != nil {
+			err = syncErr
+		}
+		if unmapErr := syscall.Munmap(seg.data); unmapErr != nil && err == nil {
+			err = unmapErr
+		}
 		seg.data = nil
 	}
 	if seg.file != nil {
 		if closeErr := seg.file.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
+		seg.file = nil
 	}
 	return err
 }

@@ -46,6 +46,23 @@ type Config struct {
 	SegmentDir string
 
 	VectorFullDim int
+
+	// MemoryLimitBytes optionally overrides auto-detected GOMEMLIMIT / cgroup RAM ceiling.
+	// When > 0 (or when GOMEMLIMIT/cgroup is detected), MEB automatically caps the
+	// mmap vector cache to 45% of the limit and scales the dictionary LRU cache.
+	MemoryLimitBytes int64
+
+	// MaxMmapBytes explicitly caps total mapped vector segment bytes in RAM.
+	// When 0, derived automatically from MemoryLimitBytes / GOMEMLIMIT if present.
+	MaxMmapBytes int64
+
+	// VectorSegmentSize overrides the byte size of each mmap vector segment (default 64MB).
+	VectorSegmentSize int
+
+	// AutoPromoteThreshold is the per-topic vector count at which VectorRegistry
+	// automatically transitions from StateBruteForce to StateBuilding -> StateANN.
+	// Defaults to 50,000 when 0; set < 0 to disable auto-promotion.
+	AutoPromoteThreshold int
 }
 
 func (c *Config) Validate() error {
@@ -97,6 +114,16 @@ func (c *Config) Validate() error {
 
 	if c.GCRatio < 0 || c.GCRatio > 1 {
 		return fmt.Errorf("GCRatio must be between 0 and 1, got %f", c.GCRatio)
+	}
+
+	if c.MemoryLimitBytes < 0 {
+		return fmt.Errorf("MemoryLimitBytes must be non-negative, got %d", c.MemoryLimitBytes)
+	}
+	if c.MaxMmapBytes < 0 {
+		return fmt.Errorf("MaxMmapBytes must be non-negative, got %d", c.MaxMmapBytes)
+	}
+	if c.VectorSegmentSize < 0 {
+		return fmt.Errorf("VectorSegmentSize must be non-negative, got %d", c.VectorSegmentSize)
 	}
 
 	return nil

@@ -9,6 +9,13 @@ import (
 )
 
 func (idx *HNSWIndex) writeNode(ctx context.Context, packedID uint64, level int, neighbors []uint64) error {
+	lock := idx.nodeStripe(packedID)
+	lock.Lock()
+	defer lock.Unlock()
+	return idx.writeNodeUnlocked(ctx, packedID, level, neighbors)
+}
+
+func (idx *HNSWIndex) writeNodeUnlocked(ctx context.Context, packedID uint64, level int, neighbors []uint64) error {
 	key := keys.EncodeHNSWKey(packedID, level)
 
 	val := make([]byte, len(neighbors)*8)
@@ -22,6 +29,13 @@ func (idx *HNSWIndex) writeNode(ctx context.Context, packedID uint64, level int,
 }
 
 func (idx *HNSWIndex) readNeighbors(packedID uint64, level int) ([]uint64, error) {
+	lock := idx.nodeStripe(packedID)
+	lock.RLock()
+	defer lock.RUnlock()
+	return idx.readNeighborsUnlocked(packedID, level)
+}
+
+func (idx *HNSWIndex) readNeighborsUnlocked(packedID uint64, level int) ([]uint64, error) {
 	key := keys.EncodeHNSWKey(packedID, level)
 
 	var neighbors []uint64
@@ -43,6 +57,9 @@ func (idx *HNSWIndex) readNeighbors(packedID uint64, level int) ([]uint64, error
 }
 
 func (idx *HNSWIndex) deleteNode(packedID uint64, level int) error {
+	lock := idx.nodeStripe(packedID)
+	lock.Lock()
+	defer lock.Unlock()
 	key := keys.EncodeHNSWKey(packedID, level)
 	return idx.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete(key)

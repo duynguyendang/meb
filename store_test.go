@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/duynguyendang/meb/keys"
 	"github.com/duynguyendang/meb/store"
 	"github.com/duynguyendang/meb/vector"
 	"go.uber.org/goleak"
@@ -1609,5 +1610,70 @@ func TestMinimumResourceProfile_EndToEnd(t *testing.T) {
 	defer s2.Close()
 	if c := s2.Count(); c != 3 {
 		t.Errorf("Count after reopen = %d, want 3", c)
+	}
+}
+
+func TestCleanupOrphanedVectors_StreamingMergeJoin(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	s := newTestStore(t)
+	dim := s.Vectors().FullDim()
+	vec := make([]float32, dim)
+	vec[0] = 1.0
+
+	// 1. Document with both content (0x10) and metadata facts (0x20) — NOT orphan
+	if err := s.AddDocument("doc:keep-both", []byte("body"), vec, map[string]any{"kind": "doc"}); err != nil {
+		t.Fatalf("AddDocument both: %v", err)
+	}
+
+	// 2. Fact-only subject (no 0x10 content, only 0x20 SPO triple) + unpacked vector — NOT orphan
+	if err := s.AddFact(Fact{Subject: "entity:fact-only", Predicate: "type", Object: "node"}); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+	factOnlyID, err := s.Dict().GetID("entity:fact-only")
+	if err != nil {
+		t.Fatalf("GetID fact-only: %v", err)
+	}
+	if err := s.Vectors().Add(factOnlyID, vec); err != nil {
+		t.Fatalf("Vectors.Add fact-only: %v", err)
+	}
+
+	// 3. Content-only vector (0x10 content, no 0x20 facts) — NOT orphan
+	contentOnlyID := keys.PackID(1, 777)
+	if err := s.SetContent(contentOnlyID, []byte("payload")); err != nil {
+		t.Fatalf("SetContent: %v", err)
+	}
+	if err := s.Vectors().Add(contentOnlyID, vec); err != nil {
+		t.Fatalf("Vectors.Add content-only: %v", err)
+	}
+
+	// 4. Orphaned unpacked vector (localID=999001, no 0x10 content, no 0x20 facts) — ORPHAN
+	orphanUnpackedID := uint64(999001)
+	if err := s.Vectors().Add(orphanUnpackedID, vec); err != nil {
+		t.Fatalf("Vectors.Add orphan unpacked: %v", err)
+	}
+
+	// 5. Orphaned topic-packed vector (topicID=2, localID=999002) — ORPHAN
+	orphanPackedID := keys.PackID(2, 999002)
+	if err := s.Vectors().Add(orphanPackedID, vec); err != nil {
+		t.Fatalf("Vectors.Add orphan packed: %v", err)
+	}
+
+	cleaned := s.cleanupOrphanedVectors()
+	if cleaned != 2 {
+		t.Fatalf("cleanupOrphanedVectors() = %d, want 2", cleaned)
+	}
+
+	if !s.Vectors().HasVector(factOnlyID) {
+		t.Error("expected fact-only vector to be preserved")
+	}
+	if !s.Vectors().HasVector(contentOnlyID) {
+		t.Error("expected content-only vector to be preserved")
+	}
+	if s.Vectors().HasVector(orphanUnpackedID) {
+		t.Error("expected orphan unpacked vector to be removed from registry")
+	}
+	if s.Vectors().HasVector(orphanPackedID) {
+		t.Error("expected orphan packed vector to be removed from registry")
 	}
 }

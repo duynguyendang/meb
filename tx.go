@@ -348,7 +348,7 @@ func (t *StoreTxn) SearchHNSW(ctx context.Context, topicID uint32, queryVec []fl
 		}
 		key, err := t.store.Dict().GetString(keys.UnpackLocalID(sr.ID))
 		if err != nil {
-			continue
+			key = fmt.Sprintf("localID:%d", keys.UnpackLocalID(sr.ID))
 		}
 		results = append(results, Result{
 			ID:    sr.ID,
@@ -388,7 +388,7 @@ func (t *StoreTxn) executeVectorSearch(ctx context.Context, queryVec []float32, 
 		}
 		key, err := t.store.Dict().GetString(keys.UnpackLocalID(sr.ID))
 		if err != nil {
-			continue
+			key = fmt.Sprintf("localID:%d", keys.UnpackLocalID(sr.ID))
 		}
 		results = append(results, Result{
 			ID:    sr.ID,

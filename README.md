@@ -8,10 +8,11 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 
 - **Triple Store**: Subject-Predicate-Object with dual SPO/OPS indexing (25-byte keys)
 - **Multi-Topic Isolation**: 24-bit TopicID bit-packing enables 16M namespaces without a Graph column, enforced across `Scan`, `ScanInTopic`, `Query`, and `SearchInTopic`
-- **ANN Indexes**: IVF-PQ (coarse K-means + residual PQ with per-centroid residual ADC) and HNSW (hierarchical navigable small world) for O(log N) vector search
-- **Badger-Native Vector Store**: Compressed vectors stored in BadgerDB with mmap cache layer — disk-scaled, O(k) memory per search
+- **Adaptive Auto-Promoting Vector Index**: Per-topic 3-state machine (`StateBruteForce` → `StateBuilding` → `StateANN`) automatically promotes topics crossing `AutoPromoteThreshold` (default `50,000` vectors) to IVF-PQ in the background using a non-blocking delta buffer and atomic pointer swap (`TopicID = 0` or any topic supported seamlessly)
+- **Bounded Memory Budget & Segmented mmap LRU Eviction**: Auto-detects `GOMEMLIMIT` (`debug.SetMemoryLimit(-1)`) and cgroup memory limits, caps mmap vector segments to 45% of RAM budget and scales dictionary LRU caches to 10%, unmapping cold segments with zero-copy fallback to Badger `0x11` iterator streaming
+- **Badger-Native Vector Store**: Compressed vectors stored in BadgerDB (`0x11`) with opt-in `0x16` raw float32 storage (`StoreRawVectors: false` default, cutting ~6.14 GB/1M 1536-d vectors) and segmented mmap cache layer
 - **SIMD ADC Accumulation**: Asymmetric distance computation with scalar, SSE (amd64, opt-in via `MEB_AVX2_ADC=1`), and NEON (arm64) kernels; runtime dispatch via `golang.org/x/sys/cpu`
-- **Dual-Path Search**: Hot queries hit parallel mmap (~500K vectors/sec); cold start streams from Badger
+- **O(1)-Memory Background Maintenance**: Streaming merge-join over sorted `0x20` (`SPO`) ⋈ `0x11` (`Vec`) keys for orphan vector cleanup + incremental striped-lock HNSW compaction (`CompactIncremental`) triggered at ≥15% tombstone ratio
 - **LSM-Level Topic Filtering**: `SearchInTopic()` and `EncodeSPOTopicPrefix()` use Badger prefix scans — zero I/O on unrelated topics
 - **Hybrid Vector Compression**: FWHT preconditioning + block-wise 4/8-bit quantization preserving full 1536 dimensions
 - **Cauchy-Schwarz Pruning**: Per-block L2 norm suffix sums for early termination during vector search
@@ -29,7 +30,7 @@ Mangle Extension for Badger — an embedded knowledge graph database combining t
 - **Hybrid WAL Approach**: Transactions use BadgerDB `SyncWrites: true` for durability; WriteBatch path uses WAL v2 (CRC32C) for crash recovery
 - **Deterministic LFTJ Joins**: Canonical ordering + `ExecuteOrdered` for reproducible multi-way join results
 - **Sharded Dictionary**: Configurable lock-striping for high-concurrent ingestion
-- **Soft Delete & Compaction**: HNSW tombstone keys + mutex-serialized `Compact()` pruning deleted neighbor links and re-selecting entry points
+- **Soft Delete & Incremental Compaction**: HNSW tombstone keys (`0x12 0xFF`) with per-topic atomic tombstone ratio trigger (`>= 15%`) and batched `CompactIncremental()` using striped node locks
 - **S2 Compression**: Fast content storage with Snappy-compatible compression
 - **Ergonomic Presets & Health**: `OpenDefault`, `OpenSafeServing`, `OpenInMemory`, `BatchWriter`, and `Health()` diagnostics
 
@@ -250,30 +251,20 @@ The per-block L2 norm enables **Cauchy-Schwarz early termination**: suffix sums 
 
 ### Vector Search Architecture
 
-MEB uses a **dual-path** vector retrieval strategy for optimal performance at any scale:
+MEB uses a **tiered adaptive** vector retrieval pipeline for predictable latency across corpus sizes and tight RAM budgets:
 
 ```
-Search() / SearchWithFilter()
+Search() / SearchInTopic()
     │
-    ├─ mmap has vectors? (totalVectors > 0)
-    │   └─ YES → 4-way parallel mmap scan (~500K vectors/sec)
-    │            Cache-hot sequential RAM access
+    ├─ Topic in StateANN? (auto-promoted at >= 50K vectors via background build + delta replay)
+    │   └─ YES → Active ANN index (default: IVF-PQ sequential 0x14 posting list scan)
     │
-    └─ NO → Badger iterator streaming (~50-100K vectors/sec)
-            Warms mmap cache as it goes — next search hits fast path
-
-SearchInTopic(topicID)
-    └─ Badger prefix scan on [0x11][topicID]
-       LSM-level topic filtering — zero I/O on unrelated topics
-       Memory: O(k) for top-k heap, never O(N)
+    ├─ All mmap segments resident? (mappedBytes <= 45% RAM budget, no LRU evictions)
+    │   └─ YES → Parallel mmap scan with Cauchy-Schwarz pruning (~1.95M vec/s @ 1536-d, ~23.7M vec/s @ 128-d)
+    │
+    └─ Cold start or evicted LRU segment
+        └─ Badger 0x11 iterator streaming in O(k) memory (TopicID prefix [0x11][topicID:3])
 ```
-
-**Benefits:**
-- **Hot queries**: Parallel mmap scan at ~500K vectors/sec
-- **Cold start**: Streams from Badger, no RAM limit
-- **Topic filtering**: Skips 99% of data at storage level
-- **Write durability**: Synchronous Badger write before return
-- **Scale**: Limited by disk size, not RAM
 
 **Blockwise Dot Product** — similarity computed directly on compressed data without full dequantization:
 
@@ -371,8 +362,9 @@ MEB runs periodic cleanup of orphaned data during `runCleanup()`:
 
 1. **Deprecated triples** — Scans SPO index, deletes entries with `FlagIsDeprecated`
 2. **Orphan dictionary entries** — Scans reverse dictionary, removes entries not referenced by any fact
-3. **Orphan vectors** — Two-pass scan: collects all subject IDs from facts, then removes vectors with no content and no referencing facts
-4. **ValueLog GC** — Runs BadgerDB GC to reclaim space from tombstones
+3. **Orphan vectors (`O(1)` memory)** — Concurrent streaming merge-join across sorted `0x20` (`SPO`) ⋈ `0x11` (`Vec`) iterators plus `0x10` (`Content`) lookup; deletes unreferenced vectors without materializing subject maps in RAM
+4. **Incremental HNSW compaction** — Checks per-topic atomic tombstone ratio (`>= 15%`) and runs `CompactIncremental()` in 500-node batches with striped node locks
+5. **ValueLog GC** — Runs BadgerDB GC to reclaim space from tombstones
 
 All cleanup operations are **throttled** (max 1000 orphans per cycle) to avoid long GC pauses.
 
@@ -383,28 +375,30 @@ meb/
 ├── Makefile               # SIFT-1M download & benchmark targets
 ├── keys/                  # 25-byte triple key encoding, TopicID/inline bit-packing, IVF/HNSW keys
 ├── dict/                  # String interning (thread-safe LRU + sharded range allocator)
-├── store/                 # BadgerDB config with deployment profiles
+├── store/                 # BadgerDB config, deployment profiles & GOMEMLIMIT/cgroup memory budgeting
+│   ├── badger.go          # Config, validation, deployment profiles
+│   └── memory.go          # DetectMemoryLimit (GOMEMLIMIT / cgroup v1 & v2), ComputeMemoryBudget
 ├── graph/                 # Integer-ID graph algorithms (Dijkstra, BFS, LCA, cycles, centrality, PageRank)
-├── vector/                # Hybrid vector compression, ANN indexes & SIMD ADC
-│   ├── turboquant.go      # FWHT + block-wise 4/8-bit quantization + Cauchy-Schwarz pruning
+├── vector/                # Hybrid vector compression, adaptive ANN, LRU mmap & SIMD ADC
+│   ├── adaptive.go        # Per-topic 3-state auto-promoter (StateBruteForce → StateBuilding → StateANN)
+│   ├── turboquant.go      # FWHT + block-wise 4/8-bit quantization, DequantizeHybridTransformed, pruning
 │   ├── fwht.go            # Fast Walsh-Hadamard transform
 │   ├── partitioned.go     # PartitionedRegistry (sharded by TopicID)
-│   ├── registry.go        # Badger-native store + mmap cache, RCU revMap
-│   ├── mmap*.go           # Cross-platform mmap segment lifecycle
-│   ├── search.go          # Dual-path: mmap parallel + Badger streaming, adaptive workers
+│   ├── registry.go        # Badger-native store + LRU-evicting mmap cache, RCU revMap
+│   ├── mmap*.go           # Cross-platform mmap segment lifecycle + unmap eviction
+│   ├── search.go          # Adaptive ANN + parallel mmap + cold Badger streaming fallback
 │   ├── heap.go            # Purpose-built top-K and node-distance heaps
 │   ├── math.go            # L2 normalize, dot product
 │   ├── index.go           # Index selection API (brute-force / IVF-PQ / HNSW)
 │   ├── ivfpq.go           # IVF-PQ index: centroid assignment, residual ADC search, posting scan
-│   ├── ivfpq_config.go    # IVFPQConfig with validation
-│   ├── ivfpq_train.go     # Mini-batch K-means training, PQ codebook training
-│   ├── hnsw.go            # HNSW index: Insert, SearchInTopic, searchLayer
-│   ├── hnsw_graph.go      # HNSW graph operations: writeNode, readNeighbors, deleteNode
+│   ├── ivfpq_config.go    # IVFPQConfig (StoreRawVectors opt-in, default false)
+│   ├── ivfpq_train.go     # Mini-batch K-means + PQ training from 0x11 or opt-in 0x16, batched reindex
+│   ├── hnsw.go            # HNSW index: Insert, SearchInTopic, 256-way striped node locks
+│   ├── hnsw_graph.go      # HNSW graph operations with per-node lock helpers
 │   ├── hnsw_level.go      # Level lookup helpers
-│   ├── hnsw_delete.go     # SoftDelete, isDeleted, Compact
+│   ├── hnsw_delete.go     # SoftDelete, TombstoneRatio, CompactIncremental, Compact
 │   ├── adc_*.go / *.s     # Scalar, SSE (amd64), and NEON (arm64) ADC kernels + dispatch
-│   ├── dotprod_*.go       # Platform dot-product helpers
-│   └── diskann.go         # DiskANNConfig and DiskANNIndex scaffold (unreachable)
+│   └── dotprod_*.go       # Platform dot-product helpers
 ├── query/                 # LFTJ engine + Datalog parser + CBO + RBO + plan/query caches
 │   ├── lftj.go            # TrieIterator, LFTJResult, Canonical ordering
 │   ├── datalog_parser.go  # Datalog atom parser & constraint syntactic sugar
@@ -457,8 +451,11 @@ cfg.Verbose = true
 // Enable sharded dictionary (must be power of 2)
 cfg.NumDictShards = 4
 
-// Set vector default dimensionality (default: 1536)
+// Set vector default dimensionality and auto-promotion / memory limits
 cfg.VectorFullDim = 1536
+cfg.AutoPromoteThreshold = 50_000   // set < 0 to disable auto IVF-PQ promotion
+cfg.MemoryLimitBytes = 2 << 30      // optional override (auto-detects GOMEMLIMIT / cgroup)
+cfg.VectorSegmentSize = 64 << 20    // mmap segment granularity (LRU-evicted when > 45% budget)
 ```
 
 ## Observability
@@ -481,65 +478,48 @@ store.RegisterTelemetrySink(&mySink{})
 
 ## Performance
 
-**Benchmark results** (AMD Ryzen 9 5900HS with Radeon Graphics, in-memory BadgerDB, Go 1.23):
+**Benchmark results** (`make bench` & `go run ./cmd/bench` on AMD Ryzen 9 5900HS with Radeon Graphics, Linux amd64, in-memory BadgerDB):
 
-| Benchmark | Ops/sec | Latency | Memory | Allocs |
-|-----------|---------|---------|--------|--------|
-| **Fact Insertion** (single) | 33,507 | 35.0 µs/op | 8.3 KB/op | 192 |
-| **Fact Insertion** (batch × 10) | 9,794 | 134.6 µs/op | 45.2 KB/op | 1,042 |
-| **Fact Insertion** (batch × 100) | 1,291 | 1,094 µs/op | 424 KB/op | 9,503 |
-| **Fact Insertion** (batch × 1000) | 100 | 10.6 ms/op | 4.7 MB/op | 93,330 |
-| **Document Add** (content + vector + metadata) | 14,925 | 76.1 µs/op | 33.9 KB/op | 113 |
-| **Transaction Batch** (100 facts) | 2,232 | 582 µs/op | 257 KB/op | 5,973 |
-| **Scan** (1000 facts, single key) | 21,270 | 54.9 µs/op | 27.2 KB/op | 621 |
-| **Vector Add** (1536-d, 8-bit Hybrid) | 24,759 | 47.3 µs/op | 29.9 KB/op | 37 |
-| **Vector Search** (10K vectors, k=10, with pruning) | 273 | 4.5 ms/op | 17.5 KB/op | 52 |
-| **Dictionary Lookup** (GetOrCreate) | 1,532,017 | 839 ns/op | 400 B/op | 7 |
+### `make bench` (`go test -bench=. -benchtime=100x -run='^$' ./bench/...`)
 
-**Derived throughput:**
+| Benchmark | Dim / Scale | Ops/sec | Latency | Memory | Allocs | Effective Throughput |
+|-----------|-------------|---------|---------|--------|--------|----------------------|
+| **VectorSearch_1K** (pruned mmap) | 128-d, 1K vecs | 8,311 qps | 120.3 µs/op | 2.4 KB/op | 22 | ~8.3M vectors/sec |
+| **VectorSearch_10K** (pruned mmap) | 128-d, 10K vecs | 2,372 qps | 421.5 µs/op | 7.4 KB/op | 53 | ~23.7M vectors/sec |
+| **VectorSearch_100K** (pruned mmap) | 128-d, 100K vecs | 296 qps | 3.38 ms/op | 10.6 KB/op | 52 | ~29.6M vectors/sec |
+| **VectorSearch** (pruned mmap) | 1536-d, 10K vecs | 195 qps | 5.12 ms/op | 17.5 KB/op | 53 | ~1.95M vectors/sec |
+| **VectorAdd_Sustained** | 128-d | 85,660 vecs/s | 11.7 µs/op | 3.0 KB/op | 30 | 85.7K vectors/sec |
+| **VectorAdd** | 1536-d | 24,665 vecs/s | 40.5 µs/op | 22.6 KB/op | 31 | 24.7K vectors/sec |
+| **FactInsertion** | 1 triple | 77,340 ops/s | 12.9 µs/op | 4.5 KB/op | 92 | dual-index SPO+OPS |
+| **FactInsertion_Batch100** | 100 triples/op | 587 ops/s | 1.70 ms/op | 435 KB/op | 9,277 | ~58.7K facts/sec |
+| **DocumentAdd** | doc+vec+meta | 15,390 ops/s | 65.0 µs/op | 38.5 KB/op | 127 | atomic S2+SPO+0x11 |
+| **HybridSearch** | vec + LFTJ | 9,342 qps | 107.0 µs/op | 23.5 KB/op | 170 | neuro-symbolic |
+| **DictionaryGetOrCreate** | string↔uint64 | 1,315,100 ops/s | 760.4 ns/op | 400 B/op | 7 | sharded LRU cache |
+| **LFTJ_3Atom / LFTJ_5Atom** | 3-way / 5-way | 1,457 / 8,098 qps | 686 / 123 µs/op | 289 / 35 KB | 2,680 / 757 | worst-case optimal |
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Vector Ingestion** | ~25K vectors/sec | Includes FWHT + quantization + norm computation + Badger write |
-| **Vector Search** | ~2.7M vectors/sec | Pruned mmap scan over 10K vectors, 15% faster than pre-pruning |
-| **Fact Ingestion** | ~34K facts/sec (single), ~129K facts/sec (batch × 100) | Dual-index SPO+OPS write |
-| **Scan Throughput** | ~21M keys/sec | Key-only, SPO prefix scan |
-| **Dictionary Lookup** | ~1.5M lookups/sec | Sharded LRU cache hit |
+### `go run ./cmd/bench` Latency & Recall (`128-d`, 50 trials, `k=10`)
 
-**Key observations:**
-- **Cauchy-Schwarz pruning** speeds up search by 15% at 10K scale (238→273 ops/s), with increasing gains at larger vector counts
-- Recall@10 improved from 90.0% to **97.0%** with per-block norm storage
-- Vector Add is 1.9x faster than original after eliminating double quantization (previously 15K→28K vectors/sec)
-- Vector search latency scales with dimension — 1536-dim is ~40x slower than 128-dim (4.5 ms vs 124 µs)
-- Scan latency scales with matching facts, not total graph size (prefix scan)
-- Dictionary lookups are sub-microsecond with thread-safe LRU cache
-- DeleteFactsBySubject uses scoped prefix scans (not full graph scan) for orphan cleanup
-- Storage overhead: +10% per vector (2,560→2,816 bytes) for per-block norm pruning
+| Scenario | Path | Ops/sec | p50 | p95 | p99 | Recall@10 |
+|----------|------|---------|-----|-----|-----|-----------|
+| **VectorSearch_1K** | Brute-force mmap | 8,030 qps | 0.112 ms | 0.190 ms | 0.276 ms | 97.0% |
+| **VectorSearch_10K** | Brute-force mmap | 2,392 qps | 0.372 ms | 0.498 ms | 1.813 ms | 97.0% |
+| **IVFPQSearch_10K** | IVF-PQ (256 centroids, nprobe=16) | 1,371 qps | 0.671 ms | 0.963 ms | 2.079 ms | — |
+| **HNSWSearch_10K** | HNSW (M=16, efSearch=32) | 2,253 qps | 0.357 ms | 0.994 ms | 1.407 ms | — |
+| **VectorAdd_Sustained** | 8-bit Hybrid (`0x11` + mmap) | 37,682 vecs/s | — | — | — | — |
 
-**Storage scaling** (per 1M items):
+### 1M-Node Storage Footprint & Memory Budget (`1536-d`)
 
-| Mode | Storage | Components Used |
-|------|---------|----------------|
-| **Facts only** | ~150 MB | SPO(41) + OPS(41) + Dict(23) per fact |
-| **+ 100K vectors** (8-bit) | ~430 MB | Facts(150) + Vectors(282) |
-| **+ 100K vectors + 10K docs** (S2) | ~530 MB | Facts(150) + Vectors(282) + Content(100) |
+| Component | Per-1M Disk / Size | Notes |
+|-----------|--------------------|-------|
+| **Facts only** (`0x20` SPO + `0x21` OPS + `0x80/81` Dict) | ~150 MB | Normalized triple store |
+| **Compressed Vectors** (`0x11`, 4-bit / 8-bit Hybrid) | 1.79 GB / 2.82 GB | Bounded to 45% RAM budget in mmap via LRU eviction |
+| **IVF-PQ Postings** (`0x14`, `StoreRawVectors: false`) | ~64 MB | Trained & re-indexed directly from `0x11` |
+| **Opt-in Raw Float32** (`0x16`, `StoreRawVectors: true`) | +6.14 GB | Disabled by default (`DefaultIVFPQConfig()`) |
+| **Content** (`0x10`, S2-compressed, 10K–100K docs) | ~100 MB – 1 GB | Decompressed lazily for top-k results |
 
-- Facts-only mode uses minimal storage — no overhead from unused subsystems
-- Vectors dominate storage (4-5x larger than facts at 8-bit)
-- Content is moderate if documents are few (S2 compressed)
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **RAM Density** | Up to 1.1M nodes (1536-d) | Within 2GB RAM using Hybrid 4-bit |
-| **Disk-Scaled** | Unlimited vectors | Badger-backed storage — not RAM-limited |
-| **Cold Start** | < 200ms warm-up | Safe-Serving profile |
-| **Join Latency** | Sub-2s | Complex code-graph traversals with circuit breaker |
-| **Vector Search (hot, pruned)** | ~273K vectors/sec | mmap parallel scan with Cauchy-Schwarz pruning |
-| **Vector Search (cold)** | ~76M vectors/sec | Badger iterator streaming |
-| **Topic Search** | LSM prefix scan only | Zero I/O on unrelated topics |
-| **Fact Insertion** | ~102K facts/sec (single), ~861K facts/sec (batch) | Dual-index write |
-| **Scan Throughput** | ~102M keys/sec | Key-only, SPO prefix scan |
-| **Content Read** | ~500MB/s | S2 decompression |
+**Guardrails & Constraints:**
+- **Auto-Promotion Threshold**: Topics automatically promote `StateBruteForce` → `StateBuilding` → `StateANN` (`IndexIVFPQ`) at **50,000 vectors** by default so brute-force scans never hit the `2,000ms` circuit breaker at 1M nodes.
+- **Cold Badger Streaming Fallback**: Evicted mmap segments stream from BadgerDB (`0x11`) in `O(k)` heap (~50K–100K vectors/sec depending on disk I/O), preserving correctness on 2 GB containers.
 
 ## Fidelity Verification
 

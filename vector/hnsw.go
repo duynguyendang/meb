@@ -9,26 +9,40 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
 )
 
+const (
+	// DefaultHNSWCompactionRatio triggers incremental compaction when tombstones
+	// reach 15% of active+deleted nodes in a topic.
+	DefaultHNSWCompactionRatio = 0.15
+	// DefaultHNSWCompactionBatchSize bounds nodes inspected per incremental compaction tick.
+	DefaultHNSWCompactionBatchSize = 500
+	hnswNodeLockStripes            = 256
+)
+
 type HNSWConfig struct {
-	M              int
-	MMax           int
-	EfConstruction int
-	EfSearch       int
-	ML             float64
+	M                      int
+	MMax                   int
+	EfConstruction         int
+	EfSearch               int
+	ML                     float64
+	CompactionRatio        float64 // Tombstone ratio threshold (default 0.15)
+	CompactionBatchSize    int     // Nodes per incremental compaction batch (default 500)
 }
 
 func DefaultHNSWConfig() *HNSWConfig {
 	return &HNSWConfig{
-		M:              16,
-		MMax:           32,
-		EfConstruction: 200,
-		EfSearch:       64,
-		ML:             1.0 / math.Log(16.0),
+		M:                   16,
+		MMax:                32,
+		EfConstruction:      200,
+		EfSearch:            64,
+		ML:                  1.0 / math.Log(16.0),
+		CompactionRatio:     DefaultHNSWCompactionRatio,
+		CompactionBatchSize: DefaultHNSWCompactionBatchSize,
 	}
 }
 
@@ -53,6 +67,7 @@ type HNSWIndex struct {
 	cfg       *HNSWConfig
 	fullDim   int
 	paddedDim int
+	rngMu     sync.Mutex
 	rng       *rand.Rand
 
 	entryPointMu sync.RWMutex
@@ -69,39 +84,48 @@ type HNSWIndex struct {
 	vecCacheMu sync.RWMutex
 	vecCache   map[uint64][]float32
 
-	// graphMu serializes graph mutations (Insert + addSymmetricalLink) to
-	// prevent concurrent inserts from corrupting neighbor lists via
-	// unsynchronized read-modify-write on node edges.
-	graphMu sync.Mutex
+	// Fine-grained striped node locks replace the coarse global graphMu so
+	// concurrent inserts, reads, and incremental compaction only contend when
+	// mutating the same node ID stripe.
+	nodeLocks [hnswNodeLockStripes]sync.RWMutex
 
 	// tombstones is an in-memory cache of soft-deleted node IDs.
 	// Checked on every neighbor expansion in searchLayer to avoid returning
 	// deleted nodes. Must be kept in sync with BadgerDB tombstone keys.
 	tombstonesMu sync.RWMutex
 	tombstones   map[uint64]struct{}
+
+	// Per-topic atomic tombstone counters and incremental compaction cursors.
+	tombstoneCountsMu sync.RWMutex
+	tombstoneCounts   map[uint32]*atomic.Int64
+
+	compactMu     sync.Mutex
+	compactStates map[uint32]*hnswCompactState
 }
 
 func NewHNSWIndex(db *badger.DB, cfg *HNSWConfig, fullDim int) *HNSWIndex {
 	paddedDim := nextPow2(fullDim)
 	return &HNSWIndex{
-		db:          db,
-		cfg:         cfg,
-		fullDim:     fullDim,
-		paddedDim:   paddedDim,
-		rng:         rand.New(rand.NewSource(rand.Int63())),
-		entryPoints: make(map[uint32]uint64),
-		maxLevels:   make(map[uint32]int),
-		nodeCounts:  make(map[uint32]int),
-		vecCache:    make(map[uint64][]float32),
-		tombstones:  make(map[uint64]struct{}),
+		db:              db,
+		cfg:             cfg,
+		fullDim:         fullDim,
+		paddedDim:       paddedDim,
+		rng:             rand.New(rand.NewSource(rand.Int63())),
+		entryPoints:     make(map[uint32]uint64),
+		maxLevels:       make(map[uint32]int),
+		nodeCounts:      make(map[uint32]int),
+		vecCache:        make(map[uint64][]float32),
+		tombstones:      make(map[uint64]struct{}),
+		tombstoneCounts: make(map[uint32]*atomic.Int64),
+		compactStates:   make(map[uint32]*hnswCompactState),
 	}
 }
 
-func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64, fullVec []float32) error {
-	// Serialize graph mutations to prevent concurrent insert corruption
-	idx.graphMu.Lock()
-	defer idx.graphMu.Unlock()
+func (idx *HNSWIndex) nodeStripe(packedID uint64) *sync.RWMutex {
+	return &idx.nodeLocks[(packedID^(packedID>>17))&(hnswNodeLockStripes-1)]
+}
 
+func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64, fullVec []float32) error {
 	transformed := PadAndTransform(fullVec, idx.paddedDim)
 	packedID := keys.PackID(topicID, localID)
 
@@ -130,10 +154,14 @@ func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64
 
 	level := idx.randomLevel()
 
-	entryPoint, hasEP := idx.getEntryPoint(topicID)
-
+	idx.entryPointMu.Lock()
+	entryPoint, hasEP := idx.entryPoints[topicID]
 	if !hasEP {
-		idx.entryPointMu.Lock()
+		// Write node before publishing entryPoint so concurrent searchers never observe an empty EP.
+		if err := idx.writeNode(ctx, packedID, level, nil); err != nil {
+			idx.entryPointMu.Unlock()
+			return err
+		}
 		idx.entryPoints[topicID] = packedID
 		idx.entryPointMu.Unlock()
 
@@ -145,8 +173,9 @@ func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64
 		idx.nodeCounts[topicID]++
 		idx.nodeCountMu.Unlock()
 
-		return idx.writeNode(ctx, packedID, level, nil)
+		return nil
 	}
+	idx.entryPointMu.Unlock()
 
 	currEntry := entryPoint
 	if maxLevel, ok := idx.getMaxLevel(topicID); ok {
@@ -183,7 +212,9 @@ func (idx *HNSWIndex) Insert(ctx context.Context, topicID uint32, localID uint64
 }
 
 func (idx *HNSWIndex) randomLevel() int {
+	idx.rngMu.Lock()
 	r := idx.rng.Float64()
+	idx.rngMu.Unlock()
 	return int(math.Floor(-math.Log(r) * idx.cfg.ML))
 }
 
@@ -407,7 +438,11 @@ func (idx *HNSWIndex) SearchInTopic(ctx context.Context, topicID uint32, queryVe
 }
 
 func (idx *HNSWIndex) addSymmetricalLink(ctx context.Context, existingID uint64, newNodeID uint64, level int) error {
-	neighbors, err := idx.readNeighbors(existingID, level)
+	lock := idx.nodeStripe(existingID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	neighbors, err := idx.readNeighborsUnlocked(existingID, level)
 	if err != nil {
 		neighbors = nil
 	}
@@ -438,7 +473,7 @@ func (idx *HNSWIndex) addSymmetricalLink(ctx context.Context, existingID uint64,
 		}
 	}
 
-	return idx.writeNode(ctx, existingID, level, neighbors)
+	return idx.writeNodeUnlocked(ctx, existingID, level, neighbors)
 }
 
 func (idx *HNSWIndex) selectNeighbors(candidates []uint64, m int, level int) []uint64 {

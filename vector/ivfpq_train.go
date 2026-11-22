@@ -11,10 +11,19 @@ import (
 	"github.com/duynguyendang/meb/keys"
 )
 
+// TrainingSample retains a vector alongside its topic and local ID so pre-training
+// inserts can be indexed into 0x14 posting lists without requiring 0x16 raw storage.
+type TrainingSample struct {
+	TopicID uint32
+	LocalID uint64
+	Vec     []float32
+}
+
 type TrainingBuffer struct {
-	mu  sync.Mutex
-	buf [][]float32
-	cap int
+	mu      sync.Mutex
+	buf     [][]float32
+	pending []TrainingSample
+	cap     int
 }
 
 func NewTrainingBuffer(capacity int) *TrainingBuffer {
@@ -25,14 +34,25 @@ func NewTrainingBuffer(capacity int) *TrainingBuffer {
 }
 
 func (tb *TrainingBuffer) Add(vec []float32) {
+	tb.AddSample(0, 0, vec)
+}
+
+func (tb *TrainingBuffer) AddSample(topicID uint32, localID uint64, vec []float32) {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
-	if len(tb.buf) >= tb.cap {
+	if tb.cap > 0 && len(tb.buf) >= tb.cap {
 		tb.buf = tb.buf[1:]
 	}
 	v := make([]float32, len(vec))
 	copy(v, vec)
 	tb.buf = append(tb.buf, v)
+	if localID != 0 {
+		tb.pending = append(tb.pending, TrainingSample{
+			TopicID: topicID,
+			LocalID: localID,
+			Vec:     v,
+		})
+	}
 }
 
 func (tb *TrainingBuffer) Drain() [][]float32 {
@@ -40,7 +60,18 @@ func (tb *TrainingBuffer) Drain() [][]float32 {
 	defer tb.mu.Unlock()
 	result := tb.buf
 	tb.buf = nil
+	tb.pending = nil
 	return result
+}
+
+func (tb *TrainingBuffer) drainWithPending() ([][]float32, []TrainingSample) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	samples := tb.buf
+	pending := tb.pending
+	tb.buf = nil
+	tb.pending = nil
+	return samples, pending
 }
 
 func (tb *TrainingBuffer) Len() int {
@@ -54,21 +85,22 @@ func (idx *IVFPQIndex) Train(topicID uint32, sampleSize int) error {
 		sampleSize = idx.cfg.NSample
 	}
 
-	samples := idx.trainingBuf.Drain()
-	if len(samples) == 0 {
+	samples, pendingSamples := idx.trainingBuf.drainWithPending()
+	var transformed [][]float32
+	if len(samples) > 0 {
+		transformed = make([][]float32, len(samples))
+		for i, vec := range samples {
+			transformed[i] = PadAndTransform(vec, idx.paddedDim)
+		}
+	} else {
 		var err error
-		samples, err = idx.sampleVectors(topicID, sampleSize)
+		transformed, err = idx.sampleTransformedVectors(topicID, sampleSize)
 		if err != nil {
 			return fmt.Errorf("sampling vectors: %w", err)
 		}
 	}
-	if len(samples) == 0 {
+	if len(transformed) == 0 {
 		return fmt.Errorf("no vectors found for topic %d", topicID)
-	}
-
-	transformed := make([][]float32, len(samples))
-	for i, vec := range samples {
-		transformed[i] = PadAndTransform(vec, idx.paddedDim)
 	}
 
 	centroids := idx.miniBatchKMeans(transformed, idx.cfg.NumCentroids)
@@ -84,11 +116,77 @@ func (idx *IVFPQIndex) Train(topicID uint32, sampleSize int) error {
 	}
 
 	// Re-index all existing vectors with the new centroids/codebook
-	if err := idx.reindexAllVectors(topicID, centroids, codebook); err != nil {
+	if err := idx.reindexAllVectors(topicID, centroids, codebook, pendingSamples); err != nil {
 		return fmt.Errorf("re-indexing vectors: %w", err)
 	}
 
 	return nil
+}
+
+// sampleTransformedVectors samples FWHT-domain vectors for training.
+// Prefers 0x16 raw vectors when stored; otherwise reads directly from compressed
+// 0x11 vectors without requiring 6.14 GB/1M of redundant 0x16 storage.
+func (idx *IVFPQIndex) sampleTransformedVectors(topicID uint32, sampleSize int) ([][]float32, error) {
+	if idx.cfg.StoreRawVectors {
+		rawSamples, err := idx.sampleVectors(topicID, sampleSize)
+		if err != nil {
+			return nil, err
+		}
+		if len(rawSamples) > 0 {
+			transformed := make([][]float32, len(rawSamples))
+			for i, v := range rawSamples {
+				transformed[i] = PadAndTransform(v, idx.paddedDim)
+			}
+			return transformed, nil
+		}
+	}
+
+	var samples [][]float32
+	expectedMinLen := 1 + HybridVectorSize(idx.paddedDim, idx.hybridCfg)
+
+	err := idx.db.View(func(txn *badger.Txn) error {
+		prefix := buildTopicVectorPrefix(topicID)
+		endKey := buildTopicVectorEnd(topicID)
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		opts.PrefetchValues = true
+		opts.PrefetchSize = 1000
+
+		iter := txn.NewIterator(opts)
+		defer iter.Close()
+
+		rng := rand.New(rand.NewSource(42))
+		count := 0
+
+		for iter.Seek(prefix); iter.Valid(); iter.Next() {
+			item := iter.Item()
+			key := item.Key()
+			if string(key) >= string(endKey) {
+				break
+			}
+			if len(key) != keys.ChunkKeySize || key[0] != keys.VectorFullPrefix {
+				continue
+			}
+			_ = item.Value(func(val []byte) error {
+				if len(val) < expectedMinLen {
+					return nil
+				}
+				tv := DequantizeHybridTransformed(val[1:], idx.fullDim, idx.hybridCfg)
+				count++
+				if len(samples) < sampleSize {
+					samples = append(samples, tv)
+				} else {
+					j := rng.Intn(count)
+					if j < sampleSize {
+						samples[j] = tv
+					}
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+	return samples, err
 }
 
 func (idx *IVFPQIndex) sampleVectors(topicID uint32, sampleSize int) ([][]float32, error) {
@@ -350,8 +448,44 @@ func squaredDist(a, b []float32) float32 {
 	return sum
 }
 
-func (idx *IVFPQIndex) reindexAllVectors(topicID uint32, centroids, codebook []float32) error {
-	return idx.db.Update(func(txn *badger.Txn) error {
+func (idx *IVFPQIndex) encodePosting(transformed, centroids, codebook []float32) (uint32, []byte) {
+	centroidID := idx.findClosestCentroid(transformed, centroids)
+	residual := make([]float32, idx.paddedDim)
+	centroidBase := int(centroidID) * idx.paddedDim
+	for i := 0; i < idx.paddedDim; i++ {
+		residual[i] = transformed[i] - centroids[centroidBase+i]
+	}
+	return centroidID, idx.quantizeResidual(residual, codebook)
+}
+
+func (idx *IVFPQIndex) reindexAllVectors(topicID uint32, centroids, codebook []float32, pending []TrainingSample) error {
+	const reindexBatchSize = 2000
+
+	type postingEntry struct {
+		key []byte
+		val []byte
+	}
+	var batch []postingEntry
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		err := idx.db.Update(func(txn *badger.Txn) error {
+			for _, p := range batch {
+				if err := txn.Set(p.key, p.val); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		batch = batch[:0]
+		return err
+	}
+
+	indexedLocalIDs := make(map[uint64]struct{})
+
+	// 1. Re-index opt-in 0x16 raw float32 keys if present.
+	if err := idx.db.View(func(txn *badger.Txn) error {
 		prefix := keys.EncodeIVFRawVectorKey(topicID, 0)[:5]
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefix
@@ -364,13 +498,13 @@ func (idx *IVFPQIndex) reindexAllVectors(topicID uint32, centroids, codebook []f
 		for iter.Rewind(); iter.Valid(); iter.Next() {
 			item := iter.Item()
 			key := item.Key()
-			if len(key) < 9 {
+			if len(key) < 13 {
 				continue
 			}
-			localID := binary.BigEndian.Uint64(key[1:9])
+			localID := binary.BigEndian.Uint64(key[5:13])
 
 			var fullVec []float32
-			err := item.Value(func(val []byte) error {
+			if err := item.Value(func(val []byte) error {
 				if len(val) < idx.fullDim*4 {
 					return nil
 				}
@@ -379,30 +513,110 @@ func (idx *IVFPQIndex) reindexAllVectors(topicID uint32, centroids, codebook []f
 					fullVec[i] = math.Float32frombits(binary.LittleEndian.Uint32(val[i*4:]))
 				}
 				return nil
-			})
-			if err != nil {
+			}); err != nil {
 				return err
 			}
 			if fullVec == nil {
 				continue
 			}
 
-			// Encode and add to posting list
 			transformed := PadAndTransform(fullVec, idx.paddedDim)
-			centroidID := idx.findClosestCentroid(transformed, centroids)
-
-			residual := make([]float32, idx.paddedDim)
-			centroidBase := int(centroidID) * idx.paddedDim
-			for i := 0; i < idx.paddedDim; i++ {
-				residual[i] = transformed[i] - centroids[centroidBase+i]
-			}
-
-			pqCodes := idx.quantizeResidual(residual, codebook)
-			postingKey := keys.EncodeIVFPostingKey(topicID, centroidID, localID)
-			if err := txn.Set(postingKey, pqCodes); err != nil {
-				return err
+			centroidID, pqCodes := idx.encodePosting(transformed, centroids, codebook)
+			batch = append(batch, postingEntry{
+				key: keys.EncodeIVFPostingKey(topicID, centroidID, localID),
+				val: pqCodes,
+			})
+			indexedLocalIDs[localID] = struct{}{}
+			if len(batch) >= reindexBatchSize {
+				if err := flush(); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// 2. Re-index primary compressed 0x11 vectors directly in FWHT domain.
+	expectedMinLen := 1 + HybridVectorSize(idx.paddedDim, idx.hybridCfg)
+	if err := idx.db.View(func(txn *badger.Txn) error {
+		prefix := buildTopicVectorPrefix(topicID)
+		endKey := buildTopicVectorEnd(topicID)
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		opts.PrefetchValues = true
+		opts.PrefetchSize = 1000
+
+		iter := txn.NewIterator(opts)
+		defer iter.Close()
+
+		for iter.Seek(prefix); iter.Valid(); iter.Next() {
+			item := iter.Item()
+			key := item.Key()
+			if string(key) >= string(endKey) {
+				break
+			}
+			if len(key) != keys.ChunkKeySize || key[0] != keys.VectorFullPrefix {
+				continue
+			}
+			localID := keys.UnpackLocalID(binary.BigEndian.Uint64(key[1:]))
+			if _, seen := indexedLocalIDs[localID]; seen {
+				continue
+			}
+
+			var transformed []float32
+			if err := item.Value(func(val []byte) error {
+				if len(val) < expectedMinLen {
+					return nil
+				}
+				transformed = DequantizeHybridTransformed(val[1:], idx.fullDim, idx.hybridCfg)
+				return nil
+			}); err != nil {
+				return err
+			}
+			if transformed == nil {
+				continue
+			}
+
+			centroidID, pqCodes := idx.encodePosting(transformed, centroids, codebook)
+			batch = append(batch, postingEntry{
+				key: keys.EncodeIVFPostingKey(topicID, centroidID, localID),
+				val: pqCodes,
+			})
+			indexedLocalIDs[localID] = struct{}{}
+			if len(batch) >= reindexBatchSize {
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// 3. Index any remaining in-memory pending samples (for callers not writing 0x11).
+	for _, s := range pending {
+		if s.TopicID != topicID {
+			continue
+		}
+		if _, seen := indexedLocalIDs[s.LocalID]; seen {
+			continue
+		}
+		transformed := PadAndTransform(s.Vec, idx.paddedDim)
+		centroidID, pqCodes := idx.encodePosting(transformed, centroids, codebook)
+		batch = append(batch, postingEntry{
+			key: keys.EncodeIVFPostingKey(topicID, centroidID, s.LocalID),
+			val: pqCodes,
+		})
+		indexedLocalIDs[s.LocalID] = struct{}{}
+		if len(batch) >= reindexBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return flush()
 }

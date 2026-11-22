@@ -47,13 +47,48 @@ func (r *VectorRegistry) Search(ctx context.Context, queryVec []float32, k int) 
 	return r.SearchWithFilter(ctx, queryVec, k, 0)
 }
 
+// trySearchPromotedANN checks whether the topic is in StateANN and returns
+// its active IVF-PQ or HNSW index.
+func (r *VectorRegistry) trySearchPromotedANN(topicID uint32) (*IVFPQIndex, *HNSWIndex, bool) {
+	r.adaptiveMu.RLock()
+	ts := r.topicStates[topicID]
+	r.adaptiveMu.RUnlock()
+	if ts == nil || IndexState(ts.state.Load()) != StateANN {
+		return nil, nil, false
+	}
+	if ivf := ts.ivfpq.Load(); ivf != nil {
+		return ivf, nil, true
+	}
+	if hnsw := ts.hnsw.Load(); hnsw != nil {
+		return nil, hnsw, true
+	}
+	return nil, nil, false
+}
+
+// singleTopicInANN returns the topicID if exactly one topic is registered and
+// its adaptive state has promoted to StateANN.
+func (r *VectorRegistry) singleTopicInANN() (uint32, *IVFPQIndex, *HNSWIndex, bool) {
+	r.adaptiveMu.RLock()
+	defer r.adaptiveMu.RUnlock()
+	if len(r.topicStates) != 1 {
+		return 0, nil, nil, false
+	}
+	for topicID, ts := range r.topicStates {
+		if IndexState(ts.state.Load()) != StateANN {
+			return 0, nil, nil, false
+		}
+		return topicID, ts.ivfpq.Load(), ts.hnsw.Load(), true
+	}
+	return 0, nil, nil, false
+}
+
 // SearchWithFilter returns an iterator of top-k most similar vectors matching a semantic hash.
-// Fast path: parallel mmap scan if vectors are loaded in RAM.
-// Fallback: streams from BadgerDB for cold start.
+// Fast path: promoted ANN index (when single topic is StateANN and filterHash == 0),
+// otherwise parallel mmap scan when all segments are resident in RAM.
+// Fallback: streams compressed 0x11 vectors from BadgerDB on cold start or when mmap segments have been LRU-evicted.
 //
 // The RLock is held for the entire duration of the parallel mmap scan. This prevents
-// concurrent Delete/Add from modifying slot data in-place (the in-place copy in Delete
-// and the slot overwrite in Add would otherwise race with lock-free readers).
+// concurrent Delete/Add/evict from modifying or unmapping slot data while readers scan it.
 func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float32, k int, filterHash uint8) iter.Seq2[SearchResult, error] {
 	return func(yield func(SearchResult, error) bool) {
 		if k <= 0 {
@@ -67,20 +102,49 @@ func (r *VectorRegistry) SearchWithFilter(ctx context.Context, queryVec []float3
 		default:
 		}
 
+		if filterHash == 0 {
+			if topicID, ivf, hnsw, ok := r.singleTopicInANN(); ok {
+				if ivf != nil {
+					txn := r.db.NewTransaction(false)
+					defer txn.Discard()
+					for sr, err := range ivf.SearchInTopic(ctx, txn, topicID, queryVec, k) {
+						if !yield(sr, err) {
+							return
+						}
+					}
+					return
+				}
+				if hnsw != nil {
+					for sr, err := range hnsw.SearchInTopic(ctx, topicID, queryVec, k) {
+						if !yield(sr, err) {
+							return
+						}
+					}
+					return
+				}
+			}
+		}
+
 		r.mu.RLock()
 		numVectors := int(r.totalVectors.Load())
 		hasVectors := numVectors > 0
+		evicted := r.evictedSegments.Load() > 0
 		vectorSize := r.vectorSize
 		hybridCfg := r.hybridCfg
 		fullDim := r.config.FullDim
 		configuredWorkers := r.config.NumWorkers
 		revMap := *r.revMap.Load()
 
-		if !hasVectors {
+		if !hasVectors || evicted {
 			r.mu.RUnlock()
-			// Cold start: stream from Badger
+			// Cold start or partially evicted mmap: stream from Badger (0x11)
 			r.searchFromBadger(ctx, queryVec, k, filterHash, hybridCfg, fullDim, yield)
 			return
+		}
+
+		numSegs := len(*r.segments.Load())
+		for sIdx := 0; sIdx < numSegs; sIdx++ {
+			r.TouchSegment(sIdx)
 		}
 
 		slog.Debug("mmap-fast vector search",
@@ -174,6 +238,27 @@ func (r *VectorRegistry) SearchInTopic(ctx context.Context, topicID uint32, quer
 			yield(SearchResult{}, ctx.Err())
 			return
 		default:
+		}
+
+		if ivf, hnsw, ok := r.trySearchPromotedANN(topicID); ok {
+			if ivf != nil {
+				txn := r.db.NewTransaction(false)
+				defer txn.Discard()
+				for sr, err := range ivf.SearchInTopic(ctx, txn, topicID, queryVec, k) {
+					if !yield(sr, err) {
+						return
+					}
+				}
+				return
+			}
+			if hnsw != nil {
+				for sr, err := range hnsw.SearchInTopic(ctx, topicID, queryVec, k) {
+					if !yield(sr, err) {
+						return
+					}
+				}
+				return
+			}
 		}
 
 		slog.Debug("Badger-streaming topic-aware vector search started",

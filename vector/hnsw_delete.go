@@ -3,11 +3,84 @@ package vector
 import (
 	"context"
 	"encoding/binary"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/duynguyendang/meb/keys"
 )
+
+type hnswCompactState struct {
+	cursor            []byte
+	tombstoneKeys     [][]byte
+	removedUnique     map[uint64]struct{}
+	bestSurvivor      uint64
+	bestSurvivorLevel int
+}
+
+func (idx *HNSWIndex) getOrCreateTombstoneCounter(topicID uint32) *atomic.Int64 {
+	idx.tombstoneCountsMu.RLock()
+	c := idx.tombstoneCounts[topicID]
+	idx.tombstoneCountsMu.RUnlock()
+	if c != nil {
+		return c
+	}
+	idx.tombstoneCountsMu.Lock()
+	defer idx.tombstoneCountsMu.Unlock()
+	if c = idx.tombstoneCounts[topicID]; c != nil {
+		return c
+	}
+	c = &atomic.Int64{}
+	idx.tombstoneCounts[topicID] = c
+	return c
+}
+
+// TombstoneCount returns the number of uncompacted soft-deletes recorded for topicID.
+func (idx *HNSWIndex) TombstoneCount(topicID uint32) int64 {
+	idx.tombstoneCountsMu.RLock()
+	c := idx.tombstoneCounts[topicID]
+	idx.tombstoneCountsMu.RUnlock()
+	if c == nil {
+		return 0
+	}
+	return c.Load()
+}
+
+// TombstoneRatio returns tombstones / nodeCount for topicID (0 if empty).
+func (idx *HNSWIndex) TombstoneRatio(topicID uint32) float64 {
+	tombs := idx.TombstoneCount(topicID)
+	if tombs <= 0 {
+		return 0
+	}
+	idx.nodeCountMu.RLock()
+	total := idx.nodeCounts[topicID]
+	idx.nodeCountMu.RUnlock()
+	if total <= 0 {
+		return 1.0
+	}
+	return float64(tombs) / float64(total)
+}
+
+// ShouldCompact reports whether topicID's tombstone ratio meets or exceeds
+// CompactionRatio (default 15%).
+func (idx *HNSWIndex) ShouldCompact(topicID uint32) bool {
+	threshold := idx.cfg.CompactionRatio
+	if threshold <= 0 {
+		threshold = DefaultHNSWCompactionRatio
+	}
+	return idx.TombstoneCount(topicID) > 0 && idx.TombstoneRatio(topicID) >= threshold
+}
+
+// ActiveTopics returns topicIDs tracked by the HNSW index.
+func (idx *HNSWIndex) ActiveTopics() []uint32 {
+	idx.nodeCountMu.RLock()
+	topics := make([]uint32, 0, len(idx.nodeCounts))
+	for tid := range idx.nodeCounts {
+		topics = append(topics, tid)
+	}
+	idx.nodeCountMu.RUnlock()
+	return topics
+}
 
 func (idx *HNSWIndex) SoftDelete(packedID uint64) error {
 	tombstoneKey := keys.EncodeHNSWTombstoneKey(packedID)
@@ -23,8 +96,13 @@ func (idx *HNSWIndex) SoftDelete(packedID uint64) error {
 	}
 
 	idx.tombstonesMu.Lock()
+	_, already := idx.tombstones[packedID]
 	idx.tombstones[packedID] = struct{}{}
 	idx.tombstonesMu.Unlock()
+
+	if !already {
+		idx.getOrCreateTombstoneCounter(keys.UnpackTopicID(packedID)).Add(1)
+	}
 	return nil
 }
 
@@ -38,41 +116,69 @@ func (idx *HNSWIndex) isDeleted(packedID uint64) bool {
 	return err == nil
 }
 
+// Compact runs incremental compaction passes until all tombstoned nodes and
+// dangling neighbor references for topicID have been cleaned up.
 func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
+	batchSize := idx.cfg.CompactionBatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultHNSWCompactionBatchSize
+	}
+	for {
+		_, done, err := idx.CompactIncremental(ctx, topicID, batchSize)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+}
+
+// CompactIncremental processes up to batchSize HNSW node-level keys for topicID
+// using fine-grained striped node locks instead of a global index mutex.
+// Returns (processed, done, err), where done=true marks completion of the topic pass.
+func (idx *HNSWIndex) CompactIncremental(ctx context.Context, topicID uint32, batchSize int) (int, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, false, err
+	}
+	if batchSize <= 0 {
+		batchSize = idx.cfg.CompactionBatchSize
+		if batchSize <= 0 {
+			batchSize = DefaultHNSWCompactionBatchSize
+		}
 	}
 
-	idx.graphMu.Lock()
-	defer idx.graphMu.Unlock()
+	idx.compactMu.Lock()
+	defer idx.compactMu.Unlock()
 
 	prefix := keys.HNSWTopicPrefix(topicID)
 	tombstoneTopicPrefix := []byte{keys.HNSWPrefix, 0xFF,
 		byte(topicID >> 16), byte(topicID >> 8), byte(topicID)}
+
+	state := idx.compactStates[topicID]
+	if state == nil {
+		state = &hnswCompactState{
+			removedUnique:     make(map[uint64]struct{}),
+			bestSurvivorLevel: -1,
+		}
+		idx.compactStates[topicID] = state
+	}
 
 	type nodeEntry struct {
 		packedID uint64
 		level    int
 	}
 	type neighborUpdate struct {
-		key       []byte
-		neighbors []uint64
+		packedID uint64
+		level    int
+		key      []byte
 	}
 
-	var toRemove []nodeEntry
-	removedUnique := make(map[uint64]struct{})
-	var tombstoneKeys [][]byte
-	tombstoneKeySet := make(map[string]struct{})
 	deletedSet := make(map[uint64]struct{})
-	var neighborUpdates []neighborUpdate
+	tombstoneKeySet := make(map[string]struct{})
 
-	var bestSurvivor uint64
-	bestSurvivorLevel := -1
-
-	currentEntry, hasEP := idx.getEntryPoint(topicID)
-
+	// 1. Collect persisted tombstones for topicID (first pass or fresh lookup).
 	err := idx.db.View(func(txn *badger.Txn) error {
-		// First scan persisted tombstones for this topic: [0x12][0xFF][topicID:3].
 		tit := txn.NewIterator(badger.DefaultIteratorOptions)
 		defer tit.Close()
 		for tit.Seek(tombstoneTopicPrefix); tit.ValidForPrefix(tombstoneTopicPrefix); tit.Next() {
@@ -85,36 +191,60 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 			}
 			tk := make([]byte, len(rawKey))
 			copy(tk, rawKey)
-			tombstoneKeys = append(tombstoneKeys, tk)
 			tombstoneKeySet[string(tk)] = struct{}{}
 			deletedID := binary.BigEndian.Uint64(tk[2:10])
 			deletedSet[deletedID] = struct{}{}
 		}
+		return nil
+	})
+	if err != nil {
+		return 0, false, err
+	}
 
-		// Also include any in-memory tombstones for this topic.
-		idx.tombstonesMu.RLock()
-		for id := range idx.tombstones {
-			if keys.UnpackTopicID(id) == topicID {
-				deletedSet[id] = struct{}{}
-			}
+	// Merge persisted tombstone keys discovered at start of pass.
+	if state.cursor == nil && len(tombstoneKeySet) > 0 {
+		for k := range tombstoneKeySet {
+			state.tombstoneKeys = append(state.tombstoneKeys, []byte(k))
 		}
-		idx.tombstonesMu.RUnlock()
+	}
 
-		if len(deletedSet) == 0 && len(tombstoneKeys) == 0 {
-			return nil
+	// Also include in-memory tombstones for this topic.
+	idx.tombstonesMu.RLock()
+	for id := range idx.tombstones {
+		if keys.UnpackTopicID(id) == topicID {
+			deletedSet[id] = struct{}{}
 		}
+	}
+	idx.tombstonesMu.RUnlock()
 
+	if len(deletedSet) == 0 && len(state.tombstoneKeys) == 0 && state.cursor == nil {
+		delete(idx.compactStates, topicID)
+		return 0, true, nil
+	}
+
+	// 2. Scan up to batchSize HNSW node-level keys starting at cursor (or prefix).
+	var toRemove []nodeEntry
+	var toPrune []neighborUpdate
+	processed := 0
+	reachedEnd := true
+	var nextCursor []byte
+
+	err = idx.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = true
+		opts.PrefetchValues = false
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		seekPos := prefix
+		if state.cursor != nil {
+			seekPos = state.cursor
+		}
+
+		for it.Seek(seekPos); it.ValidForPrefix(prefix); it.Next() {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			item := it.Item()
-			key := item.Key()
+			key := it.Item().Key()
 			if len(key) < 10 || key[0] != keys.HNSWPrefix {
 				continue
 			}
@@ -122,106 +252,105 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 				continue
 			}
 
+			if processed >= batchSize {
+				nextCursor = make([]byte, len(key))
+				copy(nextCursor, key)
+				reachedEnd = false
+				break
+			}
+			processed++
+
 			packedID := binary.BigEndian.Uint64(key[1:9])
 			level := int(key[9])
 
 			if _, deleted := deletedSet[packedID]; deleted {
 				toRemove = append(toRemove, nodeEntry{packedID: packedID, level: level})
-				removedUnique[packedID] = struct{}{}
+				state.removedUnique[packedID] = struct{}{}
 				continue
 			}
 
-			if level > bestSurvivorLevel {
-				bestSurvivorLevel = level
-				bestSurvivor = packedID
+			if level > state.bestSurvivorLevel {
+				state.bestSurvivorLevel = level
+				state.bestSurvivor = packedID
 			}
 
-			// Prune any deleted IDs from surviving node's neighbor list.
-			var pruned []uint64
+			kCopy := make([]byte, len(key))
+			copy(kCopy, key)
+			toPrune = append(toPrune, neighborUpdate{
+				packedID: packedID,
+				level:    level,
+				key:      kCopy,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return processed, false, err
+	}
+
+	// 3. Apply per-node deletions & neighbor pruning using fine-grained node stripe locks.
+	for _, entry := range toRemove {
+		if err := ctx.Err(); err != nil {
+			return processed, false, err
+		}
+		if err := idx.deleteNode(entry.packedID, entry.level); err != nil {
+			return processed, false, err
+		}
+	}
+
+	for _, upd := range toPrune {
+		if err := ctx.Err(); err != nil {
+			return processed, false, err
+		}
+		lock := idx.nodeStripe(upd.packedID)
+		lock.Lock()
+		neighbors, err := idx.readNeighborsUnlocked(upd.packedID, upd.level)
+		if err == nil && len(neighbors) > 0 {
 			changed := false
-			if err := item.Value(func(val []byte) error {
-				count := len(val) / 8
-				for i := 0; i < count; i++ {
-					nid := binary.BigEndian.Uint64(val[i*8:])
-					if _, nidDeleted := deletedSet[nid]; nidDeleted {
-						if !changed {
-							changed = true
-							pruned = make([]uint64, 0, count)
-							for j := 0; j < i; j++ {
-								pruned = append(pruned, binary.BigEndian.Uint64(val[j*8:]))
-							}
-						}
-						continue
-					}
-					if changed {
-						pruned = append(pruned, nid)
-					}
+			pruned := make([]uint64, 0, len(neighbors))
+			for _, nid := range neighbors {
+				if _, nidDeleted := deletedSet[nid]; nidDeleted {
+					changed = true
+					continue
 				}
-				return nil
-			}); err != nil {
-				return err
+				pruned = append(pruned, nid)
 			}
 			if changed {
-				kCopy := make([]byte, len(key))
-				copy(kCopy, key)
-				neighborUpdates = append(neighborUpdates, neighborUpdate{
-					key:       kCopy,
-					neighbors: pruned,
-				})
+				err = idx.writeNodeUnlocked(ctx, upd.packedID, upd.level, pruned)
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		return err
+		lock.Unlock()
+		if err != nil && err != badger.ErrKeyNotFound {
+			return processed, false, err
+		}
 	}
 
-	if len(toRemove) == 0 && len(tombstoneKeys) == 0 && len(neighborUpdates) == 0 {
-		return nil
+	if !reachedEnd {
+		state.cursor = nextCursor
+		return processed, false, nil
 	}
 
-	err = idx.db.Update(func(txn *badger.Txn) error {
-		for _, entry := range toRemove {
-			if err := ctx.Err(); err != nil {
-				return err
+	// 4. Finalize pass: delete tombstone keys, rotate entry point if deleted, clear caches/counters.
+	if len(state.tombstoneKeys) > 0 {
+		if err := idx.db.Update(func(txn *badger.Txn) error {
+			for _, tk := range state.tombstoneKeys {
+				if err := txn.Delete(tk); err != nil {
+					return err
+				}
 			}
-			key := keys.EncodeHNSWKey(entry.packedID, entry.level)
-			if err := txn.Delete(key); err != nil {
-				return err
-			}
+			return nil
+		}); err != nil {
+			return processed, false, err
 		}
-		for _, upd := range neighborUpdates {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			val := make([]byte, len(upd.neighbors)*8)
-			for i, n := range upd.neighbors {
-				binary.BigEndian.PutUint64(val[i*8:], n)
-			}
-			if err := txn.Set(upd.key, val); err != nil {
-				return err
-			}
-		}
-		for _, tk := range tombstoneKeys {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := txn.Delete(tk); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 
+	currentEntry, hasEP := idx.getEntryPoint(topicID)
 	if _, epDeleted := deletedSet[currentEntry]; hasEP && epDeleted {
 		idx.entryPointMu.Lock()
 		idx.maxLevelMu.Lock()
-		if bestSurvivorLevel >= 0 {
-			idx.entryPoints[topicID] = bestSurvivor
-			idx.maxLevels[topicID] = bestSurvivorLevel
+		if state.bestSurvivorLevel >= 0 {
+			idx.entryPoints[topicID] = state.bestSurvivor
+			idx.maxLevels[topicID] = state.bestSurvivorLevel
 		} else {
 			delete(idx.entryPoints, topicID)
 			delete(idx.maxLevels, topicID)
@@ -230,10 +359,10 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 		idx.entryPointMu.Unlock()
 	}
 
-	if len(removedUnique) > 0 {
+	if len(state.removedUnique) > 0 {
 		idx.nodeCountMu.Lock()
-		if idx.nodeCounts[topicID] >= len(removedUnique) {
-			idx.nodeCounts[topicID] -= len(removedUnique)
+		if idx.nodeCounts[topicID] >= len(state.removedUnique) {
+			idx.nodeCounts[topicID] -= len(state.removedUnique)
 		} else {
 			idx.nodeCounts[topicID] = 0
 		}
@@ -246,12 +375,13 @@ func (idx *HNSWIndex) Compact(ctx context.Context, topicID uint32) error {
 	}
 	idx.vecCacheMu.Unlock()
 
-	// Remove compacted nodes from in-memory tombstone cache.
 	idx.tombstonesMu.Lock()
 	for id := range deletedSet {
 		delete(idx.tombstones, id)
 	}
 	idx.tombstonesMu.Unlock()
 
-	return nil
+	idx.getOrCreateTombstoneCounter(topicID).Store(0)
+	delete(idx.compactStates, topicID)
+	return processed, true, nil
 }

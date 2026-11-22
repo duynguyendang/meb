@@ -178,7 +178,9 @@ func QuantizeHybrid(vec []float32, cfg *HybridConfig) []byte {
 	return out
 }
 
-func DequantizeHybrid(data []byte, dim int, cfg *HybridConfig) []float32 {
+// DequantizeHybridTransformed decodes block-wise quantized bytes directly into
+// the FWHT-transformed (paddedDim) float32 domain without running inverse FWHT.
+func DequantizeHybridTransformed(data []byte, dim int, cfg *HybridConfig) []float32 {
 	if cfg == nil {
 		cfg = DefaultHybridConfig()
 	}
@@ -226,6 +228,16 @@ func DequantizeHybrid(data []byte, dim int, cfg *HybridConfig) []float32 {
 			offset += blockSize/2 - (end-start+1)/2
 		}
 	}
+	return vec
+}
+
+func DequantizeHybrid(data []byte, dim int, cfg *HybridConfig) []float32 {
+	if cfg == nil {
+		cfg = DefaultHybridConfig()
+	}
+
+	vec := DequantizeHybridTransformed(data, dim, cfg)
+	paddedDim := cfg.paddedDim
 
 	FWHT(vec)
 	invNorm := 1.0 / float32(math.Sqrt(float64(paddedDim)))

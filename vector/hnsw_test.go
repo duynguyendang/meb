@@ -276,3 +276,74 @@ func TestHNSWConcurrentInsertAndCompact(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+func TestHNSW_IncrementalCompactionAndTombstoneRatio(t *testing.T) {
+	db := newInMemoryHNSWBadger(t)
+	cfg := DefaultHNSWConfig()
+	cfg.CompactionRatio = 0.15
+	cfg.CompactionBatchSize = 5
+	idx := NewHNSWIndex(db, cfg, 8)
+	ctx := context.Background()
+	const topicID uint32 = 1
+
+	const totalNodes = 30
+	for i := uint64(1); i <= totalNodes; i++ {
+		vec := make([]float32, 8)
+		vec[0] = float32(i)
+		if err := idx.Insert(ctx, topicID, i, vec); err != nil {
+			t.Fatalf("Insert(%d): %v", i, err)
+		}
+	}
+
+	// Delete 3 nodes (10% < 15%): ShouldCompact must be false.
+	for i := uint64(1); i <= 3; i++ {
+		if err := idx.SoftDelete(keys.PackID(topicID, i)); err != nil {
+			t.Fatalf("SoftDelete(%d): %v", i, err)
+		}
+	}
+	if idx.ShouldCompact(topicID) {
+		t.Fatalf("expected ShouldCompact=false at 10%% tombstone ratio (got ratio=%.2f)", idx.TombstoneRatio(topicID))
+	}
+
+	// Delete 3 more nodes (20% >= 15%): ShouldCompact must become true.
+	for i := uint64(4); i <= 6; i++ {
+		if err := idx.SoftDelete(keys.PackID(topicID, i)); err != nil {
+			t.Fatalf("SoftDelete(%d): %v", i, err)
+		}
+	}
+	if !idx.ShouldCompact(topicID) {
+		t.Fatalf("expected ShouldCompact=true at 20%% tombstone ratio (got ratio=%.2f)", idx.TombstoneRatio(topicID))
+	}
+
+	// Step through CompactIncremental with small batches (5 nodes/tick).
+	ticks := 0
+	for {
+		ticks++
+		_, done, err := idx.CompactIncremental(ctx, topicID, 5)
+		if err != nil {
+			t.Fatalf("CompactIncremental tick %d: %v", ticks, err)
+		}
+		if done {
+			break
+		}
+		if ticks > 50 {
+			t.Fatal("incremental compaction did not terminate")
+		}
+	}
+	if ticks < 2 {
+		t.Errorf("expected multiple incremental ticks with batchSize=5, got %d", ticks)
+	}
+	if idx.TombstoneCount(topicID) != 0 {
+		t.Errorf("expected TombstoneCount=0 after full pass, got %d", idx.TombstoneCount(topicID))
+	}
+	if idx.ShouldCompact(topicID) {
+		t.Error("expected ShouldCompact=false after compaction completes")
+	}
+
+	idx.nodeCountMu.RLock()
+	cnt := idx.nodeCounts[topicID]
+	idx.nodeCountMu.RUnlock()
+	if cnt != totalNodes-6 {
+		t.Errorf("nodeCounts[%d] = %d, want %d", topicID, cnt, totalNodes-6)
+	}
+}

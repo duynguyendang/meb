@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -14,14 +15,18 @@ import (
 )
 
 type Config struct {
-	FullDim         int
-	HybridBitWidth  int
-	HybridBlockSize int
-	NumWorkers      int
-	VectorCapacity  int
-	InitialCapacity int
-	SegmentDir      string
-	SegmentSize     int
+	FullDim              int
+	HybridBitWidth       int
+	HybridBlockSize      int
+	NumWorkers           int
+	VectorCapacity       int
+	InitialCapacity      int
+	SegmentDir           string
+	SegmentSize          int
+	MaxMmapBytes         int64 // 0 = unbounded
+	AutoPromoteThreshold int   // 0 = DefaultAutoPromoteThreshold (50,000); < 0 = disabled
+	AutoPromoteANNType   ANNIndexType
+	OnAutoPromote        func(topicID uint32, annType ANNIndexType, count int64, deltaReplayed int)
 }
 
 func DefaultConfig() *Config {
@@ -74,6 +79,9 @@ type VectorRegistry struct {
 	segments          *atomic.Pointer[[]*mmapSegment]
 	vectorsPerSegment int
 	totalVectors      atomic.Int64
+	mappedBytes       atomic.Int64
+	evictedSegments   atomic.Int64
+	accessClock       atomic.Int64
 
 	// cellsPtr is an RCU-published slice of per-slot atomic pointers.
 	// Each cell is independently swappable: writers allocate new slotData
@@ -86,6 +94,14 @@ type VectorRegistry struct {
 
 	db *badger.DB
 	mu sync.RWMutex
+
+	// Adaptive per-topic index promotion state machine
+	adaptiveMu    sync.RWMutex
+	topicStates   map[uint32]*topicIndexState
+	buildWG       sync.WaitGroup
+	buildCancelMu sync.Mutex
+	buildCtx      context.Context
+	buildCancel   context.CancelFunc
 
 	// Tombstone support for deferred segment cleanup in Reset()
 	tombstoneSegments []*mmapSegment
@@ -101,13 +117,13 @@ const hashSize = 1 // 1 byte for semantic hash filter per vector entry
 //
 // Two backing stores exist: newly-appended slots point directly into the
 // contiguous mmap region (zero-copy, no heap pressure). Overwrites and
-// delete-swaps allocate a new slotData on the Go heap and atomically
-// publish the pointer, detaching that slot from the mmap. For update-heavy
-// or churn-heavy workloads this adds GC pressure and RSS beyond the mmap
-// size, trading the "O(k) memory, disk-scaled" property for correctness.
-// The primary store (BadgerDB) holds the authoritative copy regardless.
+// delete-swaps allocate a new slotData on the Go heap (heapOwned = true) and
+// atomically publish the pointer, detaching that slot from the mmap.
+// When an mmapSegment is evicted via LRU, all non-heapOwned cells in that
+// segment are cleared to nil under r.mu.Lock() before syscall.Munmap().
 type slotData struct {
-	data []byte
+	data      []byte
+	heapOwned bool
 }
 
 // appendRevMap extends the revMap by one entry.
@@ -150,6 +166,7 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 		vectorSize:        vSize,
 		vectorsPerSegment: vectorsPerSeg,
 		idMap:             make(map[uint64]uint32, cfg.InitialCapacity),
+		topicStates:       make(map[uint32]*topicIndexState),
 		revMap: func() *atomic.Pointer[[]uint64] {
 			p := &atomic.Pointer[[]uint64]{}
 			// Pre-allocate to VectorCapacity to avoid O(n²) copies during bulk load
@@ -170,8 +187,30 @@ func NewRegistry(db *badger.DB, cfg *Config) *VectorRegistry {
 		}(),
 		db: db,
 	}
+	r.resetBuildContext()
 
 	return r
+}
+
+// MappedBytes returns the total byte size of currently resident mmap segments.
+func (r *VectorRegistry) MappedBytes() int64 {
+	return r.mappedBytes.Load()
+}
+
+// EvictedSegmentCount returns the number of mmap segments unmapped due to MaxMmapBytes.
+func (r *VectorRegistry) EvictedSegmentCount() int64 {
+	return r.evictedSegments.Load()
+}
+
+// TouchSegment marks segIdx as recently used for LRU eviction.
+func (r *VectorRegistry) TouchSegment(segIdx int) {
+	segs := *r.segments.Load()
+	if segIdx >= 0 && segIdx < len(segs) {
+		seg := segs[segIdx]
+		if seg != nil && !seg.evicted.Load() {
+			seg.lastAccess.Store(r.accessClock.Add(1))
+		}
+	}
 }
 
 // Reset clears all vectors, mappings, and segment data from the registry.
@@ -184,6 +223,14 @@ func (r *VectorRegistry) Reset() error {
 	if r.closed.Load() {
 		return ErrClosed
 	}
+
+	// Cancel and drain any background adaptive ANN promotion builders before clearing state.
+	r.buildCancelMu.Lock()
+	if r.buildCancel != nil {
+		r.buildCancel()
+	}
+	r.buildCancelMu.Unlock()
+	r.buildWG.Wait()
 
 	r.mu.Lock()
 
@@ -199,12 +246,19 @@ func (r *VectorRegistry) Reset() error {
 		r.tombstoneSegments = append(r.tombstoneSegments, oldSegs...)
 	}
 
-	// Clear mappings
+	// Clear mappings and counters
 	r.idMap = make(map[uint64]uint32, r.config.InitialCapacity)
 	r.revMap.Store(&[]uint64{})
 	r.totalVectors.Store(0)
+	r.mappedBytes.Store(0)
+	r.evictedSegments.Store(0)
 	r.segments.Store(&[]*mmapSegment{})
 	r.cellsPtr.Store(&[]atomic.Pointer[slotData]{})
+
+	r.adaptiveMu.Lock()
+	r.topicStates = make(map[uint32]*topicIndexState)
+	r.adaptiveMu.Unlock()
+	r.resetBuildContext()
 
 	r.mu.Unlock()
 
@@ -241,7 +295,9 @@ func (r *VectorRegistry) WaitTombstones() {
 	r.tombstoneWG.Wait()
 }
 
-// ensureCapacity grows the segment list if needed to hold the required number of vectors.
+// ensureCapacity grows the segment list if needed to hold the required number of vectors
+// and evicts least-recently-used segments if MaxMmapBytes would be exceeded.
+// Must be called under mu.Lock().
 func (r *VectorRegistry) ensureCapacity(totalVectors int) error {
 	requiredSegs := (totalVectors + r.vectorsPerSegment - 1) / r.vectorsPerSegment
 	for {
@@ -251,14 +307,68 @@ func (r *VectorRegistry) ensureCapacity(totalVectors int) error {
 		}
 		segIdx := len(oldSegs)
 		segBytes := r.vectorsPerSegment * r.vectorSize
+		if r.config.MaxMmapBytes > 0 && r.mappedBytes.Load()+int64(segBytes) > r.config.MaxMmapBytes {
+			r.evictLRUSegmentsLocked(segIdx, r.config.MaxMmapBytes-int64(segBytes))
+		}
 		seg, err := newMmapSegment(r.config.SegmentDir, segIdx, segBytes)
 		if err != nil {
 			return fmt.Errorf("failed to create segment %d: %w", segIdx, err)
 		}
+		seg.lastAccess.Store(r.accessClock.Add(1))
+		r.mappedBytes.Add(int64(segBytes))
 		newSegs := make([]*mmapSegment, len(oldSegs)+1)
 		copy(newSegs, oldSegs)
 		newSegs[len(oldSegs)] = seg
 		r.segments.Store(&newSegs)
+	}
+}
+
+// evictLRUSegmentsLocked unmaps the oldest mapped segments until mappedBytes <= targetMaxBytes
+// or no further evictable segments remain (excluding excludeSegIdx). Must be called under mu.Lock().
+func (r *VectorRegistry) evictLRUSegmentsLocked(excludeSegIdx int, targetMaxBytes int64) {
+	if targetMaxBytes < 0 {
+		targetMaxBytes = 0
+	}
+	segs := *r.segments.Load()
+	cells := *r.cellsPtr.Load()
+	totalVecs := int(r.totalVectors.Load())
+
+	for r.mappedBytes.Load() > targetMaxBytes {
+		var victim *mmapSegment
+		var oldestAccess int64 = math.MaxInt64
+		for _, seg := range segs {
+			if seg == nil || seg.index == excludeSegIdx || seg.evicted.Load() || seg.data == nil {
+				continue
+			}
+			acc := seg.lastAccess.Load()
+			if acc < oldestAccess {
+				oldestAccess = acc
+				victim = seg
+			}
+		}
+		if victim == nil {
+			return
+		}
+
+		startIdx := victim.index * r.vectorsPerSegment
+		endIdx := startIdx + r.vectorsPerSegment
+		if endIdx > totalVecs {
+			endIdx = totalVecs
+		}
+		if endIdx > len(cells) {
+			endIdx = len(cells)
+		}
+		for idx := startIdx; idx < endIdx; idx++ {
+			if sd := cells[idx].Load(); sd != nil && !sd.heapOwned {
+				cells[idx].Store(nil)
+			}
+		}
+
+		if err := victim.unmap(); err != nil {
+			slog.Warn("LRU segment unmap failed", "segment", victim.index, "error", err)
+		}
+		r.mappedBytes.Add(-int64(victim.size))
+		r.evictedSegments.Add(1)
 	}
 }
 
@@ -304,7 +414,9 @@ func (r *VectorRegistry) getVectorSlice(idx int) []byte {
 	segs := *r.segments.Load()
 	segIdx := idx / r.vectorsPerSegment
 	offset := (idx % r.vectorsPerSegment) * r.vectorSize
-	return segs[segIdx].data[offset : offset+r.vectorSize]
+	seg := segs[segIdx]
+	seg.lastAccess.Store(r.accessClock.Add(1))
+	return seg.data[offset : offset+r.vectorSize]
 }
 
 func (r *VectorRegistry) Add(id uint64, fullVec []float32) error {
@@ -327,9 +439,9 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.closed.Load() {
+		r.mu.Unlock()
 		return ErrClosed
 	}
 
@@ -338,12 +450,15 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 		buf := make([]byte, r.vectorSize)
 		buf[0] = semanticHash
 		copy(buf[hashSize:hashSize+hybridSize], hybridData)
-		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
+		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf, heapOwned: true})
+		r.mu.Unlock()
+		r.recordVectorAdd(id, fullVec, false)
 		return nil
 	}
 
 	newTotal := r.totalVectors.Load() + 1
 	if err := r.ensureCapacity(int(newTotal)); err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	r.ensureCells(int(newTotal))
@@ -357,8 +472,11 @@ func (r *VectorRegistry) AddToMmapCache(id uint64, fullVec []float32, semanticHa
 	copy(slot[hashSize:hashSize+hybridSize], hybridData)
 
 	// Publish the slot data and bump totalVectors atomically.
-	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize]})
+	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize], heapOwned: false})
 	r.totalVectors.Store(newTotal)
+	r.mu.Unlock()
+
+	r.recordVectorAdd(id, fullVec, true)
 	return nil
 }
 
@@ -391,12 +509,15 @@ func (r *VectorRegistry) AddWithHash(id uint64, fullVec []float32, semanticHash 
 		return fmt.Errorf("failed to persist vector to BadgerDB: %w", err)
 	}
 
-	return r.addMmapOnly(id, hybridData, semanticHash)
+	return r.addMmapOnlyWithFullVec(id, hybridData, semanticHash, fullVec)
 }
 
 // addMmapOnly writes pre-quantized hybrid data directly to the mmap cache.
-// Skips re-quantization — called from AddWithHash where hybridData is already computed.
 func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash uint8) error {
+	return r.addMmapOnlyWithFullVec(id, hybridData, semanticHash, nil)
+}
+
+func (r *VectorRegistry) addMmapOnlyWithFullVec(id uint64, hybridData []byte, semanticHash uint8, fullVec []float32) error {
 	hybridSize := len(hybridData)
 
 	if hashSize+hybridSize > r.vectorSize {
@@ -405,9 +526,9 @@ func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash 
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.closed.Load() {
+		r.mu.Unlock()
 		return ErrClosed
 	}
 
@@ -416,12 +537,15 @@ func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash 
 		buf := make([]byte, r.vectorSize)
 		buf[0] = semanticHash
 		copy(buf[hashSize:hashSize+hybridSize], hybridData)
-		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
+		(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf, heapOwned: true})
+		r.mu.Unlock()
+		r.recordVectorAdd(id, fullVec, false)
 		return nil
 	}
 
 	newTotal := r.totalVectors.Load() + 1
 	if err := r.ensureCapacity(int(newTotal)); err != nil {
+		r.mu.Unlock()
 		return err
 	}
 	r.ensureCells(int(newTotal))
@@ -435,8 +559,11 @@ func (r *VectorRegistry) addMmapOnly(id uint64, hybridData []byte, semanticHash 
 	copy(slot[hashSize:hashSize+hybridSize], hybridData)
 
 	// Publish the slot data and bump totalVectors atomically.
-	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize]})
+	(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: slot[:r.vectorSize], heapOwned: false})
 	r.totalVectors.Store(newTotal)
+	r.mu.Unlock()
+
+	r.recordVectorAdd(id, fullVec, true)
 	return nil
 }
 
@@ -447,10 +574,19 @@ func (r *VectorRegistry) Count() int {
 func (r *VectorRegistry) Close() error {
 	r.closed.Store(true)
 
+	// Cancel and wait for any background adaptive ANN promotion builders.
+	r.buildCancelMu.Lock()
+	if r.buildCancel != nil {
+		r.buildCancel()
+	}
+	r.buildCancelMu.Unlock()
+	r.buildWG.Wait()
+
 	// Close current segments without holding the lock during IO.
 	r.mu.Lock()
 	segments := *r.segments.Load()
 	r.segments.Store(&[]*mmapSegment{})
+	r.mappedBytes.Store(0)
 	r.mu.Unlock()
 
 	var lastErr error
@@ -481,10 +617,10 @@ func (r *VectorRegistry) Close() error {
 
 func (r *VectorRegistry) Delete(id uint64) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	idx, exists := r.idMap[id]
 	if !exists {
+		r.mu.Unlock()
 		return false
 	}
 
@@ -520,7 +656,9 @@ func (r *VectorRegistry) Delete(id uint64) bool {
 
 	delete(r.idMap, id)
 	r.totalVectors.Add(-1)
+	r.mu.Unlock()
 
+	r.recordVectorDelete(id)
 	return true
 }
 
@@ -728,6 +866,10 @@ func (r *VectorRegistry) LoadSnapshot() error {
 			"vectorCount", r.totalVectors.Load(),
 			"vectorSize", r.vectorSize,
 		)
+		rev := *r.revMap.Load()
+		for _, id := range rev {
+			r.recordVectorAdd(id, nil, true)
+		}
 	}
 
 	return nil
@@ -941,7 +1083,7 @@ func (r *VectorRegistry) loadFromBadger(txn *badger.Txn) error {
 				buf := make([]byte, hashSize+len(vecData))
 				buf[0] = hashByte
 				copy(buf[hashSize:], vecData)
-				(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf})
+				(*r.cellsPtr.Load())[int(idx)].Store(&slotData{data: buf, heapOwned: true})
 				return nil
 			}
 

@@ -3,22 +3,25 @@ package vector
 import "fmt"
 
 type IVFPQConfig struct {
-	NumCentroids int
-	NumSubSpaces int
-	BitsPerSpace int
-	NProbe       int
-	NSample      int
-	BatchSize    int
+	NumCentroids    int
+	NumSubSpaces    int
+	BitsPerSpace    int
+	NProbe          int
+	NSample         int
+	BatchSize       int
+	StoreRawVectors bool          // Opt-in: persist raw float32 vectors under 0x16 (saves ~6.14 GB/1M vecs when false)
+	HybridCfg       *HybridConfig // Optional: matches VectorRegistry Hybrid quantization when reading 0x11
 }
 
 func DefaultIVFPQConfig() *IVFPQConfig {
 	return &IVFPQConfig{
-		NumCentroids: 1024,
-		NumSubSpaces: 64,
-		BitsPerSpace: 8,
-		NProbe:       32,
-		NSample:      100_000,
-		BatchSize:    10_000,
+		NumCentroids:    1024,
+		NumSubSpaces:    64,
+		BitsPerSpace:    8,
+		NProbe:          32,
+		NSample:         100_000,
+		BatchSize:       10_000,
+		StoreRawVectors: false,
 	}
 }
 

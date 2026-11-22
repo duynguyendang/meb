@@ -13,10 +13,11 @@ import (
 )
 
 type IVFPQIndex struct {
-	db         *badger.DB
-	cfg        *IVFPQConfig
-	fullDim    int
-	paddedDim  int
+	db          *badger.DB
+	cfg         *IVFPQConfig
+	hybridCfg   *HybridConfig
+	fullDim     int
+	paddedDim   int
 	subspaceDim int
 
 	centroidsMu sync.RWMutex
@@ -31,9 +32,14 @@ type IVFPQIndex struct {
 func NewIVFPQIndex(db *badger.DB, cfg *IVFPQConfig, fullDim int) *IVFPQIndex {
 	paddedDim := nextPow2(fullDim)
 	subspaceDim := paddedDim / cfg.NumSubSpaces
+	hybridCfg := cfg.HybridCfg
+	if hybridCfg == nil {
+		hybridCfg = DefaultHybridConfig()
+	}
 	return &IVFPQIndex{
 		db:          db,
 		cfg:         cfg,
+		hybridCfg:   hybridCfg,
 		fullDim:     fullDim,
 		paddedDim:   paddedDim,
 		subspaceDim: subspaceDim,
@@ -46,16 +52,18 @@ func NewIVFPQIndex(db *badger.DB, cfg *IVFPQConfig, fullDim int) *IVFPQIndex {
 func (idx *IVFPQIndex) AddVector(txn *badger.Txn, topicID uint32, localID uint64, fullVec []float32) error {
 	transformed := PadAndTransform(fullVec, idx.paddedDim)
 
-	idx.trainingBuf.Add(fullVec)
+	idx.trainingBuf.AddSample(topicID, localID, fullVec)
 
-	// Store raw float32 vector for future training
-	rawKey := keys.EncodeIVFRawVectorKey(topicID, localID)
-	rawBuf := make([]byte, idx.fullDim*4)
-	for i := 0; i < idx.fullDim; i++ {
-		binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(fullVec[i]))
-	}
-	if err := txn.Set(rawKey, rawBuf); err != nil {
-		return err
+	if idx.cfg.StoreRawVectors {
+		// Opt-in raw float32 persistence under 0x16 (skipping cuts ~6.14 GB per 1M 1536-d vectors).
+		rawKey := keys.EncodeIVFRawVectorKey(topicID, localID)
+		rawBuf := make([]byte, idx.fullDim*4)
+		for i := 0; i < idx.fullDim; i++ {
+			binary.LittleEndian.PutUint32(rawBuf[i*4:], math.Float32bits(fullVec[i]))
+		}
+		if err := txn.Set(rawKey, rawBuf); err != nil {
+			return err
+		}
 	}
 
 	centroids, err := idx.loadCentroids(txn, topicID)
@@ -65,7 +73,7 @@ func (idx *IVFPQIndex) AddVector(txn *badger.Txn, topicID uint32, localID uint64
 
 	if centroids == nil {
 		// No centroids yet — training has not been run.
-		// Just store the raw vector, skip IVF-PQ encoding.
+		// Vectors stay in 0x11 and/or trainingBuf until Train runs.
 		return nil
 	}
 

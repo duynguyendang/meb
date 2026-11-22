@@ -491,69 +491,161 @@ func (m *MEBStore) cleanupOrphanedDictEntriesFullScan() (int, error) {
 	return cleaned, nil
 }
 
-// cleanupOrphanedVectors scans vectors and removes those that have no
-// corresponding content or any referencing facts.
-// Uses a two-pass approach: O(facts + vectors) instead of O(facts × vectors).
+// cleanupOrphanedVectors scans vectors (0x11) and removes those that have no
+// corresponding content (0x10) or any referencing fact subject in SPO (0x20).
+//
+// Uses an O(1)-memory streaming merge-join instead of materializing all subject IDs
+// in a heap map: both 0x11 and per-topic 0x20 keys are stored sorted by 40-bit
+// LocalID in BadgerDB, so concurrent iterators advance in lock-step with zero
+// per-node RAM allocation.
 func (m *MEBStore) cleanupOrphanedVectors() int {
 	cleaned := 0
 	const maxOrphansPerCycle = 1000
+	const maxStreamingTopicCursors = 16
 
-	m.withWriteTxn(func(txn *badger.Txn) error {
-		// Phase 1: Build set of all subject local IDs referenced by facts (single scan)
-		factSubjectIDs := make(map[uint64]bool)
-		spoPrefix := []byte{keys.TripleSPOPrefix}
+	var orphanIDs []uint64
 
-		spoItOpts := badger.DefaultIteratorOptions
-		spoItOpts.PrefetchValues = false
-		spoIt := txn.NewIterator(spoItOpts)
+	_ = m.withWriteTxn(func(txn *badger.Txn) error {
+		// 1. Discover active topicIDs in the SPO (0x20) index in O(numTopics) seeks.
+		topics := discoverSPOTopics(txn)
 
-		for spoIt.Seek(spoPrefix); spoIt.ValidForPrefix(spoPrefix); spoIt.Next() {
-			sKey := spoIt.Item().Key()
-			if len(sKey) != keys.TripleKeySize {
-				continue
+		var cursors []*spoTopicCursor
+		var overflowTopics []uint32
+		defer func() {
+			for _, tc := range cursors {
+				tc.it.Close()
 			}
-			s, _, _ := keys.DecodeTripleKey(sKey)
-			localID := keys.UnpackLocalID(s)
-			if localID != 0 {
-				factSubjectIDs[localID] = true
+		}()
+
+		itOpts := badger.DefaultIteratorOptions
+		itOpts.PrefetchValues = false
+
+		for i, tid := range topics {
+			if i >= maxStreamingTopicCursors {
+				overflowTopics = topics[i:]
+				break
 			}
+			pfx := spoTopicPrefix3(tid)
+			it := txn.NewIterator(itOpts)
+			it.Seek(pfx)
+			tc := &spoTopicCursor{
+				topicID: tid,
+				prefix:  pfx,
+				it:      it,
+			}
+			tc.advanceValid()
+			cursors = append(cursors, tc)
 		}
-		spoIt.Close()
 
-		// Phase 2: Scan vectors, check against set in O(1)
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		defer it.Close()
+		// Reset/rewind cursor for exact topic when vecTopic changes in 0x11.
+		findCursor := func(tid uint32) *spoTopicCursor {
+			for _, tc := range cursors {
+				if tc.topicID == tid {
+					return tc
+				}
+			}
+			return nil
+		}
+
+		cursorHasLocalID := func(tc *spoTopicCursor, targetLocal uint64) bool {
+			if !tc.valid || tc.curID > targetLocal {
+				return false
+			}
+			if tc.curID == targetLocal {
+				return true
+			}
+			// Jump directly via Seek if far behind, otherwise step sequentially.
+			if targetLocal-tc.curID > 16 {
+				seekKey := keys.EncodeTripleSPOPrefix(keys.PackID(tc.topicID, targetLocal), 0, 0)
+				tc.it.Seek(seekKey)
+				tc.advanceValid()
+			} else {
+				for tc.valid && tc.curID < targetLocal {
+					tc.it.Next()
+					tc.advanceValid()
+				}
+			}
+			return tc.valid && tc.curID == targetLocal
+		}
+
+		// Rewind cursors whenever vecTopic switches in 0x11 so packed topics can merge sequentially too.
+		var lastVecTopic uint32
+		firstVec := true
+
+		vecIt := txn.NewIterator(itOpts)
+		defer vecIt.Close()
 
 		vecPrefix := []byte{keys.VectorFullPrefix}
 		var orphanKeys [][]byte
 
-		for it.Seek(vecPrefix); it.ValidForPrefix(vecPrefix); it.Next() {
-			key := it.Item().Key()
-			if len(key) != keys.ChunkKeySize {
+		for vecIt.Seek(vecPrefix); vecIt.ValidForPrefix(vecPrefix); vecIt.Next() {
+			rawKey := vecIt.Item().Key()
+			if len(rawKey) != keys.ChunkKeySize {
 				continue
 			}
 
-			id := binary.BigEndian.Uint64(key[1:])
+			vecID := binary.BigEndian.Uint64(rawKey[1:])
+			vecTopic := keys.UnpackTopicID(vecID)
+			vecLocal := keys.UnpackLocalID(vecID)
 
-			// Check if content exists for this vector
-			contentKey := keys.EncodeChunkKey(id)
-			_, err := txn.Get(contentKey)
-			hasContent := err == nil
+			if firstVec || vecTopic != lastVecTopic {
+				firstVec = false
+				lastVecTopic = vecTopic
+				if vecTopic != 0 {
+					if tc := findCursor(vecTopic); tc != nil && tc.curID > vecLocal {
+						tc.it.Seek(tc.prefix)
+						tc.advanceValid()
+					}
+				}
+			}
 
-			// Check if any fact references this ID as subject
-			hasFact := factSubjectIDs[id]
+			// Check 0x10 content existence first (O(1) point lookup).
+			if _, err := txn.Get(keys.EncodeChunkKey(vecID)); err == nil {
+				continue
+			}
+			if vecTopic != 0 {
+				if _, err := txn.Get(keys.EncodeChunkKey(vecLocal)); err == nil {
+					continue
+				}
+			}
 
-			if !hasContent && !hasFact {
-				orphanKeys = append(orphanKeys, key)
+			// Streaming merge-join check against SPO (0x20) sorted LocalIDs.
+			hasFact := false
+			if vecTopic == 0 {
+				// Unpacked document/vector ID: check across active topics in lock-step.
+				for _, tc := range cursors {
+					if cursorHasLocalID(tc, vecLocal) {
+						hasFact = true
+						break
+					}
+				}
+				if !hasFact {
+					for _, tid := range overflowTopics {
+						if spoTopicHasSubject(txn, tid, vecLocal) {
+							hasFact = true
+							break
+						}
+					}
+				}
+			} else {
+				if tc := findCursor(vecTopic); tc != nil {
+					hasFact = cursorHasLocalID(tc, vecLocal)
+				} else {
+					hasFact = spoTopicHasSubject(txn, vecTopic, vecLocal)
+				}
+			}
+
+			if !hasFact {
+				kCopy := make([]byte, len(rawKey))
+				copy(kCopy, rawKey)
+				orphanKeys = append(orphanKeys, kCopy)
+				orphanIDs = append(orphanIDs, vecID)
 				if len(orphanKeys) >= maxOrphansPerCycle {
 					break
 				}
 			}
 		}
 
-		// Delete orphans
 		for _, key := range orphanKeys {
 			if err := txn.Delete(key); err != nil {
 				return err
@@ -564,5 +656,87 @@ func (m *MEBStore) cleanupOrphanedVectors() int {
 		return nil
 	})
 
+	if cleaned > 0 && m.vectors != nil {
+		for _, id := range orphanIDs {
+			m.vectors.Delete(id)
+		}
+	}
+
 	return cleaned
+}
+
+func spoTopicPrefix3(topicID uint32) []byte {
+	return []byte{
+		keys.TripleSPOPrefix,
+		byte(topicID >> 16),
+		byte(topicID >> 8),
+		byte(topicID),
+	}
+}
+
+func discoverSPOTopics(txn *badger.Txn) []uint32 {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	var topics []uint32
+	seekKey := []byte{keys.TripleSPOPrefix}
+	for {
+		it.Seek(seekKey)
+		if !it.ValidForPrefix([]byte{keys.TripleSPOPrefix}) {
+			break
+		}
+		key := it.Item().Key()
+		if len(key) != keys.TripleKeySize {
+			it.Next()
+			if !it.Valid() {
+				break
+			}
+			seekKey = it.Item().KeyCopy(nil)
+			continue
+		}
+		s, _, _ := keys.DecodeTripleKey(key)
+		tid := keys.UnpackTopicID(s)
+		topics = append(topics, tid)
+		if tid == 0xFFFFFF {
+			break
+		}
+		seekKey = spoTopicPrefix3(tid + 1)
+	}
+	return topics
+}
+
+type spoTopicCursor struct {
+	topicID uint32
+	prefix  []byte
+	it      *badger.Iterator
+	valid   bool
+	curID   uint64
+}
+
+func (tc *spoTopicCursor) advanceValid() {
+	for tc.it.ValidForPrefix(tc.prefix) {
+		k := tc.it.Item().Key()
+		if len(k) == keys.TripleKeySize {
+			s, _, _ := keys.DecodeTripleKey(k)
+			tc.curID = keys.UnpackLocalID(s)
+			tc.valid = true
+			return
+		}
+		tc.it.Next()
+	}
+	tc.valid = false
+}
+
+func spoTopicHasSubject(txn *badger.Txn, topicID uint32, localID uint64) bool {
+	sID := keys.PackID(topicID, localID)
+	pfx := keys.EncodeTripleSPOPrefix(sID, 0, 0)
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchValues = false
+	opts.PrefetchSize = 1
+	it := txn.NewIterator(opts)
+	defer it.Close()
+	it.Seek(pfx)
+	return it.ValidForPrefix(pfx)
 }

@@ -321,7 +321,19 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 
 	slog.Info("BadgerDB opened successfully")
 
-	dictEncoder, err := dict.NewEncoder(db, cfg.LRUCacheSize, cfg.NumDictShards)
+	// Auto-detect GOMEMLIMIT / cgroup RAM ceiling to bound mmap vector cache and dict LRU.
+	maxMmapBytes, adaptiveLRU := store.ComputeMemoryBudget(cfg.MemoryLimitBytes, cfg.LRUCacheSize)
+	if cfg.MaxMmapBytes > 0 {
+		maxMmapBytes = cfg.MaxMmapBytes
+	}
+	lruSize := cfg.LRUCacheSize
+	if lruSize <= 0 || (adaptiveLRU > 0 && adaptiveLRU < lruSize) {
+		if adaptiveLRU > 0 {
+			lruSize = adaptiveLRU
+		}
+	}
+
+	dictEncoder, err := dict.NewEncoder(db, lruSize, cfg.NumDictShards)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create dictionary encoder: %w", err)
@@ -329,6 +341,13 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 
 	vCfg := vector.DefaultConfig()
 	vCfg.SegmentDir = cfg.SegmentDir
+	vCfg.MaxMmapBytes = maxMmapBytes
+	if cfg.VectorSegmentSize > 0 {
+		vCfg.SegmentSize = cfg.VectorSegmentSize
+	}
+	if cfg.AutoPromoteThreshold != 0 {
+		vCfg.AutoPromoteThreshold = cfg.AutoPromoteThreshold
+	}
 	if cfg.VectorFullDim > 0 {
 		vCfg.FullDim = cfg.VectorFullDim
 	}
@@ -349,6 +368,14 @@ func NewMEBStore(cfg *store.Config) (*MEBStore, error) {
 		cleanupDone:       make(chan struct{}),
 		lftjEngine:        query.NewLFTJEngine(db),
 		wal:               wal,
+	}
+	vCfg.OnAutoPromote = func(topicID uint32, annType vector.ANNIndexType, count int64, deltaReplayed int) {
+		m.telemetry.Emit("vector_index_promoted", map[string]any{
+			"topicID":       topicID,
+			"annType":       annType,
+			"vectorCount":   count,
+			"deltaReplayed": deltaReplayed,
+		})
 	}
 	m.breaker.Store(circuit.NewBreaker(nil))
 	m.breaker.Load().OnStateChange(func(oldState, newState circuit.State, err error) {
@@ -912,6 +939,23 @@ func (m *MEBStore) runCleanup() {
 		m.telemetry.Emit("vector_orphan_cleanup", map[string]any{
 			"count": vecCleaned,
 		})
+	}
+
+	// Phase 3b: Run one incremental HNSW compaction batch for any topic crossing tombstone threshold
+	if m.hnsw != nil {
+		for _, tid := range m.hnsw.ActiveTopics() {
+			if m.hnsw.ShouldCompact(tid) {
+				if processed, done, err := m.hnsw.CompactIncremental(context.Background(), tid, 0); err != nil {
+					slog.Warn("incremental HNSW compaction failed", "topicID", tid, "error", err)
+				} else if processed > 0 {
+					slog.Info("incremental HNSW compaction tick",
+						"topicID", tid,
+						"processed", processed,
+						"passDone", done,
+					)
+				}
+			}
+		}
 	}
 
 	// Phase 4: Run GC on unified DB

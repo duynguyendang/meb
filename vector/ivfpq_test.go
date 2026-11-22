@@ -295,3 +295,144 @@ func TestIVFPQSearchCancellation(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", gotErr)
 	}
 }
+
+func TestIVFPQ_NoRawVectorsByDefault(t *testing.T) {
+	cfg := DefaultIVFPQConfig()
+	if cfg.StoreRawVectors {
+		t.Fatal("expected DefaultIVFPQConfig().StoreRawVectors to be false by default")
+	}
+
+	db := newInMemoryVectorBadger(t)
+	idx := NewIVFPQIndex(db, &IVFPQConfig{
+		NumCentroids:    2,
+		NumSubSpaces:    4,
+		BitsPerSpace:    8,
+		NProbe:          2,
+		NSample:         500,
+		BatchSize:       100,
+		StoreRawVectors: false,
+	}, 8)
+	const topicID uint32 = 1
+
+	err := db.Update(func(txn *badger.Txn) error {
+		for i := 1; i <= 40; i++ {
+			v := make([]float32, 8)
+			if i <= 20 {
+				v[0] = float32(i) * 0.1
+			} else {
+				for d := range v {
+					v[d] = 20.0 + float32(i)*0.01
+				}
+			}
+			if err := idx.AddVector(txn, topicID, uint64(i), v); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("AddVector failed: %v", err)
+	}
+
+	// Verify zero 0x16 raw vector keys were written.
+	var rawCount int
+	_ = db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		pfx := []byte{keys.IVFRawVectorPrefix}
+		for it.Seek(pfx); it.ValidForPrefix(pfx); it.Next() {
+			rawCount++
+		}
+		return nil
+	})
+	if rawCount != 0 {
+		t.Fatalf("expected 0 0x16 raw vector keys when StoreRawVectors=false, got %d", rawCount)
+	}
+
+	if err := idx.Train(topicID, 500); err != nil {
+		t.Fatalf("Train failed: %v", err)
+	}
+
+	// Also verify training from compressed 0x11 keys directly when trainingBuf is empty.
+	reg := NewRegistry(db, &Config{
+		FullDim:              8,
+		HybridBitWidth:       8,
+		HybridBlockSize:      32,
+		NumWorkers:           2,
+		VectorCapacity:       100,
+		InitialCapacity:      100,
+		SegmentDir:           t.TempDir(),
+		SegmentSize:          1 << 20,
+		AutoPromoteThreshold: -1,
+	})
+	defer reg.Close()
+
+	const topic2 uint32 = 2
+	for i := 1; i <= 30; i++ {
+		v := make([]float32, 8)
+		v[0] = float32(i)
+		if err := reg.Add(keys.PackID(topic2, uint64(i)), v); err != nil {
+			t.Fatalf("reg.Add: %v", err)
+		}
+	}
+	idxFrom0x11 := NewIVFPQIndex(db, &IVFPQConfig{
+		NumCentroids:    2,
+		NumSubSpaces:    4,
+		BitsPerSpace:    8,
+		NProbe:          2,
+		NSample:         500,
+		BatchSize:       100,
+		StoreRawVectors: false,
+	}, 8)
+	if err := idxFrom0x11.Train(topic2, 500); err != nil {
+		t.Fatalf("Train from 0x11 failed: %v", err)
+	}
+
+	var results []SearchResult
+	_ = db.View(func(txn *badger.Txn) error {
+		for res, err := range idxFrom0x11.SearchInTopic(context.Background(), txn, topic2, []float32{30, 0, 0, 0, 0, 0, 0, 0}, 3) {
+			if err != nil {
+				return err
+			}
+			results = append(results, res)
+		}
+		return nil
+	})
+	if len(results) == 0 {
+		t.Fatal("expected results when training/reindexing solely from 0x11")
+	}
+}
+
+func TestIVFPQ_StoreRawVectorsOptIn(t *testing.T) {
+	db := newInMemoryVectorBadger(t)
+	idx := NewIVFPQIndex(db, &IVFPQConfig{
+		NumCentroids:    2,
+		NumSubSpaces:    4,
+		BitsPerSpace:    8,
+		NProbe:          2,
+		NSample:         100,
+		BatchSize:       50,
+		StoreRawVectors: true,
+	}, 8)
+
+	err := db.Update(func(txn *badger.Txn) error {
+		return idx.AddVector(txn, 1, 1, []float32{1, 2, 3, 4, 5, 6, 7, 8})
+	})
+	if err != nil {
+		t.Fatalf("AddVector: %v", err)
+	}
+
+	var rawCount int
+	_ = db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		pfx := []byte{keys.IVFRawVectorPrefix}
+		for it.Seek(pfx); it.ValidForPrefix(pfx); it.Next() {
+			rawCount++
+		}
+		return nil
+	})
+	if rawCount != 1 {
+		t.Errorf("expected 1 0x16 key when StoreRawVectors=true, got %d", rawCount)
+	}
+}
